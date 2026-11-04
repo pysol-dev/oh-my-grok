@@ -1,4 +1,4 @@
-"""`omoctl hook serve`: a local-only, one-time-token web form for entering webhook URLs and keys.
+"""`omoctl hook serve`: a local-only, per-run session token web form for entering webhook URLs and keys.
 
 For GUIs whose paste tool cannot type into a terminal. Security properties:
   - stdlib http.server bound to 127.0.0.1 on a random free port; every path except /setup/<token> is 404, where
@@ -192,8 +192,12 @@ class HookFormServer:
                 if n < 0 or n > MAX_BODY or ctype != "application/x-www-form-urlencoded":
                     self._send(400, b"bad request")
                     return
-                form = parse_qs(self.rfile.read(n).decode("utf-8", "replace"), keep_blank_values=True,
-                                max_num_fields=64)
+                try:
+                    form = parse_qs(self.rfile.read(n).decode("utf-8", "replace"), keep_blank_values=True,
+                                    max_num_fields=64)
+                except ValueError:  # too many fields; never echo the body
+                    self._send(400, b"bad request")
+                    return
                 if form.get("action", [""])[0] == "finish":
                     self._send(200, render(outer.token, {}, {}, finished=True))
                     outer.finished.set()
@@ -224,12 +228,14 @@ class HookFormServer:
                 self.url_file.unlink()
         except OSError:
             pass
-        fd = os.open(self.url_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        tmp = self.url_file.with_name(f".{self.url_file.name}.{secrets.token_hex(8)}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
             os.fchmod(fd, 0o600)
             os.write(fd, (self.url + "\n").encode())
         finally:
             os.close(fd)
+        os.replace(tmp, self.url_file)  # readers never see an empty or partial file
 
     def _watch(self):
         while not self.finished.wait(1.0):

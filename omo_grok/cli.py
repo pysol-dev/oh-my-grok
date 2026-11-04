@@ -367,13 +367,15 @@ def cmd_hook_set(args) -> int:
 
 
 def cmd_hook_serve(args) -> int:
-    """Local-only masked web form (127.0.0.1, random port, one-time token) for GUIs that cannot paste into a
-    terminal. Prints the URL and writes it to the URL file (0600); stops on Finish or after the idle timeout."""
+    """Local-only masked web form (127.0.0.1, random port, per-run session token) for GUIs that cannot paste into a
+    terminal. Writes the URL only to the URL file (0600) unless --print-url; stops on Finish or after the idle timeout."""
     from .hook_form import URL_FILE, HookFormServer
     srv = HookFormServer(get_paths(), _engine, idle_seconds=args.idle_minutes * 60, port=args.port,
                          url_file=Path(args.url_file) if args.url_file else URL_FILE)
-    print(f"omo webhook setup form (local only, one-time token): {srv.url}", flush=True)
-    print(f"URL also written to {srv.url_file} (0600). Stops on 'Finish' or after {args.idle_minutes:g} idle "
+    srv.write_url_file()  # before announcing it, so a reader of the file never races the server start
+    if args.print_url:
+        print(f"omo webhook setup form (local only, per-run session token): {srv.url}", flush=True)
+    print(f"omo webhook setup form URL written to {srv.url_file} (0600; not printed, use --print-url to show it). Stops on 'Finish' or after {args.idle_minutes:g} idle "
           f"minutes. Values are never echoed or logged.", flush=True)
     reason = srv.serve()
     print(f"setup server stopped ({reason})", flush=True)
@@ -547,11 +549,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("role", nargs="?", choices=ROLES)
     sp.add_argument("--probe", action="store_true")
     add("list", cmd_hook_list, "role -> configured/unconfigured only", parent=hook)
-    sp = add("serve", cmd_hook_serve, "local-only masked web form for URL+key entry (127.0.0.1, one-time token)",
+    sp = add("serve", cmd_hook_serve, "local-only masked web form for URL+key entry (127.0.0.1, per-run session token)",
              parent=hook)
     sp.add_argument("--port", type=int, default=0, help="default: random free port")
     sp.add_argument("--idle-minutes", type=float, default=30.0)
     sp.add_argument("--url-file", default=None, help="default: /tmp/omo_hook_form_url")
+    sp.add_argument("--print-url", action="store_true", help="also print the tokenized URL to stdout (off by default)")
     roles = sub.add_parser("roles", help="role -> Bot -> routine bindings").add_subparsers(dest="roles_cmd",
                                                                                            required=True)
     add("list", cmd_roles_list, "show active bindings", parent=roles)

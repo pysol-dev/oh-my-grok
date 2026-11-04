@@ -590,6 +590,16 @@ class Engine:
                 self._block_task(self._one("SELECT * FROM tasks WHERE id=?", (task_id,)),
                                  f"input artifact integrity failure: {e.message} {e.details.get('path', '')}")
             raise
+        try:
+            return self._claim_tx(job_id, task_id, dispatch_id, actor)
+        except Conflict as e:
+            # The refusal itself is evidence (duplicate/stale wake-ups): log it outside the rolled-back tx.
+            # Only ids and the reason go in; never tokens, URLs or keys.
+            with db.tx(self.conn):
+                self._ev("claim_refused", job_id, task_id, actor, dispatch_id=dispatch_id, reason=e.message)
+            raise
+
+    def _claim_tx(self, job_id: str, task_id: str, dispatch_id: str, actor: str | None) -> dict:
         with db.tx(self.conn):
             job = self._job(job_id)
             t = self._task(job_id, task_id)

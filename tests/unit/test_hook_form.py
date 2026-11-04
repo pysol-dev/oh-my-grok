@@ -1,4 +1,4 @@
-"""`omoctl hook serve`: local-only one-time-token form. Token/Host/Origin gates, exact storage, no echo/log."""
+"""`omoctl hook serve`: local-only per-run session token form. Token/Host/Origin gates, exact storage, no echo/log."""
 import http.client
 import json
 import os
@@ -163,14 +163,15 @@ def test_idle_timeout_stops_the_server(omo_home, tmp_path):
     assert s.serve() == "idle timeout" and time.monotonic() - t0 < 15
 
 
-def test_cli_serve_prints_url_and_stops_on_finish(omo_home, tmp_path):
+def test_cli_serve_writes_url_only_to_file_and_stops_on_finish(omo_home, tmp_path):
     uf = tmp_path / "cli_url"
     p = subprocess.Popen([str(ROOT / "omoctl"), "hook", "serve", "--url-file", str(uf), "--idle-minutes", "1"],
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=dict(os.environ))
     try:
-        line = p.stdout.readline()
-        url = line.strip().split(": ", 1)[1]
-        assert url.startswith("http://127.0.0.1:") and uf.read_text().strip() == url
+        first = p.stdout.readline()
+        assert "/setup/" not in first and "written to" in first
+        url = uf.read_text().strip()
+        assert url.startswith("http://127.0.0.1:") and (uf.stat().st_mode & 0o777) == 0o600
         port = int(url.split(":")[2].split("/")[0])
         path = url.split(str(port), 1)[1]
         fake = type("S", (), {"port": port})()
@@ -178,6 +179,7 @@ def test_cli_serve_prints_url_and_stops_on_finish(omo_home, tmp_path):
         assert req(fake, "POST", path, "action=finish")[0] == 200
         out, err = p.communicate(timeout=20)
         assert p.returncode == 0 and "stopped (finished)" in out and "GET" not in err and path not in err
+        assert path not in out and not uf.exists()
     finally:
         if p.poll() is None:
             p.kill()
@@ -197,3 +199,38 @@ def test_referrer_policy_is_same_origin_so_chrome_sends_a_real_origin(srv):
     # `null` stays forbidden
     st, _, _ = req(srv, "POST", f"/setup/{srv.token}", "action=save", headers={"Origin": "null"})
     assert st == 403
+
+
+def test_malformed_host_url_is_a_clean_error_not_a_dropped_connection(srv, capfd):
+    form = {"url_explorer": "https://[SENTINELHOST5]/p", "key_explorer": "SENTINELKEYabcdefgh", "action": "save"}
+    st, body, _ = req(srv, "POST", f"/setup/{srv.token}", urlencode(form),
+                      headers={"Origin": f"http://127.0.0.1:{srv.port}"})
+    assert st == 200 and "malformed" in body and "SENTINEL" not in body
+    out, err = capfd.readouterr()
+    assert "SENTINEL" not in out + err and "Traceback" not in out + err
+
+
+def test_too_many_form_fields_is_400_without_traceback(srv, capfd):
+    body = "&".join(f"f{i}=x" for i in range(100))
+    st, resp, _ = req(srv, "POST", f"/setup/{srv.token}", body, headers={"Origin": f"http://127.0.0.1:{srv.port}"})
+    assert st == 400
+    out, err = capfd.readouterr()
+    assert "Traceback" not in out + err
+
+
+def test_validate_url_turns_parse_errors_into_validation_error():
+    from omo_grok.errors import ValidationError
+    from omo_grok.hooks import validate_url
+    for bad in ("https://[SENTINELHOSTCLI]/x", "https://h.example:99999999/x", "https://h.example:abc/x"):
+        with pytest.raises(ValidationError) as ei:
+            validate_url(bad)
+        assert "SENTINEL" not in ei.value.message and "h.example" not in ei.value.message
+
+
+def test_hook_set_reprompts_on_malformed_url(omo_home, monkeypatch, capsys):
+    from omo_grok import cli
+    vals = iter(["https://[SENTINELHOSTCLI]/x", "https://hooks.example.test/ok", "k" * 32])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(vals))
+    rc = cli.main(["hook", "set", "explorer"])
+    out, err = capsys.readouterr()
+    assert rc == 0 and "malformed" in err and "SENTINEL" not in out + err and "internal error" not in err

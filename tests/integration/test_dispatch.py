@@ -267,3 +267,24 @@ def test_post_json_maps_real_http_responses(live_hook):
     assert [q["auth"] for q in live_hook.requests] == [f"Bearer {KEY}"] * 3
     assert all(q["body"] == {"a": 1} and q["ctype"].startswith("application/json") for q in live_hook.requests)
     assert isinstance(a, HttpResult)
+
+
+def test_duplicate_wakeup_claim_is_refused_and_logged_without_secrets(h):
+    """§10.22 duplicate webhook: a second claim with the already-used dispatch_id is refused, leaves exactly one
+    attempt, and writes a structured claim_refused event (ids + reason only) so live runs can prove the refusal."""
+    from omo_grok.errors import Conflict
+    e = h.e
+    job = h.submit()["job_id"]
+    t = h.task(job, "explore")
+    disp = t["current_dispatch_id"]
+    e.claim(job, t["id"], disp, actor="explorer")
+    with pytest.raises(Conflict):
+        e.claim(job, t["id"], disp, actor="explorer")
+    n = e.conn.execute("SELECT COUNT(*) FROM task_attempts WHERE task_id=?", (t["id"],)).fetchone()[0]
+    assert n == 1
+    rows = e.conn.execute("SELECT actor, data_json FROM events WHERE task_id=? AND kind='claim_refused'",
+                          (t["id"],)).fetchall()
+    assert len(rows) == 1
+    data = json.loads(rows[0][1])
+    assert rows[0][0] == "explorer" and data["dispatch_id"] == disp and "working" in data["reason"]
+    assert KEY not in rows[0][1] and "http" not in rows[0][1] and "token" not in rows[0][1].lower()

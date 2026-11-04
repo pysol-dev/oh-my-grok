@@ -75,9 +75,15 @@ own routine (`omo-bus-<role>`) with its own URL and key, so run `hook set` once 
 (`hook set` then sees length=0). Use the local-only masked form instead:
 
 ```bash
-cd /workspace/omo && nohup ./omoctl hook serve > /tmp/omo_hook_serve.log 2>&1 &
-cat /tmp/omo_hook_form_url     # http://127.0.0.1:<random port>/setup/<one-time token>  (file mode 0600)
+cd /workspace/omo && (umask 077; ./omoctl hook serve > state/logs/hook_serve.log 2>&1; rm -f state/logs/hook_serve.log) &
+cat /tmp/omo_hook_form_url     # http://127.0.0.1:<random port>/setup/<per-run session token>  (file mode 0600)
 ```
+
+The tokenized URL is written only to the 0600 URL file, never to stdout (`--print-url` overrides this; don't use
+it with a log redirect). The log is created under umask 077 (mode 0600) in `state/logs/`, holds only status
+lines, and the subshell deletes it once the server stops (Finish or idle timeout). The token is a **per-run session
+token**: 256 bits from `secrets.token_urlsafe(32)`, valid for any number of requests until the server stops, and
+never reused across runs. It is not single-use.
 
 Open that URL in the box browser. There is one section per async role, in this order: explorer, librarian, metis,
 qa-executor (Metis), momus, code-reviewer (Momus), executor. Each section shows the bot, the routine and a
@@ -95,8 +101,11 @@ How it is protected:
 - Values pass through the same `sanitize_input` and `set_hook` validation as `hook set`, and are stored only
   in `state/secrets/hooks.json` (0600).
 
-**Rotation:** rotate the key in the routine UI, then run `hook set ROLE` again, then
-`resume JOB` for any job blocked with `webhook key rejected`.
+**Rotation (recommended now for all 7 roles; see SECURITY.md "2026-11-04 disclosure"):** for each async role,
+open that role's Bot, then its `omo-bus-<role>` routine panel, and regenerate the webhook key (and URL if offered).
+Then enter the new pair through `hook serve` (above) or `hook set ROLE`, never via chat. Check with `hook list`, then
+`hook check ROLE --probe` (TLS only, no POST). The old key stops working at regeneration, so a job in flight shows
+`HTTP 401/403: webhook key rejected` until the new pair is stored; then `resume JOB`.
 
 ## 5. Start a job
 - Normally you say "plan this: <goal> in <repo>" to Hephaestus.

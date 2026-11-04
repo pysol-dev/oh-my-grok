@@ -74,11 +74,16 @@ def url_diagnostic(clean: str, removed_nonprintable: bool) -> str:
 
 
 def validate_url(url: str) -> None:
-    u = urlparse(url)
-    insecure_ok = os.environ.get("OMO_ALLOW_INSECURE_HOOKS") == "1" and u.hostname in ("127.0.0.1", "localhost")
+    try:
+        u = urlparse(url)
+        host = u.hostname
+        u.port  # noqa: B018 - raises ValueError on a malformed port
+    except ValueError:
+        raise ValidationError("webhook URL is malformed (unparseable host or port; value not shown)") from None
+    insecure_ok = os.environ.get("OMO_ALLOW_INSECURE_HOOKS") == "1" and host in ("127.0.0.1", "localhost")
     if u.scheme != "https" and not (u.scheme == "http" and insecure_ok):
         raise ValidationError("webhook URL must be https")
-    if not u.hostname:
+    if not host:
         raise ValidationError("webhook URL has no host")
 
 

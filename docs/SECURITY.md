@@ -439,7 +439,7 @@ duties between cooperating agents, not protection against a malicious same-accou
 
 ## Secrets
 - Webhook URL and key pairs live only in `state/secrets/hooks.json` (mode 0600, directory 0700). They are entered
-  through `omoctl hook set ROLE` using a hidden `getpass` prompt. They never go in argv, shell history, chat, README,
+  through `omoctl hook set ROLE` using a hidden `getpass` prompt. They never go in argv, shell history, chat (one exception: see the 2026-11-04 disclosure below), README,
   commits or test logs.
 - This file mode prevents **accidental disclosure** only. Any same-account Bot can still read it.
 - `hook check --probe` performs a TLS handshake only. It never POSTs and never prints the URL path or the key.
@@ -447,6 +447,31 @@ duties between cooperating agents, not protection against a malicious same-accou
   repository commits or routine outputs.
 - Rotation: run `omoctl hook set ROLE` again with the new value. Rotate the key in the routine UI first. A changed key
   shows up as `HTTP 401/403: webhook key rejected` and blocks the task until resumed.
+- **2026-11-04 disclosure (honest record):** the terminal path (`hook set`: GUI paste delivered length=0) and the
+  first form attempt (`hook serve` with `Referrer-Policy: no-referrer`, so Chrome sent `Origin: null` and got 403)
+  both failed. The user then chose to paste all 7 webhook URL/key pairs into the Hephaestus chat, and Hephaestus stored
+  them. Those keys therefore exist in that chat's history (and any transcript copies), outside `hooks.json`. Treat them
+  as exposed: **rotation of all 7 is recommended** (RUNBOOK "Rotation"). Until rotated, anyone who can read that chat
+  history can wake the routines. Even then, a wake-up only carries ids: claiming still needs the engine's dispatch_id
+  match, and the plan gate, approvals and final gate still apply.
+
+### `omoctl hook serve` (local masked form)
+- Binds `127.0.0.1` only, random port by default. Only `/setup/<token>` is served (404 otherwise, constant-time compare).
+- Token: **per-run session token**, 256 bits (`secrets.token_urlsafe(32)`). Valid for the whole server lifetime
+  (reusable across requests in that run), new each run, not single-use.
+- The tokenized URL goes only to a 0600 URL file (written atomically, deleted on stop). It is not printed unless
+  `--print-url` is given.
+- Host must be exactly `127.0.0.1:<port>`, and Origin is either absent or exactly `http://127.0.0.1:<port>`
+  (`null` refused), as a DNS-rebinding/CSRF guard.
+- Headers: `Cache-Control: no-store`, strict CSP (`default-src 'none'`, `form-action 'self'`, `frame-ancestors
+  'none'`), `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: same-origin`.
+- POST body is urlencoded only, capped at 64 KB and 64 fields (over that gives 400). Malformed URLs give a per-role error
+  with a value-free diagnostic. No request logging.
+- Idle timeout 30 min (`--idle-minutes`), plus a Finish button.
+- **Residuals:** any same-account process can read the URL file or connect to loopback, so this is not a boundary
+  against same-account code. The token is reusable until stop. Values sit in browser memory and form state until the
+  tab closes. It is plain HTTP on loopback. The box browser's own history may record the tokenized URL (harmless once
+  the server stops).
 
 ## Approvals: SOFT (implemented) vs STRICT (protocol only, not implemented)
 
