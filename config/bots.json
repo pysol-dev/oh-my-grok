@@ -1,0 +1,12 @@
+{
+  "_comment": "Bot inventory the engine accepts for role bindings. IDs supplied by the orchestrating Hephaestus session on 2026-11-03; NOT re-verified by this build (no live Grok Bot API calls were made). bind_role refuses any bot_id not listed here.",
+  "verified_live": false,
+  "bots": [
+    {"bot_id": "f497e4a7-5d7d-46e4-829f-b0da987cbac4", "name": "Hephaestus", "provenance": "parent task brief 2026-11-03 (unverified)"},
+    {"bot_id": "41b28a72-3ece-45b9-9008-000f3fce4da7", "name": "Metis", "provenance": "parent task brief 2026-11-03 (unverified)"},
+    {"bot_id": "42b0d03a-d1fb-4fdc-87b1-35d9123f6f74", "name": "Momus", "provenance": "parent task brief 2026-11-03 (unverified)"},
+    {"bot_id": "78a94f3f-cb51-473f-b9d4-9a06fc025f59", "name": "Librarian", "provenance": "parent task brief 2026-11-03 (unverified)"},
+    {"bot_id": "dbbe6828-c2fb-4474-8fe3-a0e6df942fc6", "name": "Explorer", "provenance": "parent task brief 2026-11-03 (unverified)"},
+    {"bot_id": "e3dfae0e-9d90-4358-8e90-2e4c6734b092", "name": "Executor", "provenance": "parent task brief 2026-11-03 (unverified)"}
+  ]
+}

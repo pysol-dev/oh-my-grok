@@ -1,0 +1,19 @@
+{
+  "_comment": "Verifier profiles. argv runs with shell=False in a temporary detached checkout of the EXACT revision. Only the exit status decides. Any profile or referenced script containing OMO_VERIFY_TEMPLATE fails closed.",
+  "profiles": {
+    "fixture-calc-unittest": {
+      "argv": ["/workspace/omo/.venv/bin/python", "-B", "-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v"],
+      "cwd": ".",
+      "env_allow": [],
+      "timeout_seconds": 120,
+      "protected_paths": ["tests/"]
+    },
+    "example-template-do-not-use": {
+      "argv": ["/usr/bin/false", "OMO_VERIFY_TEMPLATE"],
+      "cwd": ".",
+      "env_allow": [],
+      "timeout_seconds": 60,
+      "_comment": "Copy and replace with a real project test command. While the marker is present this profile fails closed."
+    }
+  }
+}

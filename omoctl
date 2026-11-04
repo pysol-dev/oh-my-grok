@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# omoctl: thin wrapper; all logic lives in omo_grok (shared with the MCP server).
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
+exec "$HERE/.venv/bin/python" -m omo_grok.cli "$@"

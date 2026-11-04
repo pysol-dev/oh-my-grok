@@ -1,0 +1,15 @@
+# runtime state, secrets, logs, job artifacts and worktrees
+state/
+jobs/
+worktrees/
+*.sqlite3
+*.sqlite3-*
+hooks.json
+secrets/
+logs/
+*.log
+# environments / caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
