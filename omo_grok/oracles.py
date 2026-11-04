@@ -3,8 +3,11 @@
 The verifier parent (which never imports candidate code) builds the cases for every verification from three parts:
   1. an EXHAUSTIVE small grid (every argument tuple in [-16, 16]^arity, filtered by the function's domain),
   2. fixed BOUNDARY values (0, +-1, +-2, sign mixes, 2**31/2**32/2**53/2**63/2**64 neighbourhoods, +-10**18,
-     +-2**200, +-2**1000) combined pairwise,
-  3. FRESH random draws from the OS CSPRNG across magnitude bands.
+     +-2**200, +-2**300(+1), +-2**1000(+-1), 2**2048+c, 3**1500, +-2**4096(+-1)) combined pairwise,
+  3. FRESH random draws from the OS CSPRNG across magnitude bands, including a band of |x| ~ 2**k with k uniform in
+     0..4096 and a random mantissa.
+Magnitude ceiling (stated): nothing above about 2**4097 is ever sent. Products of two such values stay below
+Python's default 4300-digit int<->str conversion limit, which the JSON protocol needs.
 It sends them one at a time, in a shuffled order, to an untrusted child that calls the candidate, and compares the raw
 JSON values it gets back with what the oracle computes here. A candidate cannot pass without returning the right value
 on the whole small grid, on every boundary pair, and on inputs it could not know in advance.
@@ -23,13 +26,17 @@ _rng = secrets.SystemRandom()
 
 
 GRID = range(-16, 17)  # exhaustive small grid per argument
+LARGE_EXP_MAX = 4096   # random large-magnitude band: |x| ~ 2**k, k in 0..4096
 
 
 def _boundary_ints() -> list[int]:
     """Zero, +-1, +-2, the edges of the small grid, and both sides of the common machine-int / float-exact limits
     (2**31, 2**32, 2**53, 2**63, 2**64), plus 10**18 and arbitrary-precision magnitudes, with both signs."""
     pos = {1, 2, 16, 17, 2 ** 31 - 1, 2 ** 31, 2 ** 32, 2 ** 53 + 1, 2 ** 63 - 1, 2 ** 63, 2 ** 64, 10 ** 18,
-           2 ** 200, 2 ** 1000}
+           2 ** 200, 2 ** 1000,
+           # round 7: large magnitudes up to the 2**4096 ceiling, both sides of each power, plus non-powers
+           2 ** 300, 2 ** 300 + 1, 2 ** 1000 - 1, 2 ** 1000 + 1, 2 ** 2048 + 12345, 3 ** 1500,
+           2 ** 4096 - 1, 2 ** 4096, 2 ** 4096 + 1}
     return sorted({0} | pos | {-x for x in pos})
 
 
@@ -38,7 +45,11 @@ BOUNDARY_INTS = _boundary_ints()
 
 def rand_int() -> int:
     """Mix of magnitudes: small, medium, 64-bit-ish and arbitrary precision, both signs."""
-    band = _rng.randrange(5)
+    band = _rng.randrange(6)
+    if band == 5:  # |x| in [2**k, 2**(k+1)) for k uniform in 0..4096, random mantissa, random sign
+        k = _rng.randrange(0, LARGE_EXP_MAX + 1)
+        x = (1 << k) | _rng.getrandbits(k) if k else 1
+        return x if _rng.randrange(2) else -x
     if band == 0:
         return _rng.randint(-100, 100)
     if band == 4:

@@ -109,19 +109,55 @@ accepted residual. Mitigations:
   variables were silently ignored (the run used an ordinary random seed and `-I` alone provided safe-path). The
   isolated run now uses `-s -S -B -P` (user site off, no site, no bytecode, safe path; no `-E`), so its pinned seed
   takes effect; a test checks that each run's flags + env give a distinct, effective `hash()`. The call-stack depth
-  at which the candidate is called is randomized per call (0..300 extra frames), and since round 6 the child raises
-  its recursion limit by the padding (+50) first. **Correction (round 6):** before that, the padding came out of the
-  default limit of 1000, so correct code recursing ~700 deep could fail in a padded run (a false failure, not a
-  false pass); a correct depth-700 recursive `add` now passes all runs (tested). The runs also differ in **resource limits** (round 5): one run has a random low
+  at which the candidate is called is randomized per call (0..300 extra frames; 0 in the plain run).
+  **Recursion headroom (round 7, C2-4).** Every candidate call is made from the `-c` program's top level, exactly
+  like a script calling `calc.add(...)` (the protocol loop is a generator that hands each call to a top-level
+  loop). An unpadded call (always in the plain run, and whenever a padded run draws 0) runs at the **stock**
+  recursion limit, at the same frame depth as real use. A padded call raises the limit, for that call only, by
+  exactly the number of frames counted below the callee (walked via the frame chain at the call, not estimated),
+  and restores it afterwards. So the callee never has more headroom than a top-level call in a normal process,
+  and correct deep code is not starved by the padding. **Correction:** round 6 said the child "raises its recursion
+  limit by the padding (+50)"; it raised it once to stock + pad_max + 50 for the whole session and in every run,
+  including the plain one with no padding, so code recursing ~1010 deep passed the oracle but raises RecursionError
+  in real use (Momus C2-4). Tests: in all three flag sets and with padding 0, 150 and 300, the largest depth a real
+  top-level call can reach (measured, 997 here) succeeds and one more raises RecursionError; C2-4 fails the
+  verifier with the scan on and off; a correct depth-700 recursive `add` passes. The runs The runs also differ in **resource limits** (round 5): one run has a random low
   RLIMIT_AS (256-512 MiB), one the default 4 GiB, one none, so code that senses the memory limit (by allocating or by
   reading it) gets different answers in different runs. The same inputs go to every run; every run must match the
   oracle and all results must be identical across runs. A correct candidate passes all three (tested).
 - **(c) Pure-function rule** (`candidate_scan.pure_module_problems`, required for every `fixture-*` profile via
   `pure_modules: {"allow_imports": [...]}`, applied to **every** `.py` under `editable_paths` in the checked-out
-  revision, changed or not, so a relative import can only reach scanned code). It is an
-  allowlist: module top level may contain only a docstring, allowlisted imports (calc: **none**; the ceiling for any
-  profile is `math`, `operator`, `cmath`, `numbers`), function/class definitions without decorators, and immutable
-  literal constants. Inside code: names must be defined in the module or be one of a fixed set of pure builtins (no
+  revision, changed or not, so a relative import can only reach scanned code). **Round 7: a real allowlist.**
+  Rounds 4-6 called this rule an allowlist, but only names and imports were allowlisted; node types and attribute
+  access were governed by bans, and each round found another construct outside the bans (`try`, `is`, sets, then
+  dict views: C2-3). That description was inaccurate. `candidate_scan._allowlist_problems` now accepts ONLY:
+  - module level: a docstring; `import m` / `from m import name` where `m` is in the profile's `allow_imports`
+    (calc: **none**; ceiling `math`, `operator`, `cmath`, `numbers`) and `name` is in `PURE_MODULE_ATTRS[m]`;
+    `from __future__ import annotations`; relative imports of scanned local modules; `NAME = <literal>` (int,
+    float, str, bool, None, or tuples of them); top-level `def`s. No classes, no other statements;
+  - functions: plain positional parameters only (no `*args`, keyword-only or `**kwargs`, no decorators), literal
+    defaults, annotations only `int`/`float`/`bool`/`str`/`None`; no nested functions or lambdas;
+  - statements: `return`, assignment / augmented assignment to local names (or a tuple/list of names), `if`,
+    `while`, `for <name(s)> in range(...)`, `break`/`continue` inside loops, `pass`, a docstring, and
+    `raise ValueError|TypeError|ZeroDivisionError|ArithmeticError|OverflowError[(...)]` (no `from`). Expression
+    statements, `assert` (behaves differently under `-O`), `del`, `try`, `with`, `match`, `global`, `yield` etc.
+    are rejected;
+  - expressions: `+ - * / // % ** << >> | ^ &`, unary `+ - not ~`, `and`/`or`, comparisons `== != < <= > >= in
+    not in` (**no `is` / `is not`**, not even against None), `x if c else y`, constants int/float/str/bool/None
+    (no bytes, complex, Ellipsis), tuple and list displays (no starred), subscripts and slices (load only), and
+    calls whose callee is a name or an allowlisted module attribute, with no `*`/`**` arguments;
+  - names: parameters, locals, module-level names, and the builtins `abs min max int float bool str len range
+    isinstance round divmod pow sum all any tuple list` plus the five exception types above;
+  - attributes: only `<allowlisted module>.<name in PURE_MODULE_ATTRS>` (e.g. `math.isqrt`, `operator.add`) or a
+    public name of a scanned local module. There is **no attribute access on values**, so no methods at all
+    (`.keys()`, `.items()`, `.upper()`, `.sort()`, `.format`, `.__class__`, ...).
+  **Dict and set literals, dict/set/list comprehensions, generator expressions, f-strings, walrus, lambdas and
+  `dict`/`set`/`frozenset`/`sorted`/`repr`/`type`/`hash`/`id` are all outside the allowlist.** Anything not listed
+  is rejected. The real calc fix (`return a + b`), the fixture base file and every earlier correct candidate pass
+  (tested); the one earlier allowlist example that used a class with `self` was changed to a plain function.
+  The older checks below still run as defence in depth (both layers must accept). Earlier wording, kept for the
+  denylist layer: module top level may contain only a docstring, allowlisted imports, function definitions without
+  decorators, and immutable literal constants. Inside code: names must be defined in the module or be one of a fixed set of pure builtins (no
   `open`, `print`, `getattr`, `type`, `vars`, `__import__`, ...); no dunder names, no `_private`/dunder attributes,
   no `.format`/`.format_map`, no `global`/`nonlocal`, no mutable defaults, no attribute/item assignment on
   module-level objects, no `with`/async, no imports inside functions. Round 5 additions (after HMEM):
@@ -143,8 +179,11 @@ accepted residual. Mitigations:
   - (round 6) no `is` / `is not` except against the literal `None` (C2-1), and no `set`, `frozenset`, `hash`, `id`,
     set literals or set comprehensions (C2-2).
   That forbids, among others, `os.*`, `sys.*`, `resource`, environment, flags, argv, cwd, pids, users, platform,
-  socket, time, random, threading, signal, inspect, traceback, file I/O and `/proc`. The static rules are a
-  tripwire and will not cover every construct.
+  socket, time, random, threading, signal, inspect, traceback, file I/O and `/proc`. The static rules are
+  still a tripwire, not a proof: an allowlist can only be as good as the semantics of what it admits (for
+  example, `str(x)` of an int with more than 4300 digits raises in every run and in real use alike, so that is an
+  error, not a probe; and anything the allowed subset can compute from its arguments alone is by construction not
+  environment-dependent, apart from recursion depth, which C2-4 now matches to real use).
 
 **Which variants each layer stops** (`tests/integration/test_harness_detection.py`; every variant fails the full
 verifier):
@@ -179,11 +218,12 @@ verifier):
   that string-set iteration order "follows the per-process hash seed (also random in every run)", implying runs
   would catch hash-dependent code. That was wrong twice: such behaviour differs between runs only *probabilistically*
   (Momus's C2-2 passed 8 of 12 times), and the isolated run's pinned seed was ignored under `-I`. Hash-order
-  dependence is now enforced statically (C2-2 below); the per-run seeds are only a second, probabilistic layer.
+  dependence is enforced statically only since round 7 (C2-3 below); the per-run seeds are a second,
+  probabilistic layer.
 - **C2-1: argument identity (Momus re-review #6).** `if a is b and a > 1000: return a - b` passed every case,
   because the child decodes every request with `json.loads`, so the two arguments were always distinct objects,
   while a real caller writing `x = 5000; add(x, x)` passes one object. Variant: `a is b and (a > 256 or a < -5)`
-  (outside CPython's small-int cache). Fixes: (c) now rejects `is` / `is not` unless one side is the literal `None`;
+  (outside CPython's small-int cache). Fixes: (c) rejected `is` / `is not` unless one side is the literal `None` (round 7: `is` is outside the allowlist entirely);
   and the oracle sends **aliased** cases: every equal-argument case (grid and boundary diagonals, plus random equal
   pairs, including values far outside the small-int cache) is sent both as fresh objects and with the child passing
   the same object twice (`"alias": [[0, 1]]`), positionally and by keyword. Both variants fail with the static rule
@@ -192,8 +232,17 @@ verifier):
   sorted(o) else a + b` passed 8/12. Fix: (c) bans `set`, `frozenset`, `hash`, `id`, set literals and set
   comprehensions in pure modules (rejected statically every time; tested with literal, `set()`, `frozenset()`,
   comprehension and `hash()` variants). The per-run seeds (b) remain, but they detect hash dependence only with some
-  probability. **Dict iteration** is insertion-ordered by language guarantee and does not depend on the hash seed,
-  so dicts stay allowed.
+  probability. **Correction (round 7):** round 6 said hash-order dependence was thereby "enforced statically" and
+  that dicts "stay allowed" because dict iteration is insertion-ordered. The second half is true of iterating a
+  dict, but dict **views** support set operators (`d.keys() | ()`, `d.keys() & d.keys()`, `d.keys() ^ {}`,
+  `d.items() | ()`) that return real `set`s, whose order follows the hash seed. Momus's C2-3 passed 10 of 11 runs
+  under round 6, so the claim was false.
+- **C2-3: dict-view set operations (Momus re-review #7).** `o = list({'alpha':0,...}.keys() | ())` then
+  `a-b if o==sorted(o) else a+b`, plus the variants `d.keys() & d.keys()`, `d.keys() ^ {}` and `d.items() | ()`.
+  Closed by the round-7 allowlist (c): dict literals, dict comprehensions and every attribute access on a value are
+  outside it, so all four are rejected before running (tests and repro). With the static rule disabled the runtime
+  layer catches them only probabilistically (see the repro numbers in `spec/PROGRESS.md`); the allowlist is the
+  enforcement.
 - **Oracle-vs-real-call audit (round 6).** Ways the oracle's calls could differ from a real caller's, and status:
   - *identity*: covered (C2-1, rule + aliased cases). Identity of unequal values cannot be observed without `is`/`id`.
   - *keyword vs positional*: covered. Every grid/boundary case is also sent with all arguments by keyword, the grid
@@ -212,10 +261,19 @@ verifier):
 - **Oracle coverage (round 5, after HDIST).** Every verification sends: the exhaustive grid of all argument pairs in
   [-16, 16]^2 (1089 per binary function, filtered by each function's domain predicate, e.g. no zero divisor);
   pairwise boundary values (0, +-1, +-2, +-16, +-17, both sides of 2**31, 2**32, 2**53+1, 2**63, 2**64, +-10**18,
-  +-2**200, +-2**1000), and each boundary against 0, +-1, +-2, +-16 in both orders; then `cases_per_function` fresh
-  CSPRNG draws (bands: |x|<=100, <=1000, <=10**12, <=2**63, <=2**200). Round 6 adds keyword, mixed and aliased
-  copies and bool cases (C2-1 and the audit above), about 10,000 cases per run and 30,000 per verification
-  (~2 s here). Order is shuffled per run. Momus's HDIST
+  +-2**200, +-2**1000; round 7: +-2**300, +-(2**300+1), +-(2**1000+-1), +-(2**2048+12345), +-3**1500,
+  +-(2**4096-1), +-2**4096, +-(2**4096+1)), and each boundary against 0, +-1, +-2, +-16 in both orders; then
+  `cases_per_function` fresh CSPRNG draws spread over six bands: |x|<=100, <=1000, <=10**12, <=2**63, <=2**200, and
+  (round 7) |x| in [2**k, 2**(k+1)) with k uniform in 0..4096 and a random mantissa, random sign. Round 6 adds
+  keyword, mixed and aliased copies and bool cases (C2-1 and the audit above); with the round-7 boundaries that is
+  about 15,700 cases per run and 47,000 per verification (~4 s here). **Magnitudes covered:** exhaustively
+  [-16, 16]; at fixed boundaries up to 2**4096+1; by sampling, every bit length 1..4097 has the same chance per
+  large-band draw (about 16 large-band draws per function per run, so any range of bit lengths wider than a few
+  hundred is hit with near certainty; a test shows "wrong for |a| > 2**300 except 2**1000", "wrong for
+  2**2049 < |b| < 2**4095" and "wrong above 2**4000" all fail). **Not covered:** nothing above about 2**4097 is
+  ever sent (products must stay under Python's default 4300-digit int-to-str limit that the JSON protocol needs),
+  so code wrong only above that passes; and within the large range, a narrow band of bit lengths or a sparse
+  pattern of values is only sampled. Order is shuffled per run. Momus's HDIST
   (wrong for |a|,|b|<=10 except the unittest pairs) now fails every time (tested 5x plus the manual repro).
   **Limit:** outside the grid and the boundary set the oracle samples. A function wrong only on a sparse set of
   inputs that are neither in the grid, nor boundaries, nor likely random draws (e.g. one specific 40-digit value, or

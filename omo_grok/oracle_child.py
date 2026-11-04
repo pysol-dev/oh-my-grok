@@ -14,6 +14,12 @@ Protocol (line-delimited JSON on stdin/stdout):
   child -> parent  {"id": n, "value": <raw result>}              generated/sent after this answer arrives
                    {"id": n, "error": "..."}
   parent -> child  {"end": true}
+Every candidate call is made from the program's TOP LEVEL (the module frame of `-c`), exactly like a script calling
+`calc.add(...)`: the protocol loop is a generator that hands each call out to a top-level loop. With padding 0 the
+call runs at the stock recursion limit with the same frame depth as real use. With random padding n > 0 the call
+goes through n extra frames, and for that call only the limit is raised by exactly the number of frames counted
+below the callee (measured with the frame chain, not estimated), then restored; the callee never gets more headroom
+than a top-level call in a normal process.
 The bootstrap text deliberately contains no harness marker words (checked by tests)."""
 from __future__ import annotations
 
@@ -29,13 +35,26 @@ def _main(names, pad_max, hard_exit):
     sys.stdout = sys.stderr
     mods = {{n: sys.modules[n] for n in names}}
     rnd = random.SystemRandom()
+    stock = sys.getrecursionlimit()
 
-    # the random call-stack padding below must never make correct deep code fail: raise the limit by the padding
-    sys.setrecursionlimit(sys.getrecursionlimit() + pad_max + 50)
+    def frames():
+        f, n = sys._getframe(1), 0
+        while f is not None:
+            n, f = n + 1, f.f_back
+        return n
 
     def deep(n, f, a, k):
-        return f(*a, **k) if n <= 0 else deep(n - 1, f, a, k)
+        if n > 0:
+            return deep(n - 1, f, a, k)
+        # f must get exactly the headroom it has when called from a script's top level (where it is at depth 2):
+        # raise the limit by the frames measured below it, for this one call only
+        sys.setrecursionlimit(stock + frames() - 1)
+        try:
+            return f(*a, **k)
+        finally:
+            sys.setrecursionlimit(stock)
     chan.write(json.dumps({{"ready": True}}) + "\\n")
+    res = None
     for line in sys.stdin:
         req = json.loads(line)
         if req.get("end"):
@@ -49,8 +68,11 @@ def _main(names, pad_max, hard_exit):
             names = req.get("names") or [""] * len(vals)
             pos = [x for x, nm in zip(vals, names) if not nm]
             kw = {{nm: x for x, nm in zip(vals, names) if nm}}
-            v = deep(rnd.randrange(pad_max + 1), getattr(mods[m], fn), pos, kw)
-            msg = json.dumps({{"id": rid, "value": v}})
+            f = getattr(mods[m], fn)
+            n = rnd.randrange(pad_max + 1)
+            # the call itself happens at the program's top level (see below), unpadded at the stock limit
+            ok, v = yield ((f, pos, kw) if n == 0 else (deep, (n, f, pos, kw), {{}}))
+            msg = json.dumps({{"id": rid, "value": v}}) if ok else json.dumps({{"id": rid, "error": v}})
         except BaseException as e:
             msg = json.dumps({{"id": rid, "error": type(e).__name__}})
         chan.write(msg + "\\n")
@@ -59,7 +81,18 @@ def _main(names, pad_max, hard_exit):
         os._exit(0)
 
 
-_main({names!r}, {pad}, {hard})
+_c = _main({names!r}, {pad}, {hard})
+_t = next(_c, None)
+while _t is not None:
+    _f, _a, _k = _t
+    try:
+        _v = (True, _f(*_a, **_k))
+    except BaseException as _e:
+        _v = (False, type(_e).__name__)
+    try:
+        _t = _c.send(_v)
+    except StopIteration:
+        _t = None
 '''
 
 

@@ -74,8 +74,8 @@ def test_correct_deep_recursion_passes_every_run(tmp_path):
 
 
 def test_keyword_and_bool_calls_are_part_of_the_contract(tmp_path, monkeypatch):
-    extra_rest = "def add(a, b, *rest):\n    return a + b\n"  # control: still correct
-    assert _verify(tmp_path / "1", extra_rest).status == "passed"
+    swapped = "def add(a, b):\n    return b + a\n"  # control: still correct
+    assert _verify(tmp_path / "1", swapped).status == "passed"
     renamed = "def add(x, y):\n    return x + y\n"  # keyword calls use the declared names a, b
     o = _verify(tmp_path / "2", renamed)
     assert o.status == "failed" and "ORACLE:" in o.detail, o.detail

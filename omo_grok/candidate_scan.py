@@ -234,6 +234,241 @@ def _bound_names(tree) -> set[str]:
     return names
 
 
+# ---- round 7: strict node/builtin/attribute ALLOWLIST (the checks above and below the walk stay as defence in depth)
+PURE_ALLOWED_BUILTINS = {
+    "abs", "min", "max", "int", "float", "bool", "str", "len", "range", "isinstance", "round", "divmod", "pow",
+    "sum", "all", "any", "tuple", "list",
+    "ValueError", "TypeError", "ZeroDivisionError", "ArithmeticError", "OverflowError"}
+PURE_EXCEPTIONS = {"ValueError", "TypeError", "ZeroDivisionError", "ArithmeticError", "OverflowError"}
+# attribute access exists ONLY as `<allowlisted module>.<name>` from this table (or a scanned local module's public
+# name); there is no attribute access on any value, so no methods (`.keys()`, `.format`, `.__class__`, ...)
+PURE_MODULE_ATTRS = {
+    "math": {"sqrt", "isqrt", "floor", "ceil", "trunc", "gcd", "lcm", "fabs", "factorial", "comb", "perm", "copysign",
+             "fmod", "remainder", "log", "log2", "log10", "log1p", "exp", "expm1", "sin", "cos", "tan", "asin",
+             "acos", "atan", "atan2", "sinh", "cosh", "tanh", "hypot", "dist", "degrees", "radians", "isfinite",
+             "isinf", "isnan", "isclose", "prod", "fsum", "modf", "frexp", "ldexp", "pi", "e", "tau", "inf", "nan"},
+    "operator": {"add", "sub", "mul", "floordiv", "truediv", "mod", "neg", "pos", "abs", "pow", "and_", "or_", "xor",
+                 "lshift", "rshift", "invert", "lt", "le", "eq", "ne", "ge", "gt", "not_", "index"},
+    "cmath": {"sqrt", "exp", "log", "log10", "phase", "polar", "rect", "isfinite", "isinf", "isnan", "isclose",
+              "pi", "e", "tau", "inf", "infj", "nan", "nanj"},
+    "numbers": {"Number", "Complex", "Real", "Rational", "Integral"},
+}
+_ALLOWED_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow, ast.LShift, ast.RShift,
+                   ast.BitOr, ast.BitXor, ast.BitAnd)
+_ALLOWED_UNARY = (ast.UAdd, ast.USub, ast.Not, ast.Invert)
+_ALLOWED_CMP = (ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.In, ast.NotIn)
+_ANNOTATION_NAMES = {"int", "float", "bool", "str"}
+
+
+def _const_ok(v) -> bool:
+    return v is None or type(v) in (int, float, str, bool)
+
+
+def _allowlist_problems(tree, allow_imports, local_modules, rel, bad) -> None:
+    """Accept ONLY: module docstring; `import m` / `from m import name` for allowlisted modules (names from
+    PURE_MODULE_ATTRS) and relative imports of scanned local modules; module-level `NAME = <literal>`; top-level
+    functions with plain positional parameters (optional literal defaults, optional int/float/bool/str
+    annotations) whose bodies use only: Return, Assign/AugAssign to local names (or tuples of them), If, While,
+    `for <name(s)> in range(...)`, Break, Continue, Pass, `raise <allowed exception>(...)`, a docstring; expressions
+    limited to arithmetic/bitwise BinOp, UnaryOp, BoolOp, Compare (no is/is not), IfExp, Call of a known function,
+    Name, Constant (int/float/str/bool/None), Tuple/List, Subscript (load) and Slice. Everything else is rejected."""
+    allow = set(allow_imports or [])
+    mod_alias: dict[str, str] = {}   # alias -> allowlisted module
+    local_alias: set[str] = set()    # alias of a scanned local module (`from . import helper`)
+    top: set[str] = set()            # module-level names: functions, literal constants, imported names
+
+    def lit(n) -> bool:
+        if isinstance(n, ast.Constant):
+            return _const_ok(n.value)
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.USub, ast.UAdd)):
+            return lit(n.operand)
+        if isinstance(n, ast.Tuple):
+            return all(lit(e) for e in n.elts)
+        return False
+
+    for i, st in enumerate(tree.body):
+        if i == 0 and isinstance(st, ast.Expr) and _is_str_const(st.value):
+            continue
+        if isinstance(st, ast.Import):
+            for a in st.names:
+                if a.name in allow and a.name in PURE_MODULE_ATTRS:
+                    mod_alias[a.asname or a.name] = a.name
+                else:
+                    bad(st, f"[allowlist] import {a.name}")
+        elif isinstance(st, ast.ImportFrom):
+            if st.level == 0:
+                if st.module == "__future__" and all(a.name == "annotations" for a in st.names):
+                    continue
+                for a in st.names:
+                    if st.module in allow and a.name in PURE_MODULE_ATTRS.get(st.module or "", ()):
+                        top.add(a.asname or a.name)
+                    else:
+                        bad(st, f"[allowlist] from {st.module} import {a.name}")
+            else:
+                target = _relative_target(rel, st.level, st.module)
+                for a in st.names:
+                    if a.name == "*" or a.name.startswith("_"):
+                        continue  # reported by the denylist layer
+                    if st.module is None and _local_module_ok(f"{target}/{a.name}" if target else a.name,
+                                                              local_modules):
+                        local_alias.add(a.asname or a.name)
+                    else:
+                        top.add(a.asname or a.name)  # resolution checked by the denylist layer
+        elif isinstance(st, ast.FunctionDef):
+            top.add(st.name)
+        elif isinstance(st, ast.Assign) and all(isinstance(t, ast.Name) for t in st.targets) and lit(st.value):
+            top.update(t.id for t in st.targets)
+        else:
+            bad(st, f"[allowlist] module-level {type(st).__name__} not allowed")
+
+    def ann_ok(a) -> bool:
+        return a is None or (isinstance(a, ast.Name) and a.id in _ANNOTATION_NAMES) or \
+            (isinstance(a, ast.Constant) and a.value is None)
+
+    def target_ok(t) -> bool:
+        if isinstance(t, ast.Name):
+            return True
+        if isinstance(t, (ast.Tuple, ast.List)):
+            return all(isinstance(e, ast.Name) for e in t.elts)
+        return False
+
+    for st in tree.body:
+        if not isinstance(st, ast.FunctionDef):
+            continue
+        a = st.args
+        if a.vararg or a.kwarg or a.kwonlyargs or st.decorator_list or getattr(st, "type_params", None):
+            bad(st, f"[allowlist] function {st.name}: only plain positional parameters, no decorators")
+        if not all(lit(d) for d in a.defaults):
+            bad(st, f"[allowlist] function {st.name}: defaults must be literals")
+        if not all(ann_ok(x.annotation) for x in [*a.posonlyargs, *a.args]) or not ann_ok(st.returns):
+            bad(st, f"[allowlist] function {st.name}: annotations may only be int/float/bool/str/None")
+        local = {x.arg for x in [*a.posonlyargs, *a.args]}
+        for n in ast.walk(st):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                local.add(n.id)
+        known = local | top | PURE_ALLOWED_BUILTINS
+        body = st.body[1:] if st.body and isinstance(st.body[0], ast.Expr) and _is_str_const(st.body[0].value) \
+            else st.body
+
+        def expr(e) -> None:
+            if isinstance(e, ast.Constant):
+                if not _const_ok(e.value):
+                    bad(e, f"[allowlist] constant of type {type(e.value).__name__}")
+            elif isinstance(e, ast.Name):
+                if not isinstance(e.ctx, ast.Load) or e.id not in known:
+                    bad(e, f"[allowlist] name {e.id!r} is not a parameter, local, module-level name or allowed "
+                           f"builtin")
+            elif isinstance(e, ast.BinOp):
+                if not isinstance(e.op, _ALLOWED_BINOPS):
+                    bad(e, f"[allowlist] operator {type(e.op).__name__}")
+                expr(e.left)
+                expr(e.right)
+            elif isinstance(e, ast.UnaryOp):
+                if not isinstance(e.op, _ALLOWED_UNARY):
+                    bad(e, f"[allowlist] operator {type(e.op).__name__}")
+                expr(e.operand)
+            elif isinstance(e, ast.BoolOp):
+                for v in e.values:
+                    expr(v)
+            elif isinstance(e, ast.Compare):
+                for op in e.ops:
+                    if not isinstance(op, _ALLOWED_CMP):
+                        bad(e, f"[allowlist] comparison {type(op).__name__} (no is / is not)")
+                expr(e.left)
+                for c in e.comparators:
+                    expr(c)
+            elif isinstance(e, ast.IfExp):
+                expr(e.test)
+                expr(e.body)
+                expr(e.orelse)
+            elif isinstance(e, (ast.Tuple, ast.List)):
+                if not isinstance(e.ctx, ast.Load):
+                    bad(e, "[allowlist] tuple/list store outside an assignment target")
+                for x in e.elts:
+                    if isinstance(x, ast.Starred):
+                        bad(x, "[allowlist] starred element")
+                    else:
+                        expr(x)
+            elif isinstance(e, ast.Subscript):
+                if not isinstance(e.ctx, ast.Load):
+                    bad(e, "[allowlist] item assignment/deletion")
+                expr(e.value)
+                expr(e.slice)
+            elif isinstance(e, ast.Slice):
+                for x in (e.lower, e.upper, e.step):
+                    if x is not None:
+                        expr(x)
+            elif isinstance(e, ast.Attribute):
+                ok = isinstance(e.value, ast.Name) and isinstance(e.ctx, ast.Load) and (
+                    (e.value.id in mod_alias and e.attr in PURE_MODULE_ATTRS[mod_alias[e.value.id]]) or
+                    (e.value.id in local_alias and not e.attr.startswith("_")))
+                if not ok:
+                    bad(e, f"[allowlist] attribute .{e.attr} (only allowlisted module functions/constants; no "
+                           f"methods or attributes of values)")
+            elif isinstance(e, ast.Call):
+                f = e.func
+                if not (isinstance(f, ast.Name) or isinstance(f, ast.Attribute)):
+                    bad(e, "[allowlist] call of a computed callee")
+                expr(f)
+                for x in e.args:
+                    if isinstance(x, ast.Starred):
+                        bad(x, "[allowlist] *args in a call")
+                    else:
+                        expr(x)
+                for k in e.keywords:
+                    if k.arg is None:
+                        bad(e, "[allowlist] **kwargs in a call")
+                    else:
+                        expr(k.value)
+            else:
+                bad(e, f"[allowlist] expression {type(e).__name__} not allowed")
+
+        def stmts(ss, loop: bool) -> None:
+            for x in ss:
+                if isinstance(x, ast.Return):
+                    if x.value is not None:
+                        expr(x.value)
+                elif isinstance(x, ast.Assign):
+                    if not all(target_ok(t) for t in x.targets):
+                        bad(x, "[allowlist] assignment target must be local name(s)")
+                    expr(x.value)
+                elif isinstance(x, ast.AugAssign):
+                    if not isinstance(x.target, ast.Name) or not isinstance(x.op, _ALLOWED_BINOPS):
+                        bad(x, "[allowlist] augmented assignment must be `local op= expr`")
+                    expr(x.value)
+                elif isinstance(x, ast.If):
+                    expr(x.test)
+                    stmts(x.body, loop)
+                    stmts(x.orelse, loop)
+                elif isinstance(x, ast.While):
+                    expr(x.test)
+                    stmts(x.body, True)
+                    stmts(x.orelse, loop)
+                elif isinstance(x, ast.For):
+                    it = x.iter
+                    if not (target_ok(x.target) and isinstance(it, ast.Call) and isinstance(it.func, ast.Name)
+                            and it.func.id == "range" and "range" not in local | top):
+                        bad(x, "[allowlist] for loops may only iterate over range(...) into local name(s)")
+                    expr(it)
+                    stmts(x.body, True)
+                    stmts(x.orelse, loop)
+                elif isinstance(x, (ast.Break, ast.Continue)):
+                    if not loop:
+                        bad(x, f"[allowlist] {type(x).__name__} outside a loop")
+                elif isinstance(x, ast.Pass):
+                    pass
+                elif isinstance(x, ast.Raise):
+                    exc = x.exc.func if isinstance(x.exc, ast.Call) else x.exc
+                    if x.cause is not None or not (isinstance(exc, ast.Name) and exc.id in PURE_EXCEPTIONS
+                                                   and exc.id not in local | top):
+                        bad(x, f"[allowlist] raise only {sorted(PURE_EXCEPTIONS)}")
+                    if isinstance(x.exc, ast.Call):
+                        expr(x.exc)
+                else:
+                    bad(x, f"[allowlist] statement {type(x).__name__} not allowed")
+        stmts(body, False)
+
+
 def pure_module_problems(text: str, rel: str, allow_imports, local_modules=frozenset()) -> list[str]:
     """Allowlist scan of one fixture source file. Returns problems (empty = pure).
 
@@ -371,4 +606,18 @@ def pure_module_problems(text: str, rel: str, allow_imports, local_modules=froze
                 base = base.value
             if isinstance(base, ast.Name) and base.id in module_level:
                 bad(n, f"item assignment on module-level object {base.id} (state between calls)")
+    _allowlist_problems(tree, allow_imports, local_modules, rel, bad)
+    return out
+
+
+def pure_allowlist_problems(text: str, rel: str, allow_imports, local_modules=frozenset()) -> list[str]:
+    """Only the round-7 allowlist layer (for tests and diagnostics); `pure_module_problems` runs it plus the
+    denylist and import-resolution checks."""
+    try:
+        tree = ast.parse(text, filename=rel)
+    except (SyntaxError, ValueError) as e:
+        return [f"{rel}: cannot parse ({type(e).__name__}); fail closed"]
+    out: list[str] = []
+    _allowlist_problems(tree, allow_imports, local_modules, rel,
+                        lambda n, why: out.append(f"{rel}:{getattr(n, 'lineno', '?')}: pure-function rule: {why}"))
     return out

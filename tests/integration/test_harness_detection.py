@@ -133,11 +133,12 @@ def test_pure_rule_is_required_for_fixture_profiles_and_bounded():
 
 def test_pure_rule_allowlist_examples():
     from omo_grok.candidate_scan import pure_module_problems as pure
-    ok = '"""m"""\nimport math\nK = (1, 2)\n\n\nclass V:\n    Z = 0\n\n    def f(self, x):\n        return math.sqrt(x)\n'
+    # round 7: classes (and so `self.x` attribute access) are no longer allowed; plain functions are
+    ok = '"""m"""\nimport math\nK = (1, 2)\n\n\ndef f(x):\n    return math.sqrt(x) + K[0]\n'
     assert pure(ok, "m.py", ["math"]) == []
     for bad in ["import math\n", "x = []\n", "def f(a, c={}):\n    return a\n", "def f():\n    return open('x')\n",
                 "def f():\n    global G\n", "def f():\n    try:\n        return f()\n    except RecursionError:\n        return 1\n",
                 "def f():\n    return '{0.__globals__}'.format(f)\n", "def f(x):\n    return x.__class__\n",
-                "def f():\n    f.n = 1\n", "if True:\n    pass\n", "@staticmethod\ndef f():\n    pass\n",
+                "def f():\n    f.n = 1\n", "if True:\n    pass\n", "class V:\n    Z = 0\n", "@staticmethod\ndef f():\n    pass\n",
                 "def f():\n    import os\n", "def f():\n    return __file__\n", "def f():\n    print(1)\n"]:
         assert pure(bad, "m.py", []), bad

@@ -134,7 +134,7 @@ candidate without executing it when any changed path:
 The trusted parent (which never imports candidate code) then decides the result:
 - **oracle profiles** (assurance `oracle`): in each of 3 varied, neutral sandboxed runs (with different
   address-space limits: low / 4 GiB / none) the oracle child must answer every case (exhaustive [-16,16]^2 grid,
-  boundary pairs, keyword/mixed-form and aliased-equal-argument copies, bool cases and fresh random draws; keyword
+  boundary pairs, keyword/mixed-form and aliased-equal-argument copies, bool cases, magnitudes up to 2**4096 and fresh random draws; keyword
   calls make the parameter names `a`, `b` part of the contract) with a raw JSON value that is `type(v) is int` and equal to the trusted oracle's answer,
   then exit 0, and the runs must agree. The advisory unittest child must also report a clean run; its report alone
   does not make a run pass.
