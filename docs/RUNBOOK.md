@@ -64,6 +64,13 @@ For each async role, open the routine in the Grok Bot UI (desktop) and copy its 
 
 Never paste keys into chat, argv or files.
 
+Pasted values are cleaned before validation: bracketed-paste markers (`ESC[200~`/`ESC[201~`, with or without ESC),
+every control or non-printable character (CR, LF, TAB, ESC, zero-width), surrounding whitespace, and one matching
+pair of surrounding quotes or `<...>`. Each prompt allows 3 tries. A rejection prints only a diagnostic (length,
+empty, scheme http/https/empty/other, host present, whether characters were removed), never the value.
+Metis serves two roles (`metis`, then `qa-executor`) and Momus two (`momus`, then `code-reviewer`); each has its
+own routine (`omo-bus-<role>`) with its own URL and key, so run `hook set` once per role.
+
 **Rotation:** rotate the key in the routine UI, then run `hook set ROLE` again, then
 `resume JOB` for any job blocked with `webhook key rejected`.
 

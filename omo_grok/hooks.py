@@ -39,6 +39,40 @@ def load_hooks(paths: Paths) -> dict:
     return data
 
 
+_PASTE_MARKERS = ("\x1b[200~", "\x1b[201~", "[200~", "[201~")
+_PAIRS = (('"', '"'), ("'", "'"), ("<", ">"), ("`", "`"))
+
+
+def sanitize_input(raw: str) -> tuple[str, bool]:
+    """Clean a pasted URL or key: drop bracketed-paste markers (with or without ESC), every ASCII control char
+    (C0 + DEL, incl. CR/LF/TAB/ESC) and other non-printable chars, surrounding whitespace, and ONE matching pair of
+    surrounding quotes or angle brackets. Returns (clean, removed_nonprintable). Never logs the value."""
+    s = raw or ""
+    for m in _PASTE_MARKERS:
+        s = s.replace(m, "")
+    kept = "".join(c for c in s if c.isprintable() or c == " ")
+    removed = kept != s
+    kept = kept.strip()
+    for lo, hi in _PAIRS:
+        if len(kept) >= 2 and kept[0] == lo and kept[-1] == hi:
+            kept = kept[1:-1].strip()
+            break
+    return kept, removed or (raw or "") != s
+
+
+def url_diagnostic(clean: str, removed_nonprintable: bool) -> str:
+    """A diagnostic that NEVER contains the value: length, emptiness, scheme class, host presence, cleanup flag."""
+    try:
+        u = urlparse(clean)
+        scheme, has_host = u.scheme.lower(), bool(u.hostname)
+    except ValueError:
+        scheme, has_host = "unparseable", False
+    if scheme not in ("http", "https", "", "unparseable"):
+        scheme = "other"
+    return (f"length={len(clean)} empty={not clean} scheme={scheme or 'empty'} has_host={has_host} "
+            f"non_printable_or_paste_markers_removed={removed_nonprintable}")
+
+
 def validate_url(url: str) -> None:
     u = urlparse(url)
     insecure_ok = os.environ.get("OMO_ALLOW_INSECURE_HOOKS") == "1" and u.hostname in ("127.0.0.1", "localhost")
@@ -48,13 +82,21 @@ def validate_url(url: str) -> None:
         raise ValidationError("webhook URL has no host")
 
 
+def validate_key(key: str) -> str | None:
+    """Return a problem description (never containing the key) or None."""
+    if len(key) < 8 or any(c.isspace() for c in key):
+        return f"webhook key looks invalid (too short or contains whitespace; length={len(key)})"
+    return None
+
+
 def set_hook(paths: Paths, role: str, url: str, key: str) -> None:
     if role not in ROLES:
         raise ValidationError(f"unknown role {role!r}")
-    url, key = url.strip(), key.strip()
+    url, key = sanitize_input(url)[0], sanitize_input(key)[0]
     validate_url(url)
-    if len(key) < 8 or any(c.isspace() for c in key):
-        raise ValidationError("webhook key looks invalid (too short or contains whitespace)")
+    key_problem = validate_key(key)
+    if key_problem:
+        raise ValidationError(key_problem)
     paths.secrets_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(paths.secrets_dir, 0o700)
     data = load_hooks(paths)

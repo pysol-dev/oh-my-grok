@@ -312,12 +312,52 @@ def cmd_export(args) -> int:
 
 
 # ---------------------------------------------------------------- hooks / roles
+HOOK_PROMPT_ATTEMPTS = 3
+
+
+def _url_problem(clean: str, removed: bool) -> str | None:
+    from .hooks import url_diagnostic
+    try:
+        validate_url(clean)
+        return None
+    except OmoError as e:
+        return f"{e.message} ({url_diagnostic(clean, removed)}; the value itself is not shown)"
+
+
+def _key_problem(clean: str, removed: bool) -> str | None:
+    from .hooks import validate_key
+    p = validate_key(clean)
+    return None if p is None else f"{p} (non_printable_or_paste_markers_removed={removed}; key not shown)"
+
+
+def _prompt_hidden(prompt: str, problem) -> str | None:
+    """Hidden prompt with sanitizing (bracketed paste, control chars, whitespace, one pair of quotes/<>) and up to
+    HOOK_PROMPT_ATTEMPTS tries. Diagnostics never include the value."""
+    from .hooks import sanitize_input
+    for attempt in range(1, HOOK_PROMPT_ATTEMPTS + 1):
+        try:
+            raw = getpass.getpass(prompt)
+        except EOFError:
+            raw = ""
+        clean, removed = sanitize_input(raw)
+        why = problem(clean, removed)
+        if why is None:
+            return clean
+        left = HOOK_PROMPT_ATTEMPTS - attempt
+        print(f"invalid input: {why}" + (f"; try again ({left} left)" if left else "; giving up"), file=sys.stderr)
+    return None
+
+
 def cmd_hook_set(args) -> int:
     if args.role not in ROLES:
         print(f"unknown role {args.role}", file=sys.stderr)
         return 2
-    url = getpass.getpass(f"webhook URL for {args.role} (input hidden): ")
-    key = getpass.getpass(f"webhook Bearer key for {args.role} (input hidden): ")
+    url = _prompt_hidden(f"webhook URL for {args.role} (input hidden): ", _url_problem)
+    if url is None:
+        return 2
+    key = _prompt_hidden(f"webhook Bearer key for {args.role} (input hidden): ", _key_problem)
+    if key is None:
+        return 2
     paths = get_paths()
     set_hook(paths, args.role, url, key)
     e = _engine()
