@@ -12,6 +12,97 @@ So the `omo` MCP server is a **robust cooperative state machine, not a sandbox**
 transition checks prevent *accidental* miscoordination: stale or duplicate wakeups, crossed jobs, unreviewed plans,
 fabricated "PASS" text, and runaway retries. They do **not** stop a deliberately non-compliant Bot.
 
+## Threat model: malicious candidate code (round 4)
+A second, separate adversary is the **code under test**: the candidate revision a Bot commits may contain code
+written to subvert verification. Momus round 4 showed that when the children ran as the box user without a
+filesystem sandbox, candidate code could
+P1 drop a `.pth` into the venv's site-packages (persisting into every later run),
+P2 patch `omo_grok/verifier.py` (found via `/proc/self/cmdline`), and
+S1 open `state/omo.sqlite3` via `../../..`, set `jobs.phase='done'` and read `state/secrets/`.
+
+**What runs candidate code:** the unittest child, every oracle run, and every `exit_code_only` command. All of them
+run inside the sandbox below; nothing else imports or executes candidate code (the verifier parent never does).
+
+### Sandbox (`omo_grok/sandbox.py`)
+- Mechanism: **bubblewrap** (`/usr/bin/bwrap`, 0.12.0 on this box, unprivileged user namespaces; kernel 6.12.94+).
+  No root, sudo or extra OS users. `--unshare-all` (user, mount, pid, net, ipc, uts, cgroup namespaces),
+  `--die-with-parent`, `--new-session`, `--cap-drop ALL`, `--clearenv`; rlimits AS 4 GiB, FSIZE 256 MiB, no core.
+- The sandboxed process sees only: a **read-only** bind of `/usr` (system Python and its stdlib; `/usr/local` is
+  hidden behind an empty read-only tmpfs) with `/bin`, `/lib`, `/lib64`, `/sbin` symlinks; a **writable private
+  copy** of the candidate checkout (no `.git`), fresh for every child run; a private `/tmp` tmpfs; its own `/proc`
+  (own pid namespace) and a minimal `/dev`. Oracle runs additionally get a synthetic read-only `/etc`
+  (passwd/group/hostname/hosts) and a private tmpfs home. Python is the system interpreter (`/usr/bin/python3.13`),
+  not the venv.
+- It has **no view** of `OMO_HOME/state` (DB, secrets, artifacts), `omo_grok/`, `config/`, the venv, `/home/box`,
+  any other `/workspace` content, and **no network** (empty net namespace).
+- **Fail closed:** if bwrap is missing or cannot create namespaces, verification returns
+  `no sandbox available ...; refusing to run candidate code without a sandbox (fail closed)` and never runs the
+  candidate. There is no configuration switch that disables the sandbox. `omoctl doctor` reports
+  `candidate_sandbox`. Every verification record stores the mechanism in `verifications.sandbox` (`bwrap`/`none`).
+- **Integrity tripwire:** sha256 of every file under `omo_grok/`, `config/` (and the active config dir), `omoctl`,
+  `.venv/bin`, `.venv/pyvenv.cfg` and the venv `site-packages` is taken before and after each verification. Any
+  change fails the run (`TAMPER: ...`), is stored in `verifications.tamper_json` and raises a `tamper` event. Child
+  runs use a fresh per-run copy of the checkout.
+- **Untrusted output (R1):** child stdout/stderr are read with hard caps (1 MB per stream kept, rest drained and
+  dropped; 1 MB per protocol line; 16 MB per protocol session). JSON from a child is parsed with every failure mode
+  caught (oversize, invalid UTF-8, malformed, NaN/Infinity, RecursionError, MemoryError) and fails closed.
+
+**What the sandbox does NOT protect against (stated plainly):**
+- It does not hide the read-only `/usr` runtime: candidate code can read any world-readable system file there.
+- It shares the host kernel: a kernel or bubblewrap vulnerability (namespace escape) defeats it. No seccomp filter
+  and no Landlock layer is installed (Landlock is available on this kernel but not used; no fallback mechanism is
+  implemented, bwrap missing means fail closed).
+- CPU time is bounded only by the profile timeout; memory by RLIMIT_AS; disk writes by RLIMIT_FSIZE per file into
+  the private copy/tmpfs (scratch disk use under the system temp dir is possible up to those limits).
+- It does not stop **same-account Bots** (the first threat model above): they run outside any sandbox.
+- The integrity tripwire detects changes; it does not prevent them (the sandbox does). A legitimate concurrent edit
+  of the code/config during a verification also trips it (fail closed by design).
+- Verification of behaviour remains testing: the oracle only checks the functions defined in `oracles.py` on
+  random inputs, and the advisory unittest child only runs the declared tests.
+
+### H1: harness detection — user decided: NOT accepted; mitigated by (a) neutral harness, (b) varied runs, (c) pure-function rule
+Momus's H1: a candidate whose `add` returns `a+b` only when `PYTHONSAFEPATH` is set and `HOME` contains `verify-`
+(i.e. only inside the old harness) and `a-b` otherwise. The user decided on 2026-11-03 that this is **not** an
+accepted residual. Mitigations:
+- **(a) Neutral harness.** Oracle runs bind the checkout at a random ordinary path (`/home/<user>/[code|projects/]<proj>`,
+  `/srv/<proj>`, `/opt/<proj>`), with HOME=`/home/<user>`, a matching `/etc/passwd` entry and a random ordinary
+  hostname; no path, variable, file or argument contains `omo`, `verif`, `oracle`, `harness`, `sandbox`, `bwrap`,
+  `grok` or `probe` (asserted by tests). The candidate is imported exactly as `python3 -c 'import calc'` would:
+  the program is passed with `-c` (no script path), its first statement is `import calc` (plus, in the isolated
+  run only, an `sys.path.insert(0, '')` that `-I` requires), `__main__` holds only standard dunders at import time,
+  and no `-I`/`-P`/`PYTHONSAFEPATH` is used in the plain run.
+- **(b) Varied runs.** Every verification runs the oracle **3 times** in shuffled order, each in a fresh copy and a
+  different neutral layout: *plain* (`python3`, no flags, login-like env), *isolated-flags* (`python3.13 -I -S -B`,
+  minimal env with `PYTHONSAFEPATH=1` and a random `PYTHONHASHSEED`), *interactive-like* (`python3 -q -i`, different
+  LANG/EDITOR/`PYTHONDONTWRITEBYTECODE`). The call-stack depth at which the candidate is called is randomized per
+  call (0..300 extra frames). The same inputs go to every run; every run must match the oracle and all results must
+  be identical across runs.
+- **(c) Pure-function rule** (`candidate_scan.pure_module_problems`, required for every `fixture-*` profile via
+  `pure_modules: {"allow_imports": [...]}`, applied to every changed `.py` under `editable_paths`). It is an
+  allowlist: module top level may contain only a docstring, allowlisted imports (calc: **none**; the ceiling for any
+  profile is `math`, `operator`, `cmath`, `numbers`), function/class definitions without decorators, and immutable
+  literal constants. Inside code: names must be defined in the module or be one of a fixed set of pure builtins (no
+  `open`, `print`, `getattr`, `type`, `vars`, `__import__`, ...); no dunder names, no `_private`/dunder attributes,
+  no `.format`/`.format_map`, no `global`/`nonlocal`, no mutable defaults, no attribute/item assignment on
+  module-level objects, no `with`/async, no imports inside functions, and no bare/broad exception handlers
+  (`Exception`, `BaseException`, `RuntimeError`, `RecursionError`, `MemoryError`, `OSError`, ...) that could probe
+  stack depth or memory limits. That forbids, among others, `os.*`, `sys.*`, environment, flags, argv, cwd, pids,
+  users, platform, socket, time, random, threading, signal, inspect, traceback, file I/O and `/proc`.
+
+**Which variants each layer stops** (`tests/integration/test_harness_detection.py`; every variant fails the full
+verifier):
+- Defeated by (a)+(b) even with every static check disabled: Momus's H1 payload; keyed on `sys.flags.isolated`,
+  `sys.flags.no_site`, *not* isolated; `PYTHONSAFEPATH` present or absent; cwd markers; HOME markers; HOME==cwd;
+  script `argv[0]`/`orig_argv`; `argv[0] != '-c'`; `sys.executable` name; `/proc/self/cmdline` markers; user name;
+  `LANG`.
+- Stopped **only** by the static pure-function rule (c): conditions every sandboxed run shares and a normal run
+  lacks — `/proc/1/cmdline` is the bwrap init (it also shows host staging paths), `/workspace` does not exist,
+  protocol modules (`json`) are already in `sys.modules` at call time. Others in this class: no network, the pid
+  namespace, `/proc/self/mountinfo`, stdin/stdout being pipes, `os.getpid()` values, the RLIMIT_AS value. A test
+  asserts that these variants pass the runtime layer with the scan disabled, so this statement stays true.
+- Residual (all layers): the pure-function rule applies to fixture profiles only. Real-repo profiles have no oracle
+  (`cooperative`), so harness detection there is backstopped only by the required independent code review and QA.
+
 What the design does guarantee for cooperating agents:
 
 - MCP exposes only `submit, claim, context, checkpoint, complete, status, reconcile, cancel`. There is no approve,
@@ -23,8 +114,8 @@ What the design does guarantee for cooperating agents:
   content-addressed and confined to the job's artifact directory: traversal and symlinks are rejected, and sha256 is
   re-verified on every read.
 - The deterministic verifier runs argv lists without a shell, with an env allowlist, a timeout and protected test
-  paths. Missing or template (`OMO_VERIFY_TEMPLATE`) profiles fail closed. Python runs isolated (`-I`,
-  `PYTHONSAFEPATH`, `PYTHONNOUSERSITE`). Candidates are rejected before execution when they touch paths outside the
+  paths. Missing or template (`OMO_VERIFY_TEMPLATE`) profiles fail closed. Every process that runs candidate code
+  is sandboxed (section above). Candidates are rejected before execution when they touch paths outside the
   profile's `editable_paths`, protected paths, interpreter/test hooks (`sitecustomize`, `usercustomize`, `.pth`,
   `conftest.py`, runner config) or add a top-level module that shadows a stdlib/verifier/site-packages name
   (regression: a committed `unittest/__init__.py` that printed a fake pass). Shadow names come from the host
@@ -46,13 +137,13 @@ What the design does guarantee for cooperating agents:
     nonce, `result_path` and `write_result`) and N2 (the same via `os.sys._getframe`) forged that file; N3 hid the N1
     payload behind a `# -*- coding: unicode_escape -*-` cookie; N4 read `OMO_VERIFY_RESULT`/`OMO_VERIFY_SPEC` from
     `/proc/self/environ`. The design was replaced, not patched:
-    - **The parent verifier never imports candidate code.** Every candidate import happens in a child run with
-      `-I -B -X pycache_prefix=<private dir>` and a scrubbed environment (PATH, LC_ALL, HOME, the bytecode/site
-      switches and the profile's `env_allow`/`env_set`; no `OMO_*`). No nonce, result path or other secret is passed
+    - **The parent verifier never imports candidate code.** Every candidate import happens in a sandboxed child
+      with a scrubbed environment (the unittest child: `-I -S -B` with PATH, LC_ALL, HOME and the profile's
+      `env_allow`/`env_set`; oracle runs: the neutral, varied environments of H1; never any `OMO_*`). No nonce, result path or other secret is passed
       in env, argv or fds, so there is nothing for N1/N2/N4 to steal. Everything a child says is untrusted.
     - **ORACLE mode (assurance `oracle`).** `omo_grok/oracles.py` (trusted tree) generates fresh SystemRandom inputs
-      for every run (magnitudes up to ±2**200, shuffled). `omo_grok/oracle_child.py` imports the candidate and must
-      print `{"ready":true}`; the parent then sends **one** request at a time over stdin and generates the next only
+      for every run (magnitudes up to ±2**200, shuffled). `omo_grok/oracle_child.py` builds the `-c` program that imports the
+      candidate and must print `{"ready":true}`; the parent then sends **one** request at a time over stdin and generates the next only
       after the answer arrives. Each answer must be a raw JSON value; the parent checks `type(v) is int` (bool and
       float never pass) and equality with its own oracle value. The child must answer every case and exit 0. Exiting
       early, printing `VERIFIED`, forging stdout, always-equal objects and constant answers all fail, with or
@@ -61,12 +152,12 @@ What the design does guarantee for cooperating agents:
     - **Advisory unittest child.** `omo_grok/unittest_child.py` runs the `expected_tests` manifest in a separate
       child and prints one `OMO-UNITTEST-REPORT` line. It still snapshots test machinery, builtins and key stdlib
       functions as a tripwire (round-2 E). For oracle profiles the report is advisory: a missing or negative report
-      fails the run, but a positive report can never make it pass.
+      fails the run, and a positive report alone does not make it pass (the oracle decides).
     - **Cooperative assurance.** A Python profile without an oracle, and every `exit_code_only` profile, is
       `cooperative`: its pass is forgeable by a malicious candidate. The detail line starts
       `assurance=cooperative: ... forgeable`, every verification record stores `assurance`, and the final gate
       requires `verifier_assurance_recorded` plus an accepted `code_review` **and** `qa` on the same revision
-      (`cooperative_verifier_backed_by_code_review_and_qa`). The gate's assurance string carries
+      (`cooperative_verifier_backed_by_code_review_and_qa`), and `independent_code_review_and_qa` (below). The gate's assurance string carries
       `+verifier_<level>`.
   - **Static AST scan of every changed editable `.py` file (tripwire, not a sandbox).** Fail closed: a file that does
     not parse is rejected. Sources are decoded with `tokenize.detect_encoding`, and any coding cookie other than
@@ -86,11 +177,27 @@ What the design does guarantee for cooperating agents:
 
     Profiles may relax this with `static_scan` allow-lists or tighten it (`forbid_imports`). They cannot disable it.
   - **Residual risk, stated plainly.**
-    - The oracle is black-box testing. A candidate that senses the oracle harness and behaves correctly only there
-      cannot be detected by it. Code review and QA are the backstop.
+    - The oracle is black-box testing. Harness detection (H1) is mitigated as described above, not made
+      impossible: the sandbox itself is observable, and only the static pure-function rule stops code that keys on
+      it. That rule covers fixture profiles only.
     - The oracle covers only the functions defined in `oracles.py` (today `calc.add`, `calc.mul` for `calc-arith`).
     - Profiles for real repos without an oracle are `cooperative`: the verifier result is forgeable, and only the
-      required `code_review` + `qa` on the same revision stand behind it.
+      required `code_review` + `qa` on the same revision, from Bots outside the executor's independence group,
+      stand behind it.
+
+## Independence of code review and QA (enforced)
+The final gate check `independent_code_review_and_qa` requires, for the exact candidate revision, the latest
+accepted `code_review` **and** the latest accepted `qa` to come from Bots whose bot id **and** independence group
+differ from the executor's (the code reviewer and the QA Bot may be the same Bot). Reviews on an older revision never count
+(test: `test_review_on_an_older_revision_does_not_satisfy_the_gate`). This applies in every mode, fixture included.
+
+Reduced assurance (non-independent review/QA) is accepted **only** when the approval for that job carries
+`accept_reduced_assurance=true`. It is never a config default (the old policy keys `require_independent_assurance`
+and `fixture_allow_reduced_assurance` were removed; a config that still sets them is rejected). Such a job's gate
+assurance starts with `REDUCED_ASSURANCE_ACCEPTED_BY_APPROVAL+`, `omoctl status` prints `!!! WARNING !!!` and
+`!!! REDUCED ASSURANCE !!!` on the gate line, and the export carries an `ASSURANCE_LABEL` of `REDUCED ASSURANCE`.
+"Independent" here means separate Bots on the same account: they share this computer, so this is separation of
+duties between cooperating agents, not protection against a malicious same-account Bot.
     - The static scan is a tripwire and will not cover every construct.
 - Logs, status, exports, errors and CLI output pass through `redact.py`. `hook list` shows booleans only.
   Dispatch errors are scrubbed of the webhook URL/key at write time and every http(s) URL in them is cut to

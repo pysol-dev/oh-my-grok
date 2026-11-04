@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import __version__, db
+from . import __version__, db, sandbox
 from .config import TEMPLATE_MARKER, load_policy, load_verifier_profiles
 from .errors import OmoError
 from .hooks import _check_perms, hook_status, load_hooks, set_hook, validate_url
@@ -119,6 +119,8 @@ def cmd_doctor(args) -> int:
             add(f"verifier_profile:{name}", False, "; ".join(probs))
     add("verifier_profiles_usable", bool(usable), ",".join(usable) or "none (template profiles fail closed)")
     add("git_available", shutil.which("git") is not None)
+    sb = sandbox.probe()  # candidate code never runs without it; verification fails closed
+    add("candidate_sandbox", sb.ok, f"{sb.mechanism}: {sb.detail}")
     # informational (do not fail doctor): live wiring is the operator's job
     info = {"hooks_configured": hook_status(paths)}
     try:
@@ -189,6 +191,8 @@ def cmd_status(args) -> int:
     if args.job:
         lines = [f"job {s['job_id']}  phase={s['phase']}  mode={s['mode']}",
                  f"  next: {s['next_action']}"]
+        if s.get("WARNING"):
+            lines.insert(0, f"!!! {s['WARNING']} !!!")
         if s.get("blocked_reason"):
             lines.append(f"  blocked: {s['blocked_reason']}")
         if s.get("plan"):
@@ -201,7 +205,8 @@ def cmd_status(args) -> int:
                          f"attempt={t['attempt_no']} dispatch={d.get('status', '-')}"
                          + (f"  [{t['block_reason']}]" if t["block_reason"] else ""))
         for g in s["gates"]:
-            lines.append(f"  gate {g['revision'][:12]}: passed={bool(g['passed'])} assurance={g['assurance']}")
+            lines.append(f"  gate {g['revision'][:12]}: passed={bool(g['passed'])} assurance={g['assurance']}"
+                         + ("  !!! REDUCED ASSURANCE !!!" if g.get("reduced_assurance") else ""))
         _out(args, s, "\n".join(lines))
     else:
         lines = [f"schema v{s['schema_version']}"]

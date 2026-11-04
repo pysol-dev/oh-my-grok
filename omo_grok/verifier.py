@@ -1,12 +1,14 @@
 """Deterministic verifier: runs a reviewed profile (argv list, shell=False) on an exact commit checkout."""
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import io
 import json
 import os
 import platform
 import queue
+import random
 import shutil
 import subprocess
 import sys
@@ -18,16 +20,13 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import gitops
-from .candidate_scan import scan_source
-from . import oracles
-from .config import (ORACLE_CHILD, RUNNER_NAME, TEMPLATE_MARKER, canonical_json, profile_assurance, profile_hash,
+from . import gitops, integrity, sandbox
+from .candidate_scan import pure_module_problems, scan_source
+from . import oracle_child, oracles
+from .config import (RUNNER_NAME, UNITTEST_CHILD, TEMPLATE_MARKER, canonical_json, profile_assurance, profile_hash,
                      validate_profile)
 from .paths import CODE_ROOT
 from .redact import redact
-
-MAX_OUTPUT = 1_000_000
-
 
 @dataclass
 class VerifyOutcome:
@@ -41,6 +40,8 @@ class VerifyOutcome:
     env_identity: str
     argv: list = field(default_factory=list)
     assurance: str = "none"  # oracle | cooperative | none (see docs/SECURITY.md)
+    sandbox: str = "none"    # bwrap | none (none = candidate code was not run)
+    tamper: list = field(default_factory=list)
 
 
 def env_identity(prof: dict) -> str:
@@ -195,6 +196,11 @@ def content_problems(repo: Path, base: str, revision: str, prof: dict, checkout:
             found = scan_source(text, path, rules)
             if found:
                 out.append("static scan rejected: " + "; ".join(found[:20]))
+            pure = prof.get("pure_modules")
+            if pure is not None and any(_under(path, e) for e in prof.get("editable_paths", [])):
+                found = pure_module_problems(text, path, pure.get("allow_imports", []))
+                if found:
+                    out.append("pure-function rule rejected: " + "; ".join(found[:20]))
     return out
 
 
@@ -225,14 +231,51 @@ def preflight(name: str | None, prof: dict | None) -> list[str]:
     return problems
 
 
+@dataclass
+class _Ctx:
+    """One sandboxed verification run: everything a child needs, nothing the candidate may see."""
+    sb: sandbox.Probe
+    exe: str              # interpreter/command inside the read-only runtime
+    work: Path            # per-run COPY of the checkout (writable scratch, bound at /work)
+    harness: Path | None  # per-run read-only copy of the child scripts (bound at /omo-harness)
+    cwd_rel: str
+    env: dict
+    timeout: float
+    staging: Path | None = None  # private per-verification temp dir; every child run gets a FRESH copy of `work`
+
+    def fresh(self, tag: str) -> "_Ctx":
+        """A new copy of the pristine checkout for one child run (no state carries over between runs)."""
+        if self.staging is None:
+            return self
+        dst = self.staging / f"{tag}-{uuid.uuid4().hex[:6]}"
+        shutil.copytree(self.work, dst, symlinks=True)
+        return dataclasses.replace(self, work=dst)
+
+
+def _err(status, detail, ph, eid, prof, sb="none", **kw) -> VerifyOutcome:
+    return VerifyOutcome(status, None, False, "", "", detail, ph, eid, (prof or {}).get("argv", []), sandbox=sb, **kw)
+
+
 def run(repo: Path, revision: str, name: str | None, prof: dict | None, work_root: Path) -> VerifyOutcome:
     ph = profile_hash(prof) if prof else "none"
     eid = env_identity(prof) if prof else "none"
     problems = preflight(name, prof)
     if problems:
-        return VerifyOutcome("error", None, False, "", "", "; ".join(problems), ph, eid, (prof or {}).get("argv", []))
+        return _err("error", "; ".join(problems), ph, eid, prof)
+    sb = sandbox.probe()
+    if not sb.ok:  # never run candidate code unsandboxed
+        return _err("error", f"{sb.detail}; refusing to run candidate code without a sandbox (fail closed)", ph, eid,
+                    prof)
+    exe = sandbox.runtime_executable(prof["argv"][0])
+    if not exe:
+        return _err("error", f"verifier executable {prof['argv'][0]} does not resolve inside the read-only sandbox "
+                    f"runtime {sandbox.RUNTIME_ROOT} (fail closed)", ph, eid, prof)
+    cwd_rel = os.path.normpath(prof["cwd"])
+    if cwd_rel.startswith("..") or os.path.isabs(cwd_rel):
+        return _err("error", "cwd escapes checkout", ph, eid, prof)
     if not gitops.commit_exists(repo, revision):
-        return VerifyOutcome("error", None, False, "", "", f"revision {revision} not found", ph, eid, prof["argv"])
+        return _err("error", f"revision {revision} not found", ph, eid, prof)
+    work_root.mkdir(parents=True, exist_ok=True)
     dest = work_root / f"verify-{revision[:12]}-{uuid.uuid4().hex[:8]}"
     gitops.temp_checkout(repo, revision, dest)
     try:
@@ -241,41 +284,58 @@ def run(repo: Path, revision: str, name: str | None, prof: dict | None, work_roo
             cand = (dest / prof["cwd"] / a)
             if cand.is_file() and not cand.is_symlink():
                 if TEMPLATE_MARKER.encode() in cand.read_bytes()[:200_000]:
-                    return VerifyOutcome("error", None, False, "", "", f"{a} contains {TEMPLATE_MARKER}; fail closed",
-                                         ph, eid, prof["argv"])
+                    return _err("error", f"{a} contains {TEMPLATE_MARKER}; fail closed", ph, eid, prof)
         scope = scope_problems(repo, revision, prof, dest)
         if scope:
-            return VerifyOutcome("failed", None, False, "", "", "candidate rejected before running: " + "; ".join(scope),
-                                 ph, eid, prof["argv"])
-        env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LC_ALL": "C.UTF-8", "HOME": str(dest),
+            return _err("failed", "candidate rejected before running: " + "; ".join(scope), ph, eid, prof)
+        env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8", "HOME": sandbox.SANDBOX_WORK,
                "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1", "PYTHONSAFEPATH": "1"}
         for k in prof.get("env_allow", []):
             if k in os.environ:
                 env[k] = os.environ[k]
         env.update({k: str(v) for k, v in prof.get("env_set", {}).items()})
-        cwd = (dest / prof["cwd"]).resolve()
-        if dest.resolve() not in [cwd, *cwd.parents]:
-            return VerifyOutcome("error", None, False, "", "", "cwd escapes checkout", ph, eid, prof["argv"])
-        _purge_bytecode(dest)
-        pyc = Path(tempfile.mkdtemp(prefix="omo-pyc-", dir=str(work_root)))
+        python = prof.get("runner") == RUNNER_NAME
+        before = integrity.snapshot()
+        # staged under the system temp dir with a neutral name: host paths are visible inside the sandbox via
+        # /proc/1/cmdline and /proc/self/mountinfo, so they must not carry harness/job markers
+        staging = Path(tempfile.mkdtemp())
         try:
-            if prof.get("runner") == RUNNER_NAME:
-                return _run_python(prof, cwd, env, pyc, ph, eid)
-            return _run_exit_code_only(prof, cwd, env, ph, eid)
+            work, harness = sandbox.stage(dest, [UNITTEST_CHILD] if python else [], staging)
+            _purge_bytecode(work)
+            if not (work / cwd_rel).is_dir():
+                return _err("error", "profile cwd does not exist in the checkout", ph, eid, prof, sb.mechanism)
+            ctx = _Ctx(sb, exe, work, harness if python else None, cwd_rel, env, float(prof["timeout_seconds"]),
+                       staging)
+            out = _run_python(prof, ctx, ph, eid) if python else _run_exit_code_only(prof, ctx, ph, eid)
         finally:
-            shutil.rmtree(pyc, ignore_errors=True)
+            _rmtree(staging)
+        changes = integrity.diff(before, integrity.snapshot())
+        out.sandbox = sb.mechanism
+        if changes:
+            out.status, out.tamper = "failed", changes
+            out.detail = (f"TAMPER: trusted files changed during verification ({len(changes)}): "
+                          f"{'; '.join(changes[:5])} | was: {out.detail}")
+        return out
     finally:
         gitops.remove_temp_checkout(repo, dest)
 
 
-def _timeout(e, ph, eid, argv):
-    out = (e.stdout or b"")[:MAX_OUTPUT].decode("utf-8", "replace")
-    err = (e.stderr or b"")[:MAX_OUTPUT].decode("utf-8", "replace")
-    return VerifyOutcome("failed", None, True, redact(out), redact(err), "timeout (not success)", ph, eid, argv)
+def _rmtree(p: Path) -> None:
+    for d, dirs, _files in os.walk(p):  # the harness copy is read-only on purpose
+        for n in dirs:
+            try:
+                os.chmod(os.path.join(d, n), 0o700)
+            except OSError:
+                pass
+    try:
+        os.chmod(p, 0o700)
+    except OSError:
+        pass
+    shutil.rmtree(p, ignore_errors=True)
 
 
 def _purge_bytecode(dest: Path) -> None:
-    """The private checkout must never import stale/planted bytecode."""
+    """The private checkout copy must never import stale/planted bytecode."""
     for p in list(dest.rglob("__pycache__")):
         if p.is_dir() and not p.is_symlink() and dest.resolve() in p.resolve().parents:
             shutil.rmtree(p)
@@ -284,25 +344,84 @@ def _purge_bytecode(dest: Path) -> None:
             p.unlink()
 
 
-def _run_exit_code_only(prof, cwd, env, ph, eid) -> VerifyOutcome:
+MAX_OUTPUT = 1_000_000      # bytes kept per stream; the rest is drained and discarded
+MAX_LINE = 1_000_000        # one oracle protocol line
+MAX_PROTOCOL = 16_000_000   # total oracle protocol bytes
+
+
+def _drain(stream, keep: list, limit: int) -> None:
+    n = 0
     try:
-        cp = subprocess.run(prof["argv"], cwd=str(cwd), env=env, shell=False, capture_output=True,
-                            timeout=prof["timeout_seconds"], stdin=subprocess.DEVNULL)
-    except subprocess.TimeoutExpired as e:
-        return _timeout(e, ph, eid, prof["argv"])
-    out = cp.stdout[:MAX_OUTPUT].decode("utf-8", "replace")
-    err = cp.stderr[:MAX_OUTPUT].decode("utf-8", "replace")
-    status = "passed" if cp.returncode == 0 else "failed"
-    return VerifyOutcome(status, cp.returncode, False, redact(out), redact(err),
-                         f"assurance=cooperative: exit {cp.returncode} (exit-code-only profile; forgeable by the code "
-                         f"under test; independent code_review and qa on this revision are required)",
-                         ph, eid, prof["argv"], "cooperative")
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                return
+            if n < limit:
+                keep.append(chunk[:limit - n])
+            n += len(chunk)
+    except (OSError, ValueError):
+        return
 
 
-def _py_argv(prof, pyc: Path, script) -> list[str]:
-    """Interpreter + isolation flags from the profile, a throwaway pycache prefix, then the child script."""
-    flags = [a for a in prof["argv"][1:-1] if a.startswith("-")]
-    return [prof["argv"][0], *flags, "-X", f"pycache_prefix={pyc}", str(script)]
+def _kill(p: subprocess.Popen) -> None:
+    try:
+        os.killpg(p.pid, 9)
+    except OSError:
+        pass
+    try:
+        p.kill()
+    except OSError:
+        pass
+
+
+def _spawn(ctx: _Ctx, argv: list[str], stdin) -> subprocess.Popen:
+    return subprocess.Popen(sandbox.wrap(ctx.sb, argv, ctx.work, ctx.harness, ctx.cwd_rel, ctx.env), shell=False,
+                            stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env={"PATH": "/usr/bin:/bin"},
+                            cwd="/", start_new_session=True, preexec_fn=sandbox.preexec)
+
+
+def _run_capped(ctx: _Ctx, argv: list[str]) -> tuple[int | None, bytes, bytes, bool]:
+    """Run a sandboxed command; output is capped (excess drained and dropped). Returns (rc, out, err, timed_out)."""
+    p = _spawn(ctx, argv, subprocess.DEVNULL)
+    out: list = []
+    err: list = []
+    ts = [threading.Thread(target=_drain, args=(p.stdout, out, MAX_OUTPUT), daemon=True),
+          threading.Thread(target=_drain, args=(p.stderr, err, MAX_OUTPUT), daemon=True)]
+    for t in ts:
+        t.start()
+    timed_out = False
+    try:
+        rc = p.wait(timeout=ctx.timeout)
+    except subprocess.TimeoutExpired:
+        timed_out, rc = True, None
+        _kill(p)
+        p.wait()
+    _kill(p)  # nothing from the sandbox outlives the run
+    for t in ts:
+        t.join(timeout=5)
+    return rc, b"".join(out), b"".join(err), timed_out
+
+
+def _text(b: bytes) -> str:
+    return redact(b[:MAX_OUTPUT].decode("utf-8", "replace"))
+
+
+def _run_exit_code_only(prof, ctx: _Ctx, ph, eid) -> VerifyOutcome:
+    rc, out, err, to = _run_capped(ctx.fresh("x"), [ctx.exe, *prof["argv"][1:]])
+    if to:
+        return VerifyOutcome("failed", None, True, _text(out), _text(err), "timeout (not success)", ph, eid,
+                             prof["argv"])
+    status = "passed" if rc == 0 else "failed"
+    return VerifyOutcome(status, rc, False, _text(out), _text(err),
+                         f"assurance=cooperative: exit {rc} (exit-code-only profile, sandboxed; the exit code is "
+                         f"forgeable by the code under test; the final gate requires an accepted code_review and qa "
+                         f"from Bots outside the executor's independence group, unless reduced assurance was "
+                         f"explicitly accepted)", ph, eid, prof["argv"], "cooperative")
+
+
+def _py_argv(ctx: _Ctx, script: Path) -> list[str]:
+    """System interpreter inside the sandbox: -I (isolated) -S (no site-packages at all) -B, throwaway pycache."""
+    return [ctx.exe, "-I", "-S", "-B", "-X", "pycache_prefix=/tmp/omo-pyc", f"{sandbox.SANDBOX_HARNESS}/{script.name}"]
 
 
 REPORT_PREFIX = "OMO-UNITTEST-REPORT "
@@ -314,146 +433,253 @@ def evaluate_report(rep: dict | None, returncode: int | None, prof: dict) -> lis
     if returncode != 0:
         why.append(f"unittest child exit {returncode}")
     if not isinstance(rep, dict):
-        why.append("no unittest report (process exited before reporting)")
+        why.append("no unittest report (process exited before reporting, or the report was unparseable)")
         return why
     if rep.get("stage") != "done":
-        why.append(f"unittest child stopped at stage {rep.get('stage')!r}")
+        why.append(f"unittest child stopped at stage {str(rep.get('stage'))[:40]!r}")
     if rep.get("tamper"):
-        why.append(f"test machinery tampered: {list(rep['tamper'])[:10]}")
+        why.append("test machinery tampered (child self-report)")
     if rep.get("load_errors"):
-        why.append(f"test load errors: {list(rep['load_errors'])[:5]}")
+        why.append("test load errors")
     expected = list(prof["expected_tests"])
     tests = rep.get("tests") if isinstance(rep.get("tests"), dict) else {}
     missing = [t for t in expected if t not in tests]
     if missing:
         why.append(f"expected tests not run: {missing}")
-    notpass = {t: v for t, v in tests.items() if v != "passed"}
+    notpass = sorted(str(t)[:200] for t, v in tests.items() if v != "passed")
     if notpass:
-        why.append(f"tests not passed: {notpass}")
-    extra = sorted(set(tests) - set(expected))
+        why.append(f"tests not passed: {notpass[:10]}")
+    extra = sorted(str(t)[:200] for t in set(tests) - set(expected))
     if extra:
-        why.append(f"unexpected tests ran: {extra}")
+        why.append(f"unexpected tests ran: {extra[:10]}")
     n = len(expected)
     want = {"run": n, "started": n, "failures": 0, "errors": 0, "skipped": 0, "expected_failures": 0,
             "unexpected_successes": 0}
     if rep.get("counts") != want:
-        why.append(f"counts {rep.get('counts')} != expected {want}")
+        why.append(f"counts != expected {want}")
     return why
 
 
-def _parse_report(stdout: str):
-    for line in reversed(stdout.splitlines()):
+def _reject_constant(name):
+    raise ValueError(f"non-standard JSON constant {name}")
+
+
+def parse_json_untrusted(data: bytes | str, limit: int = MAX_LINE):
+    """Parse one JSON document from an untrusted child. Any failure (oversize, bad UTF-8, malformed, too deep,
+    out of memory, NaN/Infinity) returns None: callers fail closed."""
+    if len(data) > limit:
+        return None
+    try:
+        text = data.decode("utf-8") if isinstance(data, bytes) else data
+        return json.loads(text, parse_constant=_reject_constant)
+    except (ValueError, RecursionError, MemoryError, TypeError):
+        return None
+
+
+def _parse_report(stdout: bytes | str):
+    if isinstance(stdout, bytes):
+        stdout = stdout[:MAX_OUTPUT].decode("utf-8", "replace")
+    for line in reversed(stdout[:MAX_OUTPUT].splitlines()):
         if line.startswith(REPORT_PREFIX):
-            try:
-                return json.loads(line[len(REPORT_PREFIX):])
-            except ValueError:
-                return None
+            rep = parse_json_untrusted(line[len(REPORT_PREFIX):])
+            return rep if isinstance(rep, dict) else None
     return None
 
 
-def _run_unittest_child(prof, cwd, env, pyc):
-    argv = [*_py_argv(prof, pyc, prof["argv"][-1]), prof["start_dir"]]
-    cp = subprocess.run(argv, cwd=str(cwd), env=env, shell=False, capture_output=True,
-                        timeout=prof["timeout_seconds"], stdin=subprocess.DEVNULL)
-    out = cp.stdout[:MAX_OUTPUT].decode("utf-8", "replace")
-    err = cp.stderr[:MAX_OUTPUT].decode("utf-8", "replace")
-    return cp.returncode, out, err, evaluate_report(_parse_report(out), cp.returncode, prof)
+def _run_unittest_child(prof, ctx: _Ctx):
+    ctx = ctx.fresh("u")
+    rc, out, err, to = _run_capped(ctx, [*_py_argv(ctx, UNITTEST_CHILD), prof["start_dir"]])
+    if to:
+        return rc, _text(out), _text(err), ["unittest child timeout (not success)"], True
+    return rc, _text(out), _text(err), evaluate_report(_parse_report(out), rc, prof), False
 
 
-MAX_LINE = 1_000_000
+class _Proto(Exception):
+    pass
 
 
-def run_oracle(prof, cwd, env, pyc) -> tuple[list[str], int, str]:
-    """Trusted decision. The parent never imports candidate code; it draws fresh random inputs, sends them ONE AT A
-    TIME (the next input does not exist until the previous answer arrives) to an untrusted child that calls the
-    candidate, and recomputes every expected value itself. Returns (failure reasons, cases matched, child stderr)."""
+ORACLE_RUNS = 3  # separate oracle runs per verification, each under a different neutral environment
+
+
+def _alias_ok(alias: str, exe: str) -> bool:
+    return os.path.realpath(alias if "/" in alias else f"/usr/bin/{alias}") == exe
+
+
+def oracle_variants(prof, ctx: _Ctx, rng) -> list[dict]:
+    """Deliberately varied, neutral environments for the oracle runs (user decision H1). Nothing in them names the
+    harness: random ordinary user/home/project/hostname, plain `-c` import, no script path. Flags are OFF in the plain
+    run and ON in the isolated run, the third looks like an interactive session; argv[0], env sets, HOME, cwd and the
+    call-stack depth differ between runs. A candidate must be correct in every run, with identical results."""
+    names = ("python3", "/usr/bin/python3", ctx.exe)
+    plain0 = next((a for a in names if _alias_ok(a, ctx.exe)), ctx.exe)
+    other0 = next((a for a in reversed(names) if _alias_ok(a, ctx.exe) and a != plain0), ctx.exe)
+    extra = {k: os.environ[k] for k in prof.get("env_allow", []) if k in os.environ}
+    extra.update({k: str(v) for k, v in prof.get("env_set", {}).items()})
+    lays: list = []
+    while len(lays) < ORACLE_RUNS:
+        lay = sandbox.neutral_layout(rng)
+        if all(lay.project != x.project and lay.home != x.home for x in lays):
+            lays.append(lay)
+    base = [sandbox.login_env(x) for x in lays]
+    runs = [
+        {"name": "plain", "argv0": plain0, "flags": [], "env": base[0], "pad": 0, "hard": False, "cwd": False},
+        {"name": "isolated-flags", "argv0": other0, "flags": ["-I", "-S", "-B"],
+         "env": {"PATH": "/usr/bin:/bin", "HOME": lays[1].home, "PYTHONSAFEPATH": "1",
+                 "PYTHONHASHSEED": str(rng.randrange(1 << 16))}, "pad": 150, "hard": False, "cwd": True},
+        {"name": "interactive-like", "argv0": plain0, "flags": ["-q", "-i"],
+         "env": dict(base[2], LANG="en_US.UTF-8", PYTHONDONTWRITEBYTECODE="1", EDITOR="vi"), "pad": 300,
+         "hard": True, "cwd": False},
+    ]
+    for r, lay in zip(runs, lays):
+        r["layout"] = lay
+        r["env"] = dict(r["env"], **extra)
+    rng.shuffle(runs)
+    return runs
+
+
+def run_oracle(prof, ctx: _Ctx) -> tuple[list[str], int, str]:
+    """Trusted decision. The parent never imports candidate code; it draws fresh random inputs and runs the
+    candidate ORACLE_RUNS times, each in a fresh sandboxed copy under a different neutral environment. Inputs are sent
+    ONE AT A TIME (the next input does not exist until the previous answer arrives); every expected value is
+    recomputed by the parent; every run must match, and the runs must agree exactly with each other. Returns
+    (failure reasons, cases matched in total, child stderr). Every parse/decode/size/depth problem fails closed."""
     spec = prof["oracle"]
     cases = oracles.cases(spec["name"], spec.get("cases_per_function", 48))
     mods = sorted({c["call"].rsplit(".", 1)[0] for c in cases})
-    deadline = time.monotonic() + prof["timeout_seconds"]
-    with tempfile.TemporaryFile() as errf:
-        p = subprocess.Popen([*_py_argv(prof, pyc, ORACLE_CHILD), *mods], cwd=str(cwd), env=env, shell=False,
-                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errf, text=True, bufsize=1)
-        lines: queue.Queue = queue.Queue()
+    rng = random.SystemRandom()
+    why: list[str] = []
+    errs: list[str] = []
+    total = 0
+    seen: dict[int, str] = {}
+    for v in oracle_variants(prof, ctx, rng):
+        order = list(cases)
+        rng.shuffle(order)
+        w, matched, err, values = _oracle_session(ctx, v, order, mods)
+        total += matched
+        if err:
+            errs.append(f"[run {v['name']}] {err}")
+        if w:
+            why += [f"{x} [run {v['name']}]" for x in w]
+            break
+        for cid, val in values.items():
+            if seen.setdefault(cid, val) != val:
+                why.append(f"result for case {cid} differs from an earlier run (environment-dependent "
+                           f"behaviour) [run {v['name']}]")
+                break
+        if why:
+            break
+    return why, total, "\n".join(errs)
 
-        def pump():
-            try:
-                for ln in p.stdout:
-                    lines.put(ln[:MAX_LINE + 1])
-            finally:
-                lines.put(None)
-        threading.Thread(target=pump, daemon=True).start()
 
-        def recv():
-            left = deadline - time.monotonic()
-            if left <= 0:
-                raise TimeoutError
-            ln = lines.get(timeout=left)
-            if ln is None:
-                raise EOFError
-            if len(ln) > MAX_LINE:
-                raise ValueError("oversized line")
-            msg = json.loads(ln)
-            if not isinstance(msg, dict):
-                raise ValueError("non-object message")
-            return msg
+def _oracle_session(ctx: _Ctx, v: dict, cases: list, mods: list[str]):
+    c2 = ctx.fresh("r")
+    lay = v["layout"]
+    etc = sandbox.write_etc(lay, c2.staging / f"etc-{uuid.uuid4().hex[:6]}")
+    code = oracle_child.bootstrap(mods, v["pad"], v["hard"], v["cwd"])
+    argv = sandbox.wrap_neutral(ctx.sb, [v["argv0"], *v["flags"], "-c", code], c2.work, etc, lay, v["env"],
+                                ctx.cwd_rel)
+    deadline = time.monotonic() + ctx.timeout
+    p = subprocess.Popen(argv, shell=False, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         env={"PATH": "/usr/bin:/bin"}, start_new_session=True, preexec_fn=sandbox.preexec)
+    err: list = []
+    et = threading.Thread(target=_drain, args=(p.stderr, err, MAX_OUTPUT), daemon=True)
+    et.start()
+    lines: queue.Queue = queue.Queue()
 
-        why: list[str] = []
-        matched = 0
+    def pump():
+        total = 0
         try:
-            if recv() != {"ready": True}:
-                why.append("oracle child did not report ready")
-            for c in cases if not why else []:
-                p.stdin.write(json.dumps({"id": c["id"], "call": c["call"], "args": c["args"]}) + "\n")
-                p.stdin.flush()
-                msg = recv()
-                if set(msg) != {"id", "value"} or type(msg["id"]) is not int or msg["id"] != c["id"]:
-                    why.append(f"oracle case {c['id']} ({c['call']}): bad/forged reply {sorted(msg)[:4]}")
+            while True:
+                ln = p.stdout.readline(MAX_LINE + 1)
+                if not ln:
                     break
-                if not oracles.check_value(c, msg["value"]):
-                    why.append(f"oracle case {c['id']} ({c['call']}): wrong value or type "
-                               f"(got {type(msg['value']).__name__})")
+                total += len(ln)
+                if len(ln) > MAX_LINE or total > MAX_PROTOCOL:
+                    lines.put(b"\x00OVERSIZE")
                     break
-                matched += 1
-            if not why:
-                p.stdin.write(json.dumps({"end": True}) + "\n")
-                p.stdin.flush()
-        except TimeoutError:
-            why.append("oracle timeout (not success)")
-        except queue.Empty:
-            why.append("oracle timeout (not success)")
-        except EOFError:
-            why.append(f"oracle child exited after {matched}/{len(cases)} cases (exit/forgery cannot pass)")
-        except (ValueError, KeyError, BrokenPipeError, OSError) as e:
-            why.append(f"oracle protocol violation after {matched}/{len(cases)} cases: {type(e).__name__}")
+                lines.put(ln)
+        except (OSError, ValueError):
+            pass
         finally:
-            try:
-                p.stdin.close()
-            except OSError:
-                pass
-            try:
-                rc = p.wait(timeout=max(1.0, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                p.kill()
-                rc = p.wait()
-            errf.seek(0)
-            err = errf.read(MAX_OUTPUT).decode("utf-8", "replace")
-        if not why and matched != len(cases):
-            why.append(f"only {matched}/{len(cases)} oracle cases matched")
-        if not why and rc != 0:
-            why.append(f"oracle child exit {rc}")
-        return why, matched, err
+            lines.put(None)
+    threading.Thread(target=pump, daemon=True).start()
 
+    def recv():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError
+        ln = lines.get(timeout=left)
+        if ln is None:
+            raise EOFError
+        if ln == b"\x00OVERSIZE":
+            raise _Proto("oversized output")
+        msg = parse_json_untrusted(ln)
+        if not isinstance(msg, dict):
+            raise _Proto("unparseable/oversized/too-deep or non-object message")
+        return msg
 
-def _run_python(prof, cwd, env, pyc, ph, eid) -> VerifyOutcome:
-    assurance = profile_assurance(prof)
+    def send(obj):
+        p.stdin.write((json.dumps(obj) + "\n").encode())
+        p.stdin.flush()
+
+    why: list[str] = []
+    values: dict[int, str] = {}
+    matched = 0
+    rc = None
     try:
-        rc, out, err, adv = _run_unittest_child(prof, cwd, env, pyc)
-    except subprocess.TimeoutExpired as e:
-        return _timeout(e, ph, eid, prof["argv"])
-    out, err = redact(out), redact(err)
+        if recv() != {"ready": True}:
+            why.append("oracle child did not report ready")
+        for c in cases if not why else []:
+            send({"id": c["id"], "call": c["call"], "args": c["args"]})
+            msg = recv()
+            if set(msg) != {"id", "value"} or type(msg["id"]) is not int or msg["id"] != c["id"]:
+                why.append(f"oracle case {c['id']} ({c['call']}): bad/forged reply")
+                break
+            if not oracles.check_value(c, msg["value"]):
+                why.append(f"oracle case {c['id']} ({c['call']}): wrong value or type "
+                           f"(got {type(msg['value']).__name__})")
+                break
+            values[c["id"]] = f"{type(msg['value']).__name__}:{msg['value']!r}"
+            matched += 1
+        if not why:
+            send({"end": True})
+    except (TimeoutError, queue.Empty):
+        why.append("oracle timeout (not success)")
+    except EOFError:
+        why.append(f"oracle child exited after {matched}/{len(cases)} cases (exit/forgery cannot pass)")
+    except _Proto as e:
+        why.append(f"oracle protocol violation after {matched}/{len(cases)} cases: {e}")
+    except (ValueError, KeyError, TypeError, RecursionError, MemoryError, OSError) as e:
+        why.append(f"oracle protocol violation after {matched}/{len(cases)} cases: {type(e).__name__}")
+    finally:
+        if why:  # failed already: do not wait on a child that may be blocked writing or spinning
+            _kill(p)
+        try:
+            p.stdin.close()
+        except OSError:
+            pass
+        try:
+            rc = p.wait(timeout=max(1.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            _kill(p)
+            rc = p.wait()
+        _kill(p)
+        et.join(timeout=5)
+    if not why and matched != len(cases):
+        why.append(f"only {matched}/{len(cases)} oracle cases matched")
+    if not why and rc != 0:
+        why.append(f"oracle child exit {rc}")
+    return why, matched, b"".join(err).decode("utf-8", "replace"), values
+
+
+def _run_python(prof, ctx: _Ctx, ph, eid) -> VerifyOutcome:
+    assurance = profile_assurance(prof)
+    rc, out, err, adv, to = _run_unittest_child(prof, ctx)
+    if to:
+        return VerifyOutcome("failed", None, True, out, err, "timeout (not success)", ph, eid, prof["argv"],
+                             assurance)
     if assurance == "oracle":
-        why, matched, oerr = run_oracle(prof, cwd, env, pyc)
+        why, matched, oerr = run_oracle(prof, ctx)
         err = err + ("\n--- oracle child stderr ---\n" + redact(oerr) if oerr else "")
         reasons = [f"ORACLE: {w}" for w in why] + [f"unittest (advisory, negative evidence still fails): {w}"
                                                     for w in adv]
@@ -461,13 +687,14 @@ def _run_python(prof, cwd, env, pyc, ph, eid) -> VerifyOutcome:
             return VerifyOutcome("failed", rc, False, out, err, "assurance=oracle: " + "; ".join(reasons), ph, eid,
                                  prof["argv"], assurance)
         return VerifyOutcome("passed", 0, False, out, err,
-                             f"assurance=oracle: {matched}/{matched} fresh random oracle cases matched (parent-computed); "
-                             f"unittest child (advisory) reports {len(prof['expected_tests'])} expected tests passed",
-                             ph, eid, prof["argv"], assurance)
+                             f"assurance=oracle: {matched}/{matched} fresh random oracle cases matched across "
+                             f"{ORACLE_RUNS} varied neutral sandboxed runs (parent-computed, identical results); unittest child (advisory self-report) claims "
+                             f"{len(prof['expected_tests'])} expected tests passed", ph, eid, prof["argv"], assurance)
     if adv:
         return VerifyOutcome("failed", rc, False, out, err, "assurance=cooperative: " + "; ".join(adv), ph, eid,
                              prof["argv"], assurance)
     return VerifyOutcome("passed", 0, False, out, err,
                          f"assurance=cooperative: unittest child self-reports {len(prof['expected_tests'])} expected "
-                         f"tests passed (forgeable by the code under test; independent code_review and qa on this "
-                         f"revision are required)", ph, eid, prof["argv"], assurance)
+                         f"tests passed (sandboxed, but forgeable by the code under test; the final gate requires an "
+                         f"accepted code_review and qa from Bots outside the executor's independence group, unless "
+                         f"reduced assurance was explicitly accepted)", ph, eid, prof["argv"], assurance)

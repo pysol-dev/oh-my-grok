@@ -22,11 +22,10 @@ DEFAULT_POLICY = {
     "per_bot_hourly_dispatch_limit": 20,
     "max_sends_per_flush": 10,
     "repo_allowlist": [],
-    "require_independent_assurance": True,
-    "fixture_allow_reduced_assurance": True,
     "inline_dispatch": True,
 }
 
+REMOVED_POLICY_KEYS = {"require_independent_assurance", "fixture_allow_reduced_assurance"}
 TEMPLATE_MARKER = "OMO_VERIFY_TEMPLATE"
 RUNNER_NAME = "omo-unittest-child"
 UNITTEST_CHILD = Path(__file__).resolve().parent / "unittest_child.py"   # untrusted child: advisory self-report
@@ -48,6 +47,11 @@ def load_policy(config_dir: Path) -> dict:
     p = config_dir / "policy.json"
     if p.exists():
         data = json.loads(p.read_text())
+        removed = set(data) & REMOVED_POLICY_KEYS
+        if removed:
+            raise ValidationError(f"policy keys {sorted(removed)} were removed: independent code_review + qa is "
+                                  f"always required; reduced assurance is accepted per job, only through an approval "
+                                  f"with accept_reduced_assurance=true")
         unknown = set(data) - set(DEFAULT_POLICY)
         if unknown:
             raise ValidationError(f"unknown policy keys: {sorted(unknown)}")
@@ -72,7 +76,7 @@ def _oracle_problems(name: str, prof: dict) -> list[str]:
     if o is None:
         if name.startswith("fixture-"):
             return ["python fixture profiles must use an oracle (spec section 9: a fixture verifier that cannot be "
-                    "faked)"]
+                    "forged by a self-report)"]
         return []
     out = []
     if not isinstance(o, dict) or o.get("name") not in ORACLES:
@@ -84,6 +88,22 @@ def _oracle_problems(name: str, prof: dict) -> list[str]:
     if o.get("modules", mods) != mods:
         out.append(f"oracle.modules must be {mods} for oracle {o['name']!r}")
     return out
+
+
+def _pure_problems(name: str, prof: dict) -> list[str]:
+    """Fixture profiles must declare `pure_modules` (the pure-function rule for editable code, user decision H1)."""
+    from .candidate_scan import PURE_IMPORT_CEILING
+    pm = prof.get("pure_modules")
+    if pm is None:
+        return ["fixture profiles must declare pure_modules: {'allow_imports': [...]} (pure-function rule; H1 is not "
+                "an accepted residual)"] if name.startswith("fixture-") else []
+    if not isinstance(pm, dict) or set(pm) - {"allow_imports"} or not isinstance(pm.get("allow_imports", []), list):
+        return ["pure_modules must be {'allow_imports': [module, ...]}"]
+    extra = set(pm.get("allow_imports", [])) - PURE_IMPORT_CEILING
+    if extra:
+        return [f"pure_modules.allow_imports may only name pure modules {sorted(PURE_IMPORT_CEILING)}; "
+                f"got {sorted(extra)}"]
+    return []
 
 
 def profile_assurance(prof: dict) -> str:
@@ -133,6 +153,7 @@ def validate_profile(name: str, prof: dict) -> list[str]:
         if "type_checks" in prof:
             problems.append("type_checks (in-process self-report) were removed; use an oracle profile")
         problems += _oracle_problems(name, prof)
+        problems += _pure_problems(name, prof)
     elif prof.get("exit_code_only") is not True:
         problems.append("non-python profiles must set exit_code_only: true to accept exit-status-only (reduced) "
                         "assurance")

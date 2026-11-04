@@ -260,6 +260,10 @@ CREATE INDEX attempts_task ON task_attempts(task_id);
     (3, "verification_assurance", """
 ALTER TABLE verifications ADD COLUMN assurance TEXT NOT NULL DEFAULT 'none';
 """),
+    (4, "verification_sandbox_tamper", """
+ALTER TABLE verifications ADD COLUMN sandbox TEXT NOT NULL DEFAULT 'none';
+ALTER TABLE verifications ADD COLUMN tamper_json TEXT NOT NULL DEFAULT '[]';
+"""),
 ]
 
 LATEST_VERSION = MIGRATIONS[-1][0]

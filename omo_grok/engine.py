@@ -333,8 +333,8 @@ class Engine:
             if not isinstance(verifier_profile, str) or verifier_profile not in self.profiles:
                 raise ValidationError("unknown verifier_profile", known=sorted(self.profiles))
             if mode == "fixture" and profile_assurance(self.profiles[verifier_profile]) != "oracle":
-                raise ValidationError("fixture jobs require an oracle verifier profile (a fixture verifier that "
-                                      "cannot be faked)")
+                raise ValidationError("fixture jobs require an oracle verifier profile (the pass/fail "
+                                      "decision is recomputed by the parent, not taken from a self-report)")
         policies = {}
         if max_repair_cycles is not None:
             if not (1 <= int(max_repair_cycles) <= 10):
@@ -1118,14 +1118,18 @@ class Engine:
         so = self._engine_artifact(job_id, f"engine/verify/{vid}/stdout.txt", out.stdout, "verifier_stdout", task_id)
         se = self._engine_artifact(job_id, f"engine/verify/{vid}/stderr.txt", out.stderr, "verifier_stderr", task_id)
         self.conn.execute("UPDATE verifications SET status=?, exit_code=?, timed_out=?, stdout_artifact_id=?, "
-                          "stderr_artifact_id=?, detail=?, env_identity=?, assurance=?, ended_at=? WHERE id=?",
+                          "stderr_artifact_id=?, detail=?, env_identity=?, assurance=?, sandbox=?, tamper_json=?, "
+                          "ended_at=? WHERE id=?",
                           (out.status, out.exit_code, int(out.timed_out), so, se, redact(out.detail)[:1000],
-                           out.env_identity, out.assurance, db.utcnow(), vid))
+                           out.env_identity, out.assurance, out.sandbox, _j(out.tamper[:200]), db.utcnow(), vid))
+        if out.tamper:
+            self._ev("tamper", job_id, task_id, "verifier", verification_id=vid, changes=out.tamper[:50],
+                     note="trusted files changed while candidate code ran; verification failed")
         self._ev("verification", job_id, task_id, "verifier", verification_id=vid, status=out.status,
                  exit_code=out.exit_code, detail=out.detail[:300])
         return {"verification_id": vid, "status": out.status, "exit_code": out.exit_code, "detail": out.detail,
                 "timed_out": out.timed_out, "artifact_ids": [so, se], "profile_hash": out.profile_hash,
-                "assurance": out.assurance}
+                "assurance": out.assurance, "sandbox": out.sandbox, "tamper": out.tamper[:50]}
 
     # ------------------------------------------------------------------ approval
     PLAN_BOUND_KINDS = ("implement", "code_review", "qa", "integrate")
@@ -1264,13 +1268,18 @@ class Engine:
         self._after()
         return {"ok": True, "phase": self._job(job_id)["phase"]}
 
-    def record_synthetic_approval(self, job_id, plan_hash, actor="omoctl test live --fixture-only") -> dict:
-        """Explicit synthetic approval for a synthetic FIXTURE job only. Never valid for real repositories."""
+    def record_synthetic_approval(self, job_id, plan_hash, actor="omoctl test live --fixture-only",
+                                  accept_reduced_assurance: bool = False) -> dict:
+        """Explicit synthetic approval for a synthetic FIXTURE job only. Never valid for real repositories.
+        Reduced (non-independent) assurance must be opted into per job here too; it is never a default."""
         return self.approve(job_id, plan_hash, actor=actor, evidence="synthetic fixture approval (installation test)",
-                            mode="synthetic_fixture")
+                            mode="synthetic_fixture", accept_reduced_assurance=accept_reduced_assurance)
 
     # ------------------------------------------------------------------ independence + final gate
     def _independence(self, job_id, revision) -> dict:
+        """ENFORCED: the latest accepted code_review AND qa on the exact revision must come from a Bot that is neither
+        the executor's Bot nor in the executor's independence group. All Bots still share one Grok Bot account, so
+        this is separation of agents/processes, not identity isolation."""
         impl = self._one("SELECT * FROM tasks WHERE job_id=? AND kind='implement' AND candidate_revision=? "
                          "ORDER BY created_at DESC LIMIT 1", (job_id, revision))
         ex_b = None
@@ -1278,26 +1287,30 @@ class Engine:
             a = self._one("SELECT binding_id FROM task_attempts WHERE id=?", (impl["current_attempt_id"],))
             ex_b = self._one("SELECT * FROM role_bindings WHERE id=?", (a["binding_id"],)) if a and a["binding_id"] \
                 else None
-        revs = self._all("SELECT type,bot_id,independence_group FROM reviews WHERE job_id=? AND revision=? AND "
-                         "invalidated=0 AND type IN ('code','qa')", (job_id, revision))
         problems = []
-        for r in revs:
-            if not ex_b or not r["bot_id"]:
-                problems.append(f"{r['type']}: reviewer or executor identity unknown")
+        for typ in ("code", "qa"):
+            r = self._one("SELECT bot_id,independence_group,verdict FROM reviews WHERE job_id=? AND revision=? AND "
+                          "invalidated=0 AND type=? ORDER BY created_at DESC LIMIT 1", (job_id, revision, typ))
+            if not r or r["verdict"] != "accept":
+                problems.append(f"{typ}: no accepted review on this exact revision")
+            elif not ex_b or not r["bot_id"]:
+                problems.append(f"{typ}: reviewer or executor identity unknown")
             elif r["bot_id"] == ex_b["bot_id"]:
-                problems.append(f"{r['type']}: same Bot as executor")
+                problems.append(f"{typ}: same Bot as executor")
             elif r["independence_group"] == ex_b["independence_group"]:
-                problems.append(f"{r['type']}: same independence group as executor")
-        if not revs:
-            problems.append("no reviews")
+                problems.append(f"{typ}: same independence group as executor")
         level = "separate_bots_same_account" if not problems else "reduced_non_independent"
         return {"level": level, "problems": problems, "executor_bot": ex_b and ex_b["bot_id"],
-                "note": "all Bots share one Grok Bot account: assurance is process separation, not identity isolation"}
+                "note": "all Bots share one Grok Bot account: separation of agents, not identity isolation"}
+
+    def _reduced_acceptance(self, ap) -> bool:
+        """Reduced (non-independent) assurance is never a config default: only an approval of THIS job that
+        explicitly carries accept_reduced_assurance=true (any mode, including fixture) accepts it."""
+        return bool(ap is not None and json.loads(ap["scope_json"]).get("accept_reduced_assurance") is True)
 
     def gate_checks(self, job_id, final_verification: dict | None = None) -> tuple[bool, dict, str]:
         job = self._job(job_id)
         sha = job["candidate_revision"]
-        pol = self._policy(job)
         c: dict[str, dict] = {}
 
         def chk(name, ok, detail=""):
@@ -1338,12 +1351,15 @@ class Engine:
                 bad.append(f"{a['rel_path']}: {e.message}")
         chk("artifact_integrity", not bad, "; ".join(bad[:5]))
         ind = self._independence(job_id, sha) if sha else {"level": "unknown", "problems": ["no revision"]}
-        reduced_ok = (job["mode"] == "fixture" and pol["fixture_allow_reduced_assurance"]) or \
-            (ap is not None and json.loads(ap["scope_json"]).get("accept_reduced_assurance"))
-        chk("independence", ind["level"] == "separate_bots_same_account" or reduced_ok or
-            not pol["require_independent_assurance"], _j(ind["problems"]))
+        independent = ind["level"] == "separate_bots_same_account"
+        reduced = not independent and self._reduced_acceptance(ap)
+        chk("independent_code_review_and_qa", independent or reduced,
+            ("REDUCED ASSURANCE explicitly accepted by approval " + ap["id"] + ": " if reduced else "")
+            + _j(ind["problems"]))
         assurance = ind["level"] + f"+verifier_{v_assurance}"
-        if v_assurance == "cooperative":  # forgeable verifier: the independent review/QA pair is the real backstop
+        if reduced:
+            assurance = "REDUCED_ASSURANCE_ACCEPTED_BY_APPROVAL+" + assurance
+        if v_assurance == "cooperative":  # forgeable verifier: the review/QA pair is the real backstop
             chk("cooperative_verifier_backed_by_code_review_and_qa",
                 c["code_review_accepts_exact_revision"]["ok"] and c["qa_review_accepts_exact_revision"]["ok"])
         if ap and ap["mode"] == "synthetic_fixture":
@@ -1536,6 +1552,12 @@ class Engine:
         ap = self._valid_approval(job)
         out["approval"] = ap and {"mode": ap["mode"], "label": "SOFT (not a security boundary)"
                                   if ap["mode"] == "soft" else ap["mode"]}
+        out["reduced_assurance"] = bool(job["assurance"] and "REDUCED_ASSURANCE" in job["assurance"])
+        if out["reduced_assurance"]:
+            out["WARNING"] = ("REDUCED ASSURANCE: code_review/qa were NOT independent of the executor; accepted "
+                              "explicitly by the approval of this job")
+        elif ap and self._reduced_acceptance(ap):
+            out["WARNING"] = "approval accepts REDUCED ASSURANCE (non-independent review/QA) for this job"
         out["next_action"] = self._next_action(job, tasks)
         if detail:
             out["tasks"] = []
@@ -1549,9 +1571,11 @@ class Engine:
                                      "dispatch": d and dict(d, last_error=d["last_error"] and
                                                              redact_urls(d["last_error"]))})
             out["verifications"] = [dict(v) for v in self._all(
-                "SELECT id,purpose,revision,status,assurance,exit_code,detail,started_at FROM verifications WHERE job_id=? "
+                "SELECT id,purpose,revision,status,assurance,sandbox,tamper_json,exit_code,detail,started_at FROM verifications "
+                "WHERE job_id=? "
                 "ORDER BY started_at", (job["id"],))]
-            out["gates"] = [dict(g, checks=_l(g["checks_json"])) for g in self._all(
+            out["gates"] = [dict(g, checks=_l(g["checks_json"]),
+                                 reduced_assurance="REDUCED_ASSURANCE" in (g["assurance"] or "")) for g in self._all(
                 "SELECT id,revision,passed,assurance,checks_json,created_at FROM gate_results WHERE job_id=?",
                 (job["id"],))]
             out["awaiting_resume"] = [{"task_id": t["id"], "kind": t["kind"], "dispatch_id": t["current_dispatch_id"]}
@@ -1591,7 +1615,10 @@ class Engine:
         job = self._job(job_id)
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        data = {"job": dict(job), "summary": self._job_summary(job, detail=True)}
+        summary = self._job_summary(job, detail=True)
+        data = {"job": dict(job), "summary": summary,
+                "ASSURANCE_LABEL": summary.get("WARNING") or ("REDUCED ASSURANCE" if summary["reduced_assurance"]
+                                                              else f"assurance={job['assurance']}")}
         for tbl in ("tasks", "task_attempts", "artifacts", "plan_revisions", "approvals", "dispatch_outbox",
                     "verifications", "reviews", "gate_results", "events"):
             data[tbl] = [dict(r) for r in self._all(f"SELECT * FROM {tbl} WHERE job_id=?", (job_id,))]

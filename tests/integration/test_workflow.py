@@ -7,6 +7,8 @@ import pytest
 from omo_grok import fixture as fx
 from omo_grok.errors import Conflict, GateRefused, ValidationError
 
+ROOT = Path(__file__).resolve().parents[2]
+
 
 def test_full_fixture_job_reaches_done_via_gates(harness):
     job, sha, res = harness.full_fixture_job()
@@ -324,25 +326,113 @@ def test_item15_final_verifier_runs_on_exact_revision(harness):
     assert len(fin) == 1 and fin[0]["revision"] == sha and fin[0]["status"] == "passed"
 
 
-def test_independence_same_bot_refused_for_real_jobs_reported_for_fixture(harness):
+MOMUS_EXEC = ("42b0d03a-d1fb-4fdc-87b1-35d9123f6f74", "Momus", "g-momus")  # same Bot/group as the code reviewer
+
+
+def _rebind_executor_to_momus(e):
+    e.bind_role("executor", MOMUS_EXEC[0], MOMUS_EXEC[1], routine_id="r-exec", independence_group=MOMUS_EXEC[2],
+                max_concurrent=4, verified=True, provenance="test")
+
+
+def _run_to_gate(harness, job, **approve_kw):
+    harness.to_approval(job)
+    harness.approve(job, **approve_kw)
+    harness.implement(job)
+    harness.review(job, "code_review")
+    harness.review(job, "qa")
+    return harness.integrate(job)[1]
+
+
+def test_independence_fixture_same_bot_refused_without_per_job_opt_in(harness):
     e = harness.e
-    # rebind executor to Momus' bot (same as code-reviewer)
-    e.bind_role("executor", "42b0d03a-d1fb-4fdc-87b1-35d9123f6f74", "Momus", routine_id="r-exec",
-                independence_group="g-momus", max_concurrent=4, verified=True, provenance="test")
-    job, sha, res = harness.full_fixture_job()
-    g = res["final_gate"]
-    assert g["passed"] is True and g["assurance"].startswith("reduced_non_independent")
-    j2 = harness.submit()["job_id"]
-    with __import__("omo_grok.db", fromlist=["tx"]).tx(e.conn):
-        e.conn.execute("UPDATE jobs SET mode='implement' WHERE id=?", (j2,))  # simulate a real-repo job policy
-    e.policy["fixture_allow_reduced_assurance"] = False
-    harness.to_approval(j2)
-    harness.approve(j2)
-    harness.implement(j2)
-    harness.review(j2, "code_review")
-    harness.review(j2, "qa")
-    _, r2 = harness.integrate(j2)
-    assert r2["final_gate"]["passed"] is False and r2["final_gate"]["checks"]["independence"]["ok"] is False
+    _rebind_executor_to_momus(e)
+    job = harness.submit()["job_id"]
+    g = _run_to_gate(harness, job)["final_gate"]
+    assert g["passed"] is False and g["checks"]["independent_code_review_and_qa"]["ok"] is False
+    assert e.status(job)["phase"] != "done"
+
+
+def test_independence_reduced_assurance_only_with_approval_opt_in_and_is_labelled(harness, tmp_path):
+    e = harness.e
+    _rebind_executor_to_momus(e)
+    job = harness.submit()["job_id"]
+    g = _run_to_gate(harness, job, accept_reduced_assurance=True)["final_gate"]
+    assert g["passed"] is True and g["assurance"].startswith("REDUCED_ASSURANCE_ACCEPTED_BY_APPROVAL+")
+    assert "REDUCED ASSURANCE explicitly accepted" in g["checks"]["independent_code_review_and_qa"]["detail"]
+    s = e.status(job)
+    assert s["phase"] == "done" and s["reduced_assurance"] is True and "REDUCED ASSURANCE" in s["WARNING"]
+    assert all(x["reduced_assurance"] for x in s["gates"] if x["passed"])
+    out = e.export(job, tmp_path / "exp")
+    blob = json.dumps(out) + "".join(p.read_text() for p in (tmp_path / "exp").rglob("*.json"))
+    assert "REDUCED ASSURANCE" in blob
+
+
+def test_review_on_an_older_revision_does_not_satisfy_the_gate(harness):
+    e = harness.e
+    job = harness.submit()["job_id"]
+    harness.to_approval(job)
+    harness.approve(job)
+    _, sha1, _ = harness.implement(job)
+    harness.review(job, "code_review")          # accepts sha1
+    harness.review(job, "qa", verdict="reject")  # forces a repair
+    _, sha2, _ = harness.implement(job, fix=_append_constant)
+    assert sha2 != sha1
+    # code_review is re-dispatched for sha2; we deliberately do NOT complete it
+    harness.review(job, "qa")                    # only qa accepts sha2
+    with db_tx(e):
+        e.conn.execute("UPDATE jobs SET candidate_revision=? WHERE id=?", (sha2, job))
+    ok, checks, _ = e.gate_checks(job, {"status": "passed", "assurance": "oracle", "detail": ""})
+    assert ok is False
+    assert checks["code_review_accepts_exact_revision"]["ok"] is False
+    assert checks["qa_review_accepts_exact_revision"]["ok"] is True
+    assert checks["independent_code_review_and_qa"]["ok"] is False
+    assert e.status(job)["phase"] != "done"
+
+
+def _append_constant(wt):
+    p = wt / "calc" / "__init__.py"
+    p.write_text(p.read_text() + "\n\nK = 1\n")
+    return fx.commit_all(wt, "repair")
+
+
+def _real_repo_coop(harness, tmp_path):
+    from omo_grok.config import load_verifier_profiles, validate_profile
+    e = harness.e
+    repo = tmp_path / "realrepo"
+    fx.make_repo(repo)
+    prof = dict(load_verifier_profiles(ROOT / "config")["fixture-calc-unittest"])
+    prof.pop("oracle")
+    prof.pop("pure_modules")
+    assert validate_profile("real-calc-coop", prof) == []
+    e.profiles["real-calc-coop"] = prof
+    e.policy["repo_allowlist"] = [*e.policy["repo_allowlist"], str(repo)]
+    return harness.submit(mode="implement", repo=str(repo), verifier_profile="real-calc-coop")["job_id"]
+
+
+def test_real_repo_cooperative_profile_end_to_end_gate(harness, tmp_path):
+    job = _real_repo_coop(harness, tmp_path)
+    g = _run_to_gate(harness, job)["final_gate"]
+    assert g["passed"] is True, g["checks"]
+    assert "+verifier_cooperative" in g["assurance"] and "REDUCED" not in g["assurance"]
+    assert g["checks"]["independent_code_review_and_qa"]["ok"] is True
+    v = harness.e.status(job)["verifications"][-1]
+    assert v["assurance"] == "cooperative" and v["sandbox"] == "bwrap"
+
+
+def test_real_repo_same_bot_executor_refused_unless_reduced_assurance_accepted(harness, tmp_path):
+    e = harness.e
+    _rebind_executor_to_momus(e)
+    job = _real_repo_coop(harness, tmp_path)
+    g = _run_to_gate(harness, job)["final_gate"]
+    assert g["passed"] is False and g["checks"]["independent_code_review_and_qa"]["ok"] is False
+    job2 = _real_repo_coop(harness, tmp_path / "second")
+    g2 = _run_to_gate(harness, job2, accept_reduced_assurance=True)["final_gate"]
+    assert g2["passed"] is True and g2["assurance"].startswith("REDUCED_ASSURANCE_ACCEPTED_BY_APPROVAL+")
+    assert "REDUCED ASSURANCE" in e.status(job2)["WARNING"]
+
+
+def db_tx(e):
+    return __import__("omo_grok.db", fromlist=["tx"]).tx(e.conn)
 
 
 def test_item19_cancelled_and_blocked_jobs_do_not_dispatch(harness):

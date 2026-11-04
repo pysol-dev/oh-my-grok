@@ -99,7 +99,7 @@ These live in `config/verifiers.json`. Each profile has these fields:
 
 | Field | Requirement |
 |---|---|
-| `argv` | absolute interpreter, no shell; a Python interpreter must be run isolated (`-I` before `-m`) |
+| `argv` | absolute interpreter, no shell; a Python interpreter must be run isolated (`-I` before `-m`). It must resolve (realpath) inside `/usr` (not `/usr/local`): children run the system interpreter inside the sandbox, never the venv |
 | `cwd` | inside the worktree |
 | `env_allow` | allowed environment variables |
 | `timeout_seconds` | run time limit |
@@ -110,12 +110,13 @@ These live in `config/verifiers.json`. Each profile has these fields:
 | `expected_tests` | non-empty unique list of test ids that must ALL run and pass (no extras, skips or failures) |
 | `oracle` | `{"name": "<key in omo_grok/oracles.py ORACLES>", "cases_per_function": 8..2000, "modules": [...]}`. **Required** for every profile named `fixture-*`. Without it a profile is `cooperative` (see below). `type_checks` was removed in T07 round 3 and is refused |
 | `source_extensions` | allowlist of file extensions the candidate may add or change (default `[".py"]`) |
+| `pure_modules` | `{"allow_imports": [...]}`. **Required** for every `fixture-*` profile: every changed `.py` under `editable_paths` must pass the pure-function rule (no environment/context observation, no state between calls; imports only from this list, at most `math`, `operator`, `cmath`, `numbers`). `fixture-calc-unittest` allows none |
 | `static_scan` | AST-scan rule overrides (`allow_imports`, `allow_attrs`, `allow_calls`, `forbid_imports`, `allow_dunder_overrides`, `allow_builtin_subclass`); cannot be disabled |
 | `exit_code_only` | required `true` for non-Python argv; the pass then rests on exit code alone (REDUCED assurance) |
 
 A profile whose argv or referenced script contains `OMO_VERIFY_TEMPLATE` is refused. So are:
 - a missing profile
-- a Python profile without `-I` or without the unittest child and `expected_tests`, or a `fixture-*` profile without an `oracle`
+- a Python profile without `-I` or without the unittest child and `expected_tests`, or a `fixture-*` profile without an `oracle` or `pure_modules`
 - a non-Python profile without `exit_code_only: true`
 
 Before running, the verifier diffs base..candidate (`--no-renames`, so renames count as delete+add) and rejects the
@@ -131,19 +132,25 @@ candidate without executing it when any changed path:
   is binary or not UTF-8, or (for `.py`) fails the static AST scan (see SECURITY.md).
 
 The trusted parent (which never imports candidate code) then decides the result:
-- **oracle profiles** (assurance `oracle`): the oracle child must answer every fresh random case with a raw JSON value
-  that is `type(v) is int` and equal to the trusted oracle's answer, then exit 0. The advisory unittest child must also
-  report a clean run; its report can only add failures, never make a run pass.
+- **oracle profiles** (assurance `oracle`): in each of 3 varied, neutral sandboxed runs the oracle child must answer
+  every fresh random case with a raw JSON value that is `type(v) is int` and equal to the trusted oracle's answer,
+  then exit 0, and the runs must agree. The advisory unittest child must also report a clean run; its report alone
+  does not make a run pass.
 - **profiles without an oracle** (assurance `cooperative`): the unittest child's report decides, but a candidate can
   forge it. The detail line says so, the record stores `assurance=cooperative`, and the final gate requires an accepted
-  `code_review` and `qa` on the same revision.
+  `code_review` and `qa` on the same revision from Bots outside the executor's Bot and independence group (or an
+  approval with `accept_reduced_assurance=true`, labelled REDUCED ASSURANCE).
 - exit-code-only profiles are `cooperative` too.
 
 See SECURITY.md for what this does and does not prove.
 
-Both children run with `-I -B`, a scrubbed environment (no `OMO_*`, nothing secret in env, argv or fds) plus
-`PYTHONSAFEPATH=1` and `PYTHONNOUSERSITE=1`. Migration v3 adds `verifications.assurance` (auto-applied with a backup on
-the next open). A missing base revision fails closed.
+Every child that runs candidate code (unittest child, oracle runs, exit-code commands) runs inside the bubblewrap
+sandbox (read-only `/usr`, fresh writable checkout copy, private `/tmp`, no network, no view of `state/`, the code,
+the venv, `/home` or `/workspace`) with a scrubbed environment (no `OMO_*`, nothing secret in env, argv or fds). If
+bwrap is unavailable verification fails closed (`no sandbox available`); `doctor` shows `candidate_sandbox`. Trusted
+files (code, config, venv) are hashed before and after; any change fails the run with `TAMPER` and a `tamper` event.
+Migration v3 adds `verifications.assurance`, v4 adds `verifications.sandbox` and `tamper_json` (auto-applied with a
+backup on the next open). A missing base revision fails closed.
 `./omoctl doctor` lists the usable profiles.
 
 ## 10. Backups and migrations

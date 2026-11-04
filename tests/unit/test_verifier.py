@@ -23,7 +23,7 @@ def test_fixture_base_fails_real_fix_passes_fake_fails(tmp_path):
     assert verifier.run(repo, base, "p", prof, tmp_path / "w").status == "failed"
     fake = fx.apply_fake_fix(repo)
     o = verifier.run(repo, fake, "p", prof, tmp_path / "w")
-    assert o.status == "failed" and "VERIFIED" in o.stdout + o.stderr
+    assert o.status == "failed" and "pure-function rule" in o.detail  # module-level print() is not pure
     gitops.git(["checkout", "-q", base, "--", "."], repo)
     real = fx.apply_real_fix(repo)
     assert verifier.run(repo, real, "p", prof, tmp_path / "w").status == "passed"
@@ -403,7 +403,7 @@ def test_n_attacks_fail_with_static_scan_disabled(tmp_path, monkeypatch, name):
     repo, base = _repo(tmp_path)
     sha = N_ATTACKS[name](repo)
     o = verifier.run(repo, sha, "p", dict(PROF, protected_base=base), tmp_path / "w")
-    assert o.status == "failed" and "ORACLE: oracle child exited" in o.detail, (name, o.detail)
+    assert o.status == "failed" and ("ORACLE: oracle child exited" in o.detail or "ORACLE: oracle protocol violation" in o.detail), (name, o.detail)
 
 
 def test_no_secret_reaches_candidate_processes(tmp_path, monkeypatch):
@@ -412,7 +412,7 @@ def test_no_secret_reaches_candidate_processes(tmp_path, monkeypatch):
     repo, base = _repo(tmp_path)
     probe = ("\nimport os as _o\n_e = sorted(k for k in _o.environ if 'OMO' in k or 'VERIFY' in k)\n"
              "_f = sorted(int(x) for x in _o.listdir('/proc/self/fd'))\n"
-             "print('PROBE', _e, _f, flush=True)\n")
+             "import sys as _s\nprint('PROBE', _e, _f, flush=True, file=_s.stderr)  # stdout is the protocol\n")
     _write_calc(repo, (repo / "calc" / "__init__.py").read_text().replace(fx.FIX_FROM, fx.FIX_TO) + probe)
     sha = fx.commit_all(repo, "probe environment")
     o = verifier.run(repo, sha, "p", dict(PROF, protected_base=base), tmp_path / "w")
@@ -437,6 +437,16 @@ ORACLE_VARIANTS = {
     "constant_answer": "def add(a, b):\n    return 5\n",
 }
 
+# R1: hostile bytes on every inherited fd (incl. the oracle protocol channel and the unittest report line)
+_R1 = ("import os\n_b = {blob}\nfor _fd in range(1, 20):\n    try:\n        os.write(_fd, _b)\n"
+       "    except OSError:\n        pass\n")
+R1_VARIANTS = {
+    "deep_nesting": _R1.format(blob="b'OMO-UNITTEST-REPORT ' + b'[' * 300000 + b'\\n' + b'[' * 300000 + b'\\n'"),
+    "invalid_utf8": _R1.format(blob="b'OMO-UNITTEST-REPORT \\xff\\xfe{\\n\\xff\\xfe\\xfa\\n'"),
+    "flood_no_newline": _R1.format(blob="b'{' * 3000000"),
+    "huge_int": _R1.format(blob="b'{\"id\": 0, \"value\": ' + b'9' * 50000 + b'}\\n'"),
+}
+
 
 @pytest.mark.parametrize("name", sorted(ORACLE_VARIANTS))
 def test_oracle_catches_forgery_variants_with_scan_disabled(tmp_path, monkeypatch, name):
@@ -446,6 +456,18 @@ def test_oracle_catches_forgery_variants_with_scan_disabled(tmp_path, monkeypatc
     sha = fx.commit_all(repo, f"oracle variant {name}")
     o = verifier.run(repo, sha, "p", dict(PROF, protected_base=base), tmp_path / "w")
     assert o.status == "failed" and "ORACLE:" in o.detail, (name, o.detail)
+
+
+@pytest.mark.parametrize("name", sorted(R1_VARIANTS))
+def test_r1_hostile_child_output_fails_closed_with_scan_disabled(tmp_path, monkeypatch, name):
+    monkeypatch.setattr(verifier, "scope_problems", lambda *a, **k: [])
+    repo, base = _repo(tmp_path)
+    real = (repo / "calc" / "__init__.py").read_text().replace("return a - b  # BUG", "return a + b")
+    _write_calc(repo, R1_VARIANTS[name] + "\n" + real)  # a CORRECT implementation plus hostile output
+    sha = fx.commit_all(repo, f"r1 {name}")
+    o = verifier.run(repo, sha, "p", dict(PROF, protected_base=base), tmp_path / "w")
+    assert o.status == "failed" and "ORACLE:" in o.detail, (name, o.detail)
+    assert len(o.stdout) <= verifier.MAX_OUTPUT * 2 and len(o.stderr) <= verifier.MAX_OUTPUT * 3
 
 
 def test_oracle_inputs_are_fresh_per_run():

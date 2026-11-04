@@ -52,14 +52,17 @@ def commit_all(worktree: Path, message: str) -> str:
     return gitops.head(worktree)
 
 
+FAKE_LINES = "\nprint('VERIFIED')\nprint('PASS')\n"
+
+
 def apply_real_fix(worktree: Path) -> str:
     p = worktree / "calc" / "__init__.py"
-    p.write_text(p.read_text().replace(FIX_FROM, FIX_TO))
+    p.write_text(p.read_text().replace(FIX_FROM, FIX_TO).replace(FAKE_LINES, ""))  # a real repair drops fake output
     return commit_all(worktree, "fix add()")
 
 
 def apply_fake_fix(worktree: Path) -> str:
     """A 'fix' that only prints VERIFIED; must not pass."""
     p = worktree / "calc" / "__init__.py"
-    p.write_text(p.read_text() + "\nprint('VERIFIED')\nprint('PASS')\n")
+    p.write_text(p.read_text() + FAKE_LINES)
     return commit_all(worktree, "claim VERIFIED")

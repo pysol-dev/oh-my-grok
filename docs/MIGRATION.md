@@ -18,6 +18,7 @@ is recorded as an **unverified prior claim**. Nothing was migrated, and existing
 | 1 | Core tables: jobs, tasks, deps, attempts, artifacts, inputs, plan revisions, approvals, role bindings, outbox, verifications, reviews, events |
 | 2 | `hooks_meta` (booleans only) and `gate_results` tables plus indexes. See `omo_grok/db.py` `MIGRATIONS` |
 | 3 | `verifications.assurance TEXT NOT NULL DEFAULT 'none'` (oracle / cooperative / none). Applied automatically on the next open, after the automatic backup |
+| 4 | `verifications.sandbox TEXT NOT NULL DEFAULT 'none'` (mechanism used: `bwrap` / `none`) and `verifications.tamper_json TEXT NOT NULL DEFAULT '[]'` (trusted-file changes seen during the run). Old rows read `none` / `[]` |
 
 Each migration is recorded in `schema_migrations` with a checksum, and a mismatch is reported by `doctor`.
 `omoctl migrate` takes an automatic backup first when the DB is not empty. Roll back with `omoctl restore <backup>`.

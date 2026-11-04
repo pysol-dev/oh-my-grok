@@ -51,7 +51,7 @@ def test_argument_validation_exit_2(args):
 def test_doctor_and_migrate_in_isolated_home(omo_home):
     env = dict(os.environ)
     r = run(["migrate", "--dry-run", "--json"], env=env)
-    assert r.returncode == 0 and json.loads(r.stdout)["pending"] == [1, 2, 3]
+    assert r.returncode == 0 and json.loads(r.stdout)["pending"] == [1, 2, 3, 4]
     assert run(["migrate"], env=env).returncode == 0
     r = run(["doctor", "--json"], env=env)
     d = json.loads(r.stdout)

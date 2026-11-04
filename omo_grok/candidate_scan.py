@@ -156,3 +156,166 @@ def scan_source(text: str, rel: str, rules: dict | None = None) -> list[str]:
         elif isinstance(node, ast.Global) and rules.get("forbid_global", True):
             bad(node, "global statement")
     return sorted(set(out))
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Pure-function rule (fixture profiles, `pure_modules` in the profile). The user decided (round 4, H1) that harness
+# detection is NOT an accepted residual. A fixture module may compute only from its arguments: it may not observe its
+# environment or context in any way (environment, flags, argv, paths, cwd, pids, users, host, time, randomness,
+# files, /proc, threads, signals, stack depth, memory limits, introspection), and it may not keep state between
+# calls. This is an ALLOWLIST: anything not explicitly permitted is rejected.
+
+PURE_IMPORT_CEILING = {"math", "operator", "cmath", "numbers", "__future__"}  # the most any profile may allow
+PURE_BUILTINS = {
+    "abs", "all", "any", "bin", "bool", "bytes", "chr", "complex", "dict", "divmod", "enumerate", "filter", "float",
+    "frozenset", "hex", "int", "isinstance", "issubclass", "iter", "len", "list", "map", "max", "min", "next", "oct",
+    "ord", "pow", "range", "repr", "reversed", "round", "set", "slice", "sorted", "str", "sum", "super", "tuple",
+    "zip", "NotImplemented", "Ellipsis",
+    "ArithmeticError", "ZeroDivisionError", "OverflowError", "ValueError", "TypeError", "KeyError", "IndexError",
+    "LookupError", "StopIteration", "NotImplementedError", "AssertionError", "AttributeError"}
+# catching these would let code probe stack depth / memory limits / anything (RecursionError, MemoryError, ...)
+PURE_FORBIDDEN_HANDLERS = {"BaseException", "Exception", "RuntimeError", "RecursionError", "MemoryError",
+                           "SystemError", "OSError", "EnvironmentError", "IOError", "ImportError",
+                           "ModuleNotFoundError", "KeyboardInterrupt", "SystemExit", "GeneratorExit", "Warning",
+                           "UnicodeError", "UnicodeDecodeError", "UnicodeEncodeError", "EOFError"}
+PURE_FORBIDDEN_ATTRS = {"format", "format_map"}  # "{0.__globals__}".format(f) reaches globals without an AST dunder
+
+
+def _immutable_literal(node) -> bool:
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        return _immutable_literal(node.operand)
+    if isinstance(node, ast.Tuple):
+        return all(_immutable_literal(e) for e in node.elts)
+    return False
+
+
+def _bound_names(tree) -> set[str]:
+    names: set[str] = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            names.add(n.id)
+        elif isinstance(n, (ast.FunctionDef, ast.ClassDef)):
+            names.add(n.name)
+        elif isinstance(n, ast.arg):
+            names.add(n.arg)
+        elif isinstance(n, ast.alias):
+            names.add((n.asname or n.name).split(".")[0])
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            names.add(n.name)
+        elif isinstance(n, (ast.MatchAs, ast.MatchStar)) and n.name:
+            names.add(n.name)
+        elif isinstance(n, ast.MatchMapping) and n.rest:
+            names.add(n.rest)
+    return names
+
+
+def pure_module_problems(text: str, rel: str, allow_imports) -> list[str]:
+    """Allowlist scan of one fixture source file. Returns problems (empty = pure)."""
+    allow = set(allow_imports or []) | {"__future__"}
+    try:
+        tree = ast.parse(text, filename=rel)
+    except (SyntaxError, ValueError) as e:
+        return [f"{rel}: cannot parse ({type(e).__name__}); fail closed"]
+    out: list[str] = []
+
+    def bad(node, why):
+        out.append(f"{rel}:{getattr(node, 'lineno', '?')}: pure-function rule: {why}")
+
+    module_level: set[str] = set()
+    for i, st in enumerate(tree.body):
+        if isinstance(st, ast.Expr) and i == 0 and _is_str_const(st.value):
+            continue  # docstring
+        if isinstance(st, ast.Import):
+            for a in st.names:
+                if a.name not in allow:
+                    bad(st, f"import {a.name} not in this profile's allowlist {sorted(allow - {'__future__'})}")
+                module_level.add((a.asname or a.name).split(".")[0])
+        elif isinstance(st, ast.ImportFrom):
+            if st.level == 0 and (st.module or "") not in allow:
+                bad(st, f"import from {st.module} not in this profile's allowlist {sorted(allow - {'__future__'})}")
+            for a in st.names:
+                if a.name == "*" or a.name.startswith("_") and st.module != "__future__":
+                    bad(st, f"from-import of {a.name!r}")
+                module_level.add(a.asname or a.name)
+        elif isinstance(st, ast.FunctionDef):
+            module_level.add(st.name)
+        elif isinstance(st, ast.ClassDef):
+            module_level.add(st.name)
+            if st.keywords:
+                bad(st, f"class {st.name} keywords/metaclass")
+            for b in st.bases:
+                if not (isinstance(b, ast.Name) and (b.id in PURE_BUILTINS and b.id[0].isupper() or b.id in module_level)):
+                    bad(st, f"class {st.name} base must be a class defined above or an allowed exception type")
+            for item in st.body:
+                if isinstance(item, ast.FunctionDef) or (isinstance(item, ast.Expr) and _is_str_const(item.value)) \
+                        or isinstance(item, ast.Pass):
+                    continue
+                if isinstance(item, (ast.Assign, ast.AnnAssign)) and item.value is not None and \
+                        _immutable_literal(item.value):
+                    continue
+                bad(item, f"class {st.name} body may contain only methods and immutable literal constants")
+        elif isinstance(st, (ast.Assign, ast.AnnAssign)):
+            targets = st.targets if isinstance(st, ast.Assign) else [st.target]
+            if not all(isinstance(t, ast.Name) for t in targets) or st.value is None:
+                bad(st, "module-level assignment must bind plain names")
+            elif all(t.id == "__all__" for t in targets) and isinstance(st.value, (ast.List, ast.Tuple)) and \
+                    all(_is_str_const(e) for e in st.value.elts):
+                pass
+            elif not _immutable_literal(st.value):
+                bad(st, "module-level values must be immutable literal constants (no state between calls)")
+            for t in targets:
+                if isinstance(t, ast.Name):
+                    module_level.add(t.id)
+        else:
+            bad(st, f"module top level may contain only allowlisted imports, defs and literal constants, "
+                    f"not {type(st).__name__}")
+
+    bound = _bound_names(tree)
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if n.decorator_list:
+                bad(n, f"decorator on {n.name}")
+            if isinstance(n, ast.AsyncFunctionDef):
+                bad(n, "async function")
+            if not isinstance(n, ast.ClassDef):
+                for d in [*n.args.defaults, *[d for d in n.args.kw_defaults if d is not None]]:
+                    if not _immutable_literal(d):
+                        bad(n, f"default argument of {n.name} must be an immutable literal")
+        elif isinstance(n, (ast.Import, ast.ImportFrom)) and n not in tree.body:
+            bad(n, "import outside module top level")
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            bad(n, f"{type(n).__name__.lower()} statement (state between calls)")
+        elif isinstance(n, (ast.With, ast.AsyncWith, ast.Await, ast.AsyncFor)):
+            bad(n, f"{type(n).__name__} not allowed")
+        elif isinstance(n, getattr(ast, "TryStar", ())):
+            bad(n, "except* not allowed")
+        elif isinstance(n, ast.ExceptHandler):
+            types = [] if n.type is None else (n.type.elts if isinstance(n.type, ast.Tuple) else [n.type])
+            if n.type is None:
+                bad(n, "bare except (could catch RecursionError/MemoryError probes)")
+            for t in types:
+                if not isinstance(t, ast.Name) or t.id in PURE_FORBIDDEN_HANDLERS:
+                    bad(n, f"except {ast.unparse(t)} (broad/environment-probing handler)")
+        elif isinstance(n, ast.Name):
+            if n.id.startswith("__"):
+                bad(n, f"dunder name {n.id}")
+            elif isinstance(n.ctx, ast.Load) and n.id not in bound and n.id not in PURE_BUILTINS:
+                bad(n, f"name {n.id!r} is neither defined in the module nor an allowed pure builtin")
+        elif isinstance(n, ast.Attribute):
+            if n.attr.startswith("_") or n.attr in PURE_FORBIDDEN_ATTRS:
+                bad(n, f"attribute .{n.attr}")
+            if isinstance(n.ctx, (ast.Store, ast.Del)):
+                base = n.value
+                while isinstance(base, (ast.Attribute, ast.Subscript)):
+                    base = base.value
+                if isinstance(base, ast.Name) and (base.id in module_level or base.id in PURE_BUILTINS):
+                    bad(n, f"attribute assignment on module-level object {base.id} (state between calls)")
+        elif isinstance(n, ast.Subscript) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            base = n.value
+            while isinstance(base, (ast.Attribute, ast.Subscript)):
+                base = base.value
+            if isinstance(base, ast.Name) and base.id in module_level:
+                bad(n, f"item assignment on module-level object {base.id} (state between calls)")
+    return out

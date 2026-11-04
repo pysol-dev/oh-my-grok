@@ -13,7 +13,7 @@ Allowed:
 - cd to packet.worktree_root; confirm `git branch --show-current` equals packet.branch and HEAD descends from packet.base_revision.
 - Implement ONLY the approved plan (packet.plan_revision, must match the approved hash) and any repair findings in packet.relevant_prior_failures.
 - Run the project's tests locally, then `git add` + `git commit` on the job branch. Report the full 40-char commit SHA.
-- The deterministic verifier re-runs independently; writing PASS/VERIFIED in text changes nothing.
+- The deterministic verifier re-runs your revision itself, sandboxed; writing PASS/VERIFIED in text changes nothing.
 Forbidden:
 - Editing anything outside packet.worktree_root
 - push, merge, rebase or reset of user branches, deleting branches
