@@ -27,6 +27,8 @@ run inside the sandbox below; nothing else imports or executes candidate code (t
 - Mechanism: **bubblewrap** (`/usr/bin/bwrap`, 0.12.0 on this box, unprivileged user namespaces; kernel 6.12.94+).
   No root, sudo or extra OS users. `--unshare-all` (user, mount, pid, net, ipc, uts, cgroup namespaces),
   `--die-with-parent`, `--new-session`, `--cap-drop ALL`, `--clearenv`; rlimits AS 4 GiB, FSIZE 256 MiB, no core.
+  The three oracle runs deliberately use different address-space limits (one random 256-512 MiB, one 4 GiB, one
+  with no RLIMIT_AS at all; assigned at random to the run variants), see H1 (b).
 - The sandboxed process sees only: a **read-only** bind of `/usr` (system Python and its stdlib; `/usr/local` is
   hidden behind an empty read-only tmpfs) with `/bin`, `/lib`, `/lib64`, `/sbin` symlinks; a **writable private
   copy** of the candidate checkout (no `.git`), fresh for every child run; a private `/tmp` tmpfs; its own `/proc`
@@ -38,7 +40,12 @@ run inside the sandbox below; nothing else imports or executes candidate code (t
 - **Fail closed:** if bwrap is missing or cannot create namespaces, verification returns
   `no sandbox available ...; refusing to run candidate code without a sandbox (fail closed)` and never runs the
   candidate. There is no configuration switch that disables the sandbox. `omoctl doctor` reports
-  `candidate_sandbox`. Every verification record stores the mechanism in `verifications.sandbox` (`bwrap`/`none`).
+  `candidate_sandbox`. The probe also requires `bwrap --version` to exit 0 and print exactly
+  `bubblewrap <major>.<minor>[.<patch>]`; anything else fails closed. Every verification record stores the mechanism
+  and version in `verifications.sandbox` (e.g. `bwrap 0.12.0`, or `none` when no candidate code ran).
+- **Scratch cleanup** (`verifier._rmtree`) never follows symlinks and never chmods by path: entries are classified
+  with lstat, directories are opened `O_NOFOLLOW|O_DIRECTORY` relative to their parent fd, and the only permission
+  change is `fchmod` on such an fd after fstat confirms it is the directory inode that was listed.
 - **Integrity tripwire:** sha256 of every file under `omo_grok/`, `config/` (and the active config dir), `omoctl`,
   `.venv/bin`, `.venv/pyvenv.cfg` and the venv `site-packages` is taken before and after each verification. Any
   change fails the run (`TAMPER: ...`), is stored in `verifications.tamper_json` and raises a `tamper` event. Child
@@ -52,13 +59,15 @@ run inside the sandbox below; nothing else imports or executes candidate code (t
 - It shares the host kernel: a kernel or bubblewrap vulnerability (namespace escape) defeats it. No seccomp filter
   and no Landlock layer is installed (Landlock is available on this kernel but not used; no fallback mechanism is
   implemented, bwrap missing means fail closed).
-- CPU time is bounded only by the profile timeout; memory by RLIMIT_AS; disk writes by RLIMIT_FSIZE per file into
-  the private copy/tmpfs (scratch disk use under the system temp dir is possible up to those limits).
+- CPU time is bounded only by the profile timeout; memory by RLIMIT_AS, **except in the one oracle run that has no
+  RLIMIT_AS** (deliberate, round 5): there a candidate can use host memory until the timeout or the kernel OOM
+  killer stops it. Disk writes are bounded by RLIMIT_FSIZE per file into the private copy/tmpfs (scratch disk use
+  under the system temp dir is possible up to those limits). There is no cgroup memory limit.
 - It does not stop **same-account Bots** (the first threat model above): they run outside any sandbox.
 - The integrity tripwire detects changes; it does not prevent them (the sandbox does). A legitimate concurrent edit
   of the code/config during a verification also trips it (fail closed by design).
-- Verification of behaviour remains testing: the oracle only checks the functions defined in `oracles.py` on
-  random inputs, and the advisory unittest child only runs the declared tests.
+- Verification of behaviour remains testing: the oracle only checks the functions defined in `oracles.py` (see
+  "Oracle coverage" below for exactly which inputs), and the advisory unittest child only runs the declared tests.
 
 ### H1: harness detection — user decided: NOT accepted; mitigated by (a) neutral harness, (b) varied runs, (c) pure-function rule
 Momus's H1: a candidate whose `add` returns `a+b` only when `PYTHONSAFEPATH` is set and `HOME` contains `verify-`
@@ -75,31 +84,77 @@ accepted residual. Mitigations:
   different neutral layout: *plain* (`python3`, no flags, login-like env), *isolated-flags* (`python3.13 -I -S -B`,
   minimal env with `PYTHONSAFEPATH=1` and a random `PYTHONHASHSEED`), *interactive-like* (`python3 -q -i`, different
   LANG/EDITOR/`PYTHONDONTWRITEBYTECODE`). The call-stack depth at which the candidate is called is randomized per
-  call (0..300 extra frames). The same inputs go to every run; every run must match the oracle and all results must
-  be identical across runs.
+  call (0..300 extra frames). The runs also differ in **resource limits** (round 5): one run has a random low
+  RLIMIT_AS (256-512 MiB), one the default 4 GiB, one none, so code that senses the memory limit (by allocating or by
+  reading it) gets different answers in different runs. The same inputs go to every run; every run must match the
+  oracle and all results must be identical across runs. A correct candidate passes all three (tested).
 - **(c) Pure-function rule** (`candidate_scan.pure_module_problems`, required for every `fixture-*` profile via
-  `pure_modules: {"allow_imports": [...]}`, applied to every changed `.py` under `editable_paths`). It is an
+  `pure_modules: {"allow_imports": [...]}`, applied to **every** `.py` under `editable_paths` in the checked-out
+  revision, changed or not, so a relative import can only reach scanned code). It is an
   allowlist: module top level may contain only a docstring, allowlisted imports (calc: **none**; the ceiling for any
   profile is `math`, `operator`, `cmath`, `numbers`), function/class definitions without decorators, and immutable
   literal constants. Inside code: names must be defined in the module or be one of a fixed set of pure builtins (no
   `open`, `print`, `getattr`, `type`, `vars`, `__import__`, ...); no dunder names, no `_private`/dunder attributes,
   no `.format`/`.format_map`, no `global`/`nonlocal`, no mutable defaults, no attribute/item assignment on
-  module-level objects, no `with`/async, no imports inside functions, and no bare/broad exception handlers
-  (`Exception`, `BaseException`, `RuntimeError`, `RecursionError`, `MemoryError`, `OSError`, ...) that could probe
-  stack depth or memory limits. That forbids, among others, `os.*`, `sys.*`, environment, flags, argv, cwd, pids,
-  users, platform, socket, time, random, threading, signal, inspect, traceback, file I/O and `/proc`.
+  module-level objects, no `with`/async, no imports inside functions. Round 5 additions (after HMEM):
+  - **no `try` statement at all** (`try/except/else/finally`, `except*`): an exception raised by a resource probe
+    (MemoryError, RecursionError, ...) can never be turned into a value. Round 4 banned only broad handlers, and
+    `return` inside `finally` swallowed the MemoryError anyway (HMEM). The broad-handler list is kept as a redundant
+    second layer;
+  - `bytes` removed from the pure builtins (`bytearray`/`memoryview` were never in it); huge allocations through
+    other builtins (`[0] * n`, `range` materialisation) can only raise, which with no `try` is an error, not a value;
+  - no special-method definitions except `__init__` (no `__del__`, `__exit__`/`__enter__`, `__eq__`, `__index__`,
+    ...; class-body `__del__ = f` is a dunder name and also rejected), so no implicit hook can run code on an error
+    or at collection time;
+  - no frame/code/generator/coroutine/traceback internals (`gi_*`, `cr_*`, `ag_*`, `f_*`, `co_*`, `tb_*`, `mro`,
+    `throw`, `close`, `with_traceback`, plus the static scan's introspection list);
+  - **relative imports** (level > 0) are allowed only when they resolve to a `.py` file under the editable paths
+    (which is itself scanned by this rule); `from . import x` must name such a module, `from .m import x` needs `m` to
+    be one; anything else (protected `tests/`, outside the package, a missing module, `*`) is rejected. Absolute
+    imports of the candidate's own package go through the normal allowlist (rejected for calc).
+  That forbids, among others, `os.*`, `sys.*`, `resource`, environment, flags, argv, cwd, pids, users, platform,
+  socket, time, random, threading, signal, inspect, traceback, file I/O and `/proc`.
 
 **Which variants each layer stops** (`tests/integration/test_harness_detection.py`; every variant fails the full
 verifier):
 - Defeated by (a)+(b) even with every static check disabled: Momus's H1 payload; keyed on `sys.flags.isolated`,
   `sys.flags.no_site`, *not* isolated; `PYTHONSAFEPATH` present or absent; cwd markers; HOME markers; HOME==cwd;
   script `argv[0]`/`orig_argv`; `argv[0] != '-c'`; `sys.executable` name; `/proc/self/cmdline` markers; user name;
-  `LANG`.
+  `LANG`; **the RLIMIT_AS value** (`resource.getrlimit`).
+- **Memory-limit probing by allocation (Momus HMEM, round 5)** is stopped by **both** (c) and (b): (c) rejects the
+  `try` that would turn the MemoryError into a value (and `bytes`), and with the static rule disabled the run without
+  RLIMIT_AS can make the 5 GiB allocation succeed while the limited runs cannot, so the candidate answers wrongly in
+  that run and the oracle fails (`tests/integration/test_round5_probes.py`, including the relative-import helper
+  variant). Round 4 of this document wrongly listed "the RLIMIT_AS value" as stopped only by (c), while (c) did not
+  in fact stop HMEM; that claim is withdrawn. Caveat for (b) alone: a probe threshold above what *this host* can
+  allocate fails in every run and in most normal runs too, so it does not distinguish them here; on a host that can
+  allocate more, (b) alone would not see the difference. (c) does not depend on that.
+- Recursion-depth probing (`try`/`finally` around deep recursion): stopped by (c) (no `try`). Without `try`, a
+  RecursionError can only propagate, which fails the oracle. (b) varies the call depth but is not claimed to stop
+  it on its own.
 - Stopped **only** by the static pure-function rule (c): conditions every sandboxed run shares and a normal run
   lacks — `/proc/1/cmdline` is the bwrap init (it also shows host staging paths), `/workspace` does not exist,
   protocol modules (`json`) are already in `sys.modules` at call time. Others in this class: no network, the pid
-  namespace, `/proc/self/mountinfo`, stdin/stdout being pipes, `os.getpid()` values, the RLIMIT_AS value. A test
-  asserts that these variants pass the runtime layer with the scan disabled, so this statement stays true.
+  namespace, `/proc/self/mountinfo`, stdin/stdout being pipes, `os.getpid()` values. A test asserts that the three
+  tested variants pass the runtime layer with the scan disabled, so this statement stays true.
+- Round-5 audit of other exception-swallowing / sensing constructs (all rejected by (c), tested): `with` over a
+  context manager whose `__exit__` returns True; generator `try/finally` and `close()`/`throw()`; `__del__` (def or
+  class-body assignment); other dunder hooks; `try/except ValueError` and `try/else`; `except*`; `bytes`/
+  `bytearray`/`memoryview`; `gi_frame.f_code.co_filename` (would reveal the path); `int.mro()`; relative imports
+  of protected or missing modules; `from .m import *`; absolute self-imports. Not closed by a rule and stated here:
+  `repr()`/`str()` of a function or object exposes its memory address (ASLR-randomised, the same inside and outside
+  the sandbox, so it is randomness, not a harness signal; results that depend on it differ between the runs) and
+  string-set iteration order follows the per-process hash seed (also random in every run).
+- **Oracle coverage (round 5, after HDIST).** Every verification sends: the exhaustive grid of all argument pairs in
+  [-16, 16]^2 (1089 per binary function, filtered by each function's domain predicate, e.g. no zero divisor);
+  pairwise boundary values (0, +-1, +-2, +-16, +-17, both sides of 2**31, 2**32, 2**53+1, 2**63, 2**64, +-10**18,
+  +-2**200, +-2**1000), and each boundary against 0, +-1, +-2, +-16 in both orders; then `cases_per_function` fresh
+  CSPRNG draws (bands: |x|<=100, <=1000, <=10**12, <=2**63, <=2**200). Order is shuffled per run. Momus's HDIST
+  (wrong for |a|,|b|<=10 except the unittest pairs) now fails every time (tested 5x plus the manual repro).
+  **Limit:** outside the grid and the boundary set the oracle samples. A function wrong only on a sparse set of
+  inputs that are neither in the grid, nor boundaries, nor likely random draws (e.g. one specific 40-digit value, or
+  |a| in 17..99 with a rare pattern) can still pass; review and QA are the backstop. The grid is exhaustive only for
+  small integers and only for the functions defined in `oracles.py`.
 - Residual (all layers): the pure-function rule applies to fixture profiles only. Real-repo profiles have no oracle
   (`cooperative`), so harness detection there is backstopped only by the required independent code review and QA.
 
@@ -141,8 +196,8 @@ What the design does guarantee for cooperating agents:
       with a scrubbed environment (the unittest child: `-I -S -B` with PATH, LC_ALL, HOME and the profile's
       `env_allow`/`env_set`; oracle runs: the neutral, varied environments of H1; never any `OMO_*`). No nonce, result path or other secret is passed
       in env, argv or fds, so there is nothing for N1/N2/N4 to steal. Everything a child says is untrusted.
-    - **ORACLE mode (assurance `oracle`).** `omo_grok/oracles.py` (trusted tree) generates fresh SystemRandom inputs
-      for every run (magnitudes up to ±2**200, shuffled). `omo_grok/oracle_child.py` builds the `-c` program that imports the
+    - **ORACLE mode (assurance `oracle`).** `omo_grok/oracles.py` (trusted tree) builds an exhaustive small grid,
+      boundary pairs and fresh SystemRandom inputs for every verification (see "Oracle coverage" above; shuffled). `omo_grok/oracle_child.py` builds the `-c` program that imports the
       candidate and must print `{"ready":true}`; the parent then sends **one** request at a time over stdin and generates the next only
       after the answer arrives. Each answer must be a raw JSON value; the parent checks `type(v) is int` (bool and
       float never pass) and equality with its own oracle value. The child must answer every case and exit 0. Exiting
@@ -178,8 +233,9 @@ What the design does guarantee for cooperating agents:
     Profiles may relax this with `static_scan` allow-lists or tighten it (`forbid_imports`). They cannot disable it.
   - **Residual risk, stated plainly.**
     - The oracle is black-box testing. Harness detection (H1) is mitigated as described above, not made
-      impossible: the sandbox itself is observable, and only the static pure-function rule stops code that keys on
-      it. That rule covers fixture profiles only.
+      impossible: the sandbox itself is observable, and for the STATIC_ONLY class only the static pure-function
+      rule stops code that keys on it. That rule covers fixture profiles only. Outside the small grid and the
+      boundary set the oracle only samples (see "Oracle coverage").
     - The oracle covers only the functions defined in `oracles.py` (today `calc.add`, `calc.mul` for `calc-arith`).
     - Profiles for real repos without an oracle are `cooperative`: the verifier result is forgeable, and only the
       required `code_review` + `qa` on the same revision, from Bots outside the executor's independence group,

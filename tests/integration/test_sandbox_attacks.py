@@ -74,7 +74,7 @@ def test_round4_attacks_fail_and_touch_nothing(harness, monkeypatch, steps, scan
     v = res["verification"]
     assert v["status"] == "failed", v
     if scan == "off":  # it really ran, inside the sandbox, and saw nothing
-        assert v["sandbox"] == "bwrap" and "ORACLE" in v["detail"], v
+        assert v["sandbox"].startswith("bwrap 0.") and "ORACLE" in v["detail"], v
         err = _artifact_text(e, job)
         assert "ATTACK" in err and "WROTE" not in err and "PATCHED" not in err and "DB WRITTEN" not in err, err[-3000:]
         assert " SECRET " not in err
@@ -93,7 +93,7 @@ def test_round4_attacks_fail_and_touch_nothing(harness, monkeypatch, steps, scan
     text = _artifact_text(e, job)
     assert SECRET_KEY not in text and base64.b64encode(SECRET_KEY.encode()).decode()[:20] not in text
     vrow = e._one("SELECT * FROM verifications WHERE revision=?", (sha,))
-    assert vrow["status"] == "failed" and vrow["sandbox"] in ("bwrap", "none")
+    assert vrow["status"] == "failed" and (vrow["sandbox"] == "none" or vrow["sandbox"].startswith("bwrap "))
     assert json.loads(vrow["tamper_json"]) == []
 
 

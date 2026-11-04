@@ -416,7 +416,7 @@ def test_real_repo_cooperative_profile_end_to_end_gate(harness, tmp_path):
     assert "+verifier_cooperative" in g["assurance"] and "REDUCED" not in g["assurance"]
     assert g["checks"]["independent_code_review_and_qa"]["ok"] is True
     v = harness.e.status(job)["verifications"][-1]
-    assert v["assurance"] == "cooperative" and v["sandbox"] == "bwrap"
+    assert v["assurance"] == "cooperative" and v["sandbox"].startswith("bwrap 0.")
 
 
 def test_real_repo_same_bot_executor_refused_unless_reduced_assurance_accepted(harness, tmp_path):

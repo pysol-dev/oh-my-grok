@@ -48,6 +48,9 @@ RUNTIME = {
                                "(b'oracle', b'omo', b'harness', b'verif'))"),
     "user_name": _cand("__import__('getpass').getuser() in ('box', 'root', 'nobody', '')"),
     "lang_c": _cand("os.environ.get('LANG') == 'C.UTF-8'"),
+    # round 5: the RLIMIT_AS value now differs between the oracle runs (low / default / none)
+    "rlimit_as_finite": _cand("resource.getrlimit(resource.RLIMIT_AS)[0] != resource.RLIM_INFINITY",
+                              "import resource"),
 }
 STATIC_ONLY = {
     "proc_1_is_sandbox_init": _cand("b'bwrap' in open('/proc/1/cmdline', 'rb').read()"),

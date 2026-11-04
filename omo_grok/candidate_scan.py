@@ -167,18 +167,39 @@ def scan_source(text: str, rel: str, rules: dict | None = None) -> list[str]:
 
 PURE_IMPORT_CEILING = {"math", "operator", "cmath", "numbers", "__future__"}  # the most any profile may allow
 PURE_BUILTINS = {
-    "abs", "all", "any", "bin", "bool", "bytes", "chr", "complex", "dict", "divmod", "enumerate", "filter", "float",
+    "abs", "all", "any", "bin", "bool", "chr", "complex", "dict", "divmod", "enumerate", "filter", "float",
     "frozenset", "hex", "int", "isinstance", "issubclass", "iter", "len", "list", "map", "max", "min", "next", "oct",
     "ord", "pow", "range", "repr", "reversed", "round", "set", "slice", "sorted", "str", "sum", "super", "tuple",
     "zip", "NotImplemented", "Ellipsis",
     "ArithmeticError", "ZeroDivisionError", "OverflowError", "ValueError", "TypeError", "KeyError", "IndexError",
     "LookupError", "StopIteration", "NotImplementedError", "AssertionError", "AttributeError"}
-# catching these would let code probe stack depth / memory limits / anything (RecursionError, MemoryError, ...)
+# (round 5) `try` is banned outright in pure modules: any try/except/finally can turn a MemoryError/RecursionError
+# from a probe into a value (e.g. `return` inside `finally` swallows the exception). This list is kept as a second,
+# redundant layer for messages and in case the try ban is ever relaxed.
 PURE_FORBIDDEN_HANDLERS = {"BaseException", "Exception", "RuntimeError", "RecursionError", "MemoryError",
                            "SystemError", "OSError", "EnvironmentError", "IOError", "ImportError",
                            "ModuleNotFoundError", "KeyboardInterrupt", "SystemExit", "GeneratorExit", "Warning",
                            "UnicodeError", "UnicodeDecodeError", "UnicodeEncodeError", "EOFError"}
-PURE_FORBIDDEN_ATTRS = {"format", "format_map"}  # "{0.__globals__}".format(f) reaches globals without an AST dunder
+PURE_FORBIDDEN_ATTRS = {"format", "format_map",  # "{0.__globals__}".format(f) reaches globals without an AST dunder
+                        "mro", "with_traceback", "throw", "close"} | FORBIDDEN_DUNDER_ATTRS
+# frame / code / generator / coroutine / traceback internals (gi_frame.f_code.co_filename reveals paths, f_builtins
+# reaches open/__import__)
+PURE_FORBIDDEN_ATTR_PREFIXES = ("gi_", "cr_", "ag_", "f_", "co_", "tb_")
+PURE_ALLOWED_DUNDER_DEFS = {"__init__"}  # __del__/__exit__/__eq__/__index__/... hooks are not allowed
+
+
+def _relative_target(rel: str, level: int, module: str | None) -> str:
+    """Repo-relative package path a relative import refers to (posix), e.g. ('calc/x.py', 1, 'h') -> 'calc/h'."""
+    parts = rel.split("/")[:-1]  # containing package of either a module or an __init__.py
+    up = level - 1
+    if up > len(parts):
+        return "\0outside"
+    parts = parts[:len(parts) - up] if up else parts
+    return "/".join([*parts, *((module or "").split(".") if module else [])])
+
+
+def _local_module_ok(target: str, local_modules) -> bool:
+    return f"{target}.py" in local_modules or f"{target}/__init__.py" in local_modules
 
 
 def _immutable_literal(node) -> bool:
@@ -211,8 +232,12 @@ def _bound_names(tree) -> set[str]:
     return names
 
 
-def pure_module_problems(text: str, rel: str, allow_imports) -> list[str]:
-    """Allowlist scan of one fixture source file. Returns problems (empty = pure)."""
+def pure_module_problems(text: str, rel: str, allow_imports, local_modules=frozenset()) -> list[str]:
+    """Allowlist scan of one fixture source file. Returns problems (empty = pure).
+
+    `local_modules` is the set of repo-relative .py paths that are themselves scanned by this rule (every .py under
+    the profile's editable paths). A relative import (level > 0) is allowed only if it resolves to one of them;
+    anything else (a protected/unscanned module, a stdlib name, outside the package) is rejected."""
     allow = set(allow_imports or []) | {"__future__"}
     try:
         tree = ast.parse(text, filename=rel)
@@ -235,6 +260,15 @@ def pure_module_problems(text: str, rel: str, allow_imports) -> list[str]:
         elif isinstance(st, ast.ImportFrom):
             if st.level == 0 and (st.module or "") not in allow:
                 bad(st, f"import from {st.module} not in this profile's allowlist {sorted(allow - {'__future__'})}")
+            elif st.level > 0:
+                target = _relative_target(rel, st.level, st.module)
+                for a in st.names:
+                    # `from .m import x`: m must be a scanned module; `from . import m`: m itself must be one
+                    ok = _local_module_ok(target, local_modules) if st.module else \
+                        _local_module_ok(f"{target}/{a.name}" if target else a.name, local_modules)
+                    if not ok:
+                        bad(st, f"relative import {'.' * st.level}{st.module or ''} -> {a.name} does not resolve to "
+                                f"a pure-scanned module under the editable paths")
             for a in st.names:
                 if a.name == "*" or a.name.startswith("_") and st.module != "__future__":
                     bad(st, f"from-import of {a.name!r}")
@@ -275,6 +309,9 @@ def pure_module_problems(text: str, rel: str, allow_imports) -> list[str]:
     bound = _bound_names(tree)
     for n in ast.walk(tree):
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if n.name.startswith("__") and n.name not in PURE_ALLOWED_DUNDER_DEFS:
+                bad(n, f"special method {n.name} (implicit hooks such as __del__/__exit__/__eq__/__index__ are "
+                       f"not allowed)")
             if n.decorator_list:
                 bad(n, f"decorator on {n.name}")
             if isinstance(n, ast.AsyncFunctionDef):
@@ -289,8 +326,9 @@ def pure_module_problems(text: str, rel: str, allow_imports) -> list[str]:
             bad(n, f"{type(n).__name__.lower()} statement (state between calls)")
         elif isinstance(n, (ast.With, ast.AsyncWith, ast.Await, ast.AsyncFor)):
             bad(n, f"{type(n).__name__} not allowed")
-        elif isinstance(n, getattr(ast, "TryStar", ())):
-            bad(n, "except* not allowed")
+        elif isinstance(n, (ast.Try, *((ast.TryStar,) if hasattr(ast, "TryStar") else ()))):
+            bad(n, "try statement not allowed (try/except/finally can turn a memory/recursion-limit probe into a "
+                   "value, e.g. return inside finally)")
         elif isinstance(n, ast.ExceptHandler):
             types = [] if n.type is None else (n.type.elts if isinstance(n.type, ast.Tuple) else [n.type])
             if n.type is None:
@@ -304,7 +342,8 @@ def pure_module_problems(text: str, rel: str, allow_imports) -> list[str]:
             elif isinstance(n.ctx, ast.Load) and n.id not in bound and n.id not in PURE_BUILTINS:
                 bad(n, f"name {n.id!r} is neither defined in the module nor an allowed pure builtin")
         elif isinstance(n, ast.Attribute):
-            if n.attr.startswith("_") or n.attr in PURE_FORBIDDEN_ATTRS:
+            if n.attr.startswith("_") or n.attr in PURE_FORBIDDEN_ATTRS or \
+                    n.attr.startswith(PURE_FORBIDDEN_ATTR_PREFIXES):
                 bad(n, f"attribute .{n.attr}")
             if isinstance(n.ctx, (ast.Store, ast.Del)):
                 base = n.value

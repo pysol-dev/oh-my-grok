@@ -9,7 +9,9 @@ import os
 import platform
 import queue
 import random
+import resource
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -196,11 +198,36 @@ def content_problems(repo: Path, base: str, revision: str, prof: dict, checkout:
             found = scan_source(text, path, rules)
             if found:
                 out.append("static scan rejected: " + "; ".join(found[:20]))
-            pure = prof.get("pure_modules")
-            if pure is not None and any(_under(path, e) for e in prof.get("editable_paths", [])):
-                found = pure_module_problems(text, path, pure.get("allow_imports", []))
-                if found:
-                    out.append("pure-function rule rejected: " + "; ".join(found[:20]))
+    if prof.get("pure_modules") is not None:
+        out += pure_tree_problems(prof, checkout)
+    return out
+
+
+def pure_tree_problems(prof: dict, checkout: Path) -> list[str]:
+    """Pure-function rule over EVERY .py file under the editable paths of the checked-out revision (changed or not),
+    so that a relative import can only reach modules that are themselves scanned."""
+    allow = prof["pure_modules"].get("allow_imports", [])
+    files: dict[str, Path] = {}
+    for d, dirs, names in os.walk(checkout):
+        dirs[:] = sorted(x for x in dirs if x != ".git")
+        for n in sorted(names):
+            f = Path(d) / n
+            rel = f.relative_to(checkout).as_posix()
+            if rel.endswith(".py") and any(_under(rel, e) for e in prof.get("editable_paths", [])):
+                files[rel] = f
+    out: list[str] = []
+    local = frozenset(files)
+    for rel, f in files.items():
+        if f.is_symlink() or not f.is_file():
+            out.append(f"pure-function rule rejected: {rel} is not a regular file")
+            continue
+        text, why = decode_source(f.read_bytes())
+        if why:
+            out.append(f"pure-function rule rejected: {why}: {rel}")
+            continue
+        found = pure_module_problems(text, rel, allow, local)
+        if found:
+            out.append("pure-function rule rejected: " + "; ".join(found[:20]))
     return out
 
 
@@ -303,14 +330,14 @@ def run(repo: Path, revision: str, name: str | None, prof: dict | None, work_roo
             work, harness = sandbox.stage(dest, [UNITTEST_CHILD] if python else [], staging)
             _purge_bytecode(work)
             if not (work / cwd_rel).is_dir():
-                return _err("error", "profile cwd does not exist in the checkout", ph, eid, prof, sb.mechanism)
+                return _err("error", "profile cwd does not exist in the checkout", ph, eid, prof, sb.label)
             ctx = _Ctx(sb, exe, work, harness if python else None, cwd_rel, env, float(prof["timeout_seconds"]),
                        staging)
             out = _run_python(prof, ctx, ph, eid) if python else _run_exit_code_only(prof, ctx, ph, eid)
         finally:
             _rmtree(staging)
         changes = integrity.diff(before, integrity.snapshot())
-        out.sandbox = sb.mechanism
+        out.sandbox = sb.label
         if changes:
             out.status, out.tamper = "failed", changes
             out.detail = (f"TAMPER: trusted files changed during verification ({len(changes)}): "
@@ -320,18 +347,77 @@ def run(repo: Path, revision: str, name: str | None, prof: dict | None, work_roo
         gitops.remove_temp_checkout(repo, dest)
 
 
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
 def _rmtree(p: Path) -> None:
-    for d, dirs, _files in os.walk(p):  # the harness copy is read-only on purpose
-        for n in dirs:
-            try:
-                os.chmod(os.path.join(d, n), 0o700)
-            except OSError:
-                pass
+    """Delete a per-run staging tree that sandboxed code could write to. Never follows a symlink and never calls a
+    path-based chmod: every entry is classified with lstat (scandir with follow_symlinks=False), directories are
+    opened with O_NOFOLLOW|O_DIRECTORY relative to their parent's fd, and the only permission change is fchmod on that
+    already-opened fd, after fstat confirms it is the same directory inode that was listed (so a symlink or a swapped
+    path can never redirect it outside the tree). Symlinks themselves are unlinked, not followed. Best effort."""
     try:
-        os.chmod(p, 0o700)
+        st = os.lstat(p)
+    except OSError:
+        return
+    if not stat.S_ISDIR(st.st_mode):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+        return
+    try:
+        fd = os.open(p, _DIR_FLAGS)
+    except OSError:
+        return
+    try:
+        if (os.fstat(fd).st_dev, os.fstat(fd).st_ino) == (st.st_dev, st.st_ino):
+            _rm_contents(fd)
+    finally:
+        os.close(fd)
+    try:
+        os.rmdir(p)
     except OSError:
         pass
-    shutil.rmtree(p, ignore_errors=True)
+
+
+def _rm_contents(fd: int, depth: int = 0) -> None:
+    if depth > 200:
+        return
+    if os.fstat(fd).st_mode & 0o700 != 0o700:
+        try:
+            os.fchmod(fd, 0o700)  # fd-based: only this verified directory, never a symlink target
+        except OSError:
+            pass
+    try:
+        entries = list(os.scandir(fd))
+    except OSError:
+        return
+    for e in entries:
+        try:
+            est = e.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISDIR(est.st_mode):
+            try:
+                sub = os.open(e.name, _DIR_FLAGS, dir_fd=fd)
+            except OSError:
+                continue
+            try:
+                fst = os.fstat(sub)
+                if (fst.st_dev, fst.st_ino) == (est.st_dev, est.st_ino):
+                    _rm_contents(sub, depth + 1)
+            finally:
+                os.close(sub)
+            try:
+                os.rmdir(e.name, dir_fd=fd)
+            except OSError:
+                pass
+        else:
+            try:
+                os.unlink(e.name, dir_fd=fd)
+            except OSError:
+                pass
 
 
 def _purge_bytecode(dest: Path) -> None:
@@ -530,9 +616,13 @@ def oracle_variants(prof, ctx: _Ctx, rng) -> list[dict]:
          "env": dict(base[2], LANG="en_US.UTF-8", PYTHONDONTWRITEBYTECODE="1", EDITOR="vi"), "pad": 300,
          "hard": True, "cwd": False},
     ]
-    for r, lay in zip(runs, lays):
+    # address-space limits differ per run (low / default / none), assigned at random to the variants
+    limits = [rng.randrange(256, 513) << 20, sandbox.RLIMITS[resource.RLIMIT_AS], None]
+    rng.shuffle(limits)
+    for r, lay, lim in zip(runs, lays, limits):
         r["layout"] = lay
         r["env"] = dict(r["env"], **extra)
+        r["as_limit"] = lim
     rng.shuffle(runs)
     return runs
 
@@ -580,7 +670,8 @@ def _oracle_session(ctx: _Ctx, v: dict, cases: list, mods: list[str]):
                                 ctx.cwd_rel)
     deadline = time.monotonic() + ctx.timeout
     p = subprocess.Popen(argv, shell=False, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         env={"PATH": "/usr/bin:/bin"}, start_new_session=True, preexec_fn=sandbox.preexec)
+                         env={"PATH": "/usr/bin:/bin"}, start_new_session=True,
+                         preexec_fn=sandbox.preexec_with(v.get("as_limit", sandbox.RLIMITS[resource.RLIMIT_AS])))
     err: list = []
     et = threading.Thread(target=_drain, args=(p.stderr, err, MAX_OUTPUT), daemon=True)
     et.start()
@@ -687,8 +778,9 @@ def _run_python(prof, ctx: _Ctx, ph, eid) -> VerifyOutcome:
             return VerifyOutcome("failed", rc, False, out, err, "assurance=oracle: " + "; ".join(reasons), ph, eid,
                                  prof["argv"], assurance)
         return VerifyOutcome("passed", 0, False, out, err,
-                             f"assurance=oracle: {matched}/{matched} fresh random oracle cases matched across "
-                             f"{ORACLE_RUNS} varied neutral sandboxed runs (parent-computed, identical results); unittest child (advisory self-report) claims "
+                             f"assurance=oracle: {matched}/{matched} oracle cases (exhaustive small grid + boundaries + "
+                             f"fresh random draws) matched across {ORACLE_RUNS} varied neutral sandboxed runs with "
+                             f"different memory limits (parent-computed, identical results); unittest child (advisory self-report) claims "
                              f"{len(prof['expected_tests'])} expected tests passed", ph, eid, prof["argv"], assurance)
     if adv:
         return VerifyOutcome("failed", rc, False, out, err, "assurance=cooperative: " + "; ".join(adv), ph, eid,

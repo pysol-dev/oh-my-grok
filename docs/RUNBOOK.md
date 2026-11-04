@@ -132,8 +132,9 @@ candidate without executing it when any changed path:
   is binary or not UTF-8, or (for `.py`) fails the static AST scan (see SECURITY.md).
 
 The trusted parent (which never imports candidate code) then decides the result:
-- **oracle profiles** (assurance `oracle`): in each of 3 varied, neutral sandboxed runs the oracle child must answer
-  every fresh random case with a raw JSON value that is `type(v) is int` and equal to the trusted oracle's answer,
+- **oracle profiles** (assurance `oracle`): in each of 3 varied, neutral sandboxed runs (with different
+  address-space limits: low / 4 GiB / none) the oracle child must answer every case (exhaustive [-16,16]^2 grid,
+  boundary pairs and fresh random draws) with a raw JSON value that is `type(v) is int` and equal to the trusted oracle's answer,
   then exit 0, and the runs must agree. The advisory unittest child must also report a clean run; its report alone
   does not make a run pass.
 - **profiles without an oracle** (assurance `cooperative`): the unittest child's report decides, but a candidate can

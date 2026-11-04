@@ -17,6 +17,7 @@ is never run unsandboxed. There is no configuration switch that disables the san
 from __future__ import annotations
 
 import os
+import re
 import resource
 import shutil
 import subprocess
@@ -25,6 +26,7 @@ from functools import lru_cache
 from pathlib import Path
 
 BWRAP_CANDIDATES = ("/usr/bin/bwrap", "/bin/bwrap")
+BWRAP_VERSION_RE = re.compile(r"bubblewrap (\d{1,3}\.\d{1,3}(?:\.\d{1,3})?)")
 RUNTIME_ROOT = "/usr"
 SANDBOX_WORK = "/work"
 SANDBOX_HARNESS = "/omo-harness"
@@ -37,6 +39,12 @@ class Probe:
     mechanism: str  # "bwrap" | "none"
     detail: str
     bwrap: str | None = None
+    version: str | None = None  # e.g. "0.12.0", parsed from `bwrap --version`
+
+    @property
+    def label(self) -> str:
+        """What is recorded in verifications.sandbox, e.g. "bwrap 0.12.0" (or "none")."""
+        return f"{self.mechanism} {self.version}" if self.ok and self.version else self.mechanism
 
 
 def _bwrap_path() -> str | None:
@@ -52,14 +60,19 @@ def probe() -> Probe:
     if not bw:
         return Probe(False, "none", "no sandbox available: bwrap (bubblewrap) not installed")
     try:
-        ver = subprocess.run([bw, "--version"], capture_output=True, text=True, timeout=10).stdout.strip()
+        vp = subprocess.run([bw, "--version"], capture_output=True, text=True, timeout=10)
+        m = BWRAP_VERSION_RE.fullmatch(vp.stdout.strip()) if vp.returncode == 0 else None
+        if not m:
+            return Probe(False, "none", "no sandbox available: unexpected `bwrap --version` output "
+                         f"(exit {vp.returncode}): {vp.stdout.strip()[:60]!r}")
         cp = subprocess.run([bw, *base_args(), "--", "/usr/bin/true"], capture_output=True, text=True, timeout=20)
     except (OSError, subprocess.SubprocessError) as e:
         return Probe(False, "none", f"no sandbox available: bwrap failed to start ({type(e).__name__})")
     if cp.returncode != 0:
         return Probe(False, "none", "no sandbox available: bwrap cannot create user/mount/net namespaces: "
                      + cp.stderr.strip()[:200])
-    return Probe(True, "bwrap", f"{ver or 'bubblewrap'}; userns+mountns+pidns+netns; kernel {os.uname().release}", bw)
+    return Probe(True, "bwrap", f"bubblewrap {m.group(1)}; userns+mountns+pidns+netns; kernel {os.uname().release}",
+                 bw, m.group(1))
 
 
 def base_args() -> list[str]:
@@ -101,12 +114,29 @@ def wrap(pr: Probe, argv: list[str], work: Path, harness: Path | None, cwd_rel: 
     return [*out, "--", *argv]
 
 
-def preexec() -> None:  # runs in the forked child before exec of bwrap
-    for k, v in RLIMITS.items():
+def _apply_rlimits(limits: dict) -> None:
+    for k, v in limits.items():
         try:
             resource.setrlimit(k, (v, v))
         except (ValueError, OSError):
             pass
+
+
+def preexec() -> None:  # runs in the forked child before exec of bwrap
+    _apply_rlimits(RLIMITS)
+
+
+def preexec_with(address_space: int | None):
+    """Same limits as preexec() but with a different RLIMIT_AS (None = RLIM_INFINITY). The oracle runs use a LOW,
+    the DEFAULT and NO address-space limit, so code that senses the memory limit cannot behave identically in all
+    three runs (results must agree), while ordinary code is unaffected. FSIZE/CORE limits, the bwrap namespaces, the
+    wall-clock timeout and the output caps still apply to every run."""
+    limits = dict(RLIMITS)
+    limits[resource.RLIMIT_AS] = resource.RLIM_INFINITY if address_space is None else address_space
+
+    def fn() -> None:
+        _apply_rlimits(limits)
+    return fn
 
 
 # --- neutral layouts for the oracle runs (user decision H1: harness detection is not an accepted residual) ---------
