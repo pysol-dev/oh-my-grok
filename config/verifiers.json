@@ -1,19 +1,45 @@
 {
-  "_comment": "Verifier profiles. argv runs with shell=False in a temporary detached checkout of the EXACT revision. Only the exit status decides. Any profile or referenced script containing OMO_VERIFY_TEMPLATE fails closed.",
+  "_comment": "Verifier profiles. argv runs with shell=False, isolated interpreter (-I), sanitized env, in a temporary detached checkout of the EXACT revision. Before running, the candidate is diffed against the job base: changes to protected_paths, changes outside editable_paths (allowlist), interpreter/test-runner hook files (sitecustomize, usercustomize, *.pth, conftest.py, pytest/tox/setup config) and top-level modules shadowing stdlib or verifier modules are rejected. Only the exit status decides. Any profile or referenced script containing OMO_VERIFY_TEMPLATE fails closed.",
   "profiles": {
     "fixture-calc-unittest": {
-      "argv": ["/workspace/omo/.venv/bin/python", "-B", "-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v"],
+      "argv": [
+        "/workspace/omo/.venv/bin/python",
+        "-I",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-t",
+        ".",
+        "-v"
+      ],
       "cwd": ".",
       "env_allow": [],
       "timeout_seconds": 120,
-      "protected_paths": ["tests/"]
+      "protected_paths": [
+        "tests/"
+      ],
+      "editable_paths": [
+        "calc/"
+      ]
     },
     "example-template-do-not-use": {
-      "argv": ["/usr/bin/false", "OMO_VERIFY_TEMPLATE"],
+      "argv": [
+        "/usr/bin/false",
+        "OMO_VERIFY_TEMPLATE"
+      ],
       "cwd": ".",
       "env_allow": [],
       "timeout_seconds": 60,
-      "_comment": "Copy and replace with a real project test command. While the marker is present this profile fails closed."
+      "_comment": "Copy and replace with a real project test command. While the marker is present this profile fails closed.",
+      "editable_paths": [
+        "src/"
+      ],
+      "protected_paths": [
+        "tests/"
+      ]
     }
   }
 }

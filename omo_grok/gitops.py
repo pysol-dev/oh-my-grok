@@ -52,8 +52,9 @@ def branch_head(repo: Path, branch: str) -> str | None:
 
 
 def changed_files(repo: Path, base: str, sha: str) -> list[str]:
-    out = git(["diff", "--name-only", base, sha], repo).stdout
-    return [ln for ln in out.splitlines() if ln]
+    """All paths added/modified/deleted/renamed (both sides) between base and sha; NUL-separated, no rename folding."""
+    out = git(["diff", "--name-only", "--no-renames", "-z", base, sha], repo).stdout
+    return [p for p in out.split("\0") if p]
 
 
 def create_worktree(repo: Path, dest: Path, branch: str, base: str) -> None:

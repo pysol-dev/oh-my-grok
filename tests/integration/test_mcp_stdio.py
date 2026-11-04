@@ -56,12 +56,12 @@ def test_sdk_stdio_initialize_list_submit_status(omo_home, tmp_path):
     for t in tools.tools:
         assert t.input_schema.get("type") == "object"
     assert again["job_id"] == job and again["created"] is False
-    assert st["job"]["id"] == job if "job" in st else st["job_id"] == job
+    assert st["job_id"] == job and st["mode"] == "fixture" and st["phase"] == "research"
     assert bad.is_error  # item 10: no approval tool exists over MCP
     assert inval.is_error
     assert missing.is_error and "not_found" in missing.content[0].text
-    # stdout carried only protocol (the SDK would have failed otherwise); logs went to stderr
-    assert "sk-" not in log.read_text()
+    # stdout carried only protocol (the SDK would have failed otherwise); the secret-leak check with real planted
+    # secrets lives in test_planted_secrets_never_leak_via_mcp_status_log_or_export below
 
 
 def test_item10_server_stdout_is_protocol_only(omo_home):
@@ -76,3 +76,81 @@ def test_item10_server_stdout_is_protocol_only(omo_home):
     assert lines
     for ln in lines:
         assert json.loads(ln)["jsonrpc"] == "2.0"
+
+
+# ---------------------------------------------------------------------------------------------------- secret leaks
+HOOK_KEY = "whsec_PLANTED_hookkey_0123456789abcdef"
+ENV_SECRET = "sk-PLANTEDenvSECRET0123456789abcdef"
+URL_TOKEN = "PLANTEDurlTOKEN0123456789"
+ERR_SECRET = "xai-PLANTEDerrSECRET0123456789abcdef"
+
+
+async def _leak_flow(errlog, env):
+    params = StdioServerParameters(command=PY, args=[SERVER], env=env)
+    async with stdio_client(params, errlog=errlog) as (r, w):
+        async with ClientSession(r, w) as s:
+            await s.initialize()
+            outs = []
+            sub = await s.call_tool("submit", {"goal": "Fix calc.add in the synthetic fixture",
+                                               "idempotency_key": "leak-0001", "mode": "fixture",
+                                               "acceptance_criteria": ["unittest exits 0"]})
+            job = _payload(sub)["job_id"]
+            outs.append(sub)
+            outs.append(await s.call_tool("status", {"job_id": job}))
+            outs.append(await s.call_tool("status", {}))
+            outs.append(await s.call_tool("reconcile", {"job_id": job}))
+            # error paths carrying a secret in the input
+            outs.append(await s.call_tool("status", {"job_id": ERR_SECRET}))
+            outs.append(await s.call_tool("claim", {"job_id": job, "task_id": job, "dispatch_id": ERR_SECRET}))
+            outs.append(await s.call_tool("context", {"job_id": job, "task_id": ERR_SECRET}))
+            text = "\n".join(json.dumps(o.structured_content) + "\n" + "\n".join(
+                getattr(c, "text", "") for c in o.content) for o in outs)
+            return job, text
+
+
+def test_planted_secrets_never_leak_via_mcp_status_log_or_export(omo_home, tmp_path, monkeypatch):
+    """Real secrets planted in the hooks file (key + URL path token), the server's environment and tool-call inputs
+    must never appear in MCP results, the server's stderr log, `omoctl status/export`, or the export file."""
+    import subprocess
+    import sys
+    sys.path.insert(0, str(ROOT / "tests"))
+    from helpers import Harness
+    from omo_grok.hooks import set_hook
+    from omo_grok.paths import get_paths
+    monkeypatch.setenv("OMO_ALLOW_INSECURE_HOOKS", "1")
+    h = Harness()  # binds every role (verified) and writes hooks; then plant a real secret-bearing hook
+    for role in ("explorer", "librarian"):  # closed loopback port: connection refused, error may echo the URL
+        set_hook(get_paths(), role, f"http://127.0.0.1:9/routines/{URL_TOKEN}/fire?sig={URL_TOKEN}", HOOK_KEY)
+    h.close()
+    env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "OMO_HOME", "OMO_CONFIG_DIR",
+                                                        "OMO_ALLOW_INSECURE_HOOKS")}
+    env["OPENAI_API_KEY"] = ENV_SECRET
+    env["OMO_DEBUG_SECRET"] = ENV_SECRET
+    log = tmp_path / "stderr.log"
+    with open(log, "w") as errlog:
+        job, mcp_text = asyncio.run(_leak_flow(errlog, env))
+    # the dispatch really happened and really failed (otherwise this test proves nothing)
+    from omo_grok.engine import Engine
+    e = Engine()
+    try:
+        rows = e._all("SELECT status, last_error FROM dispatch_outbox WHERE job_id=?", (job,))
+    finally:
+        e.close()
+    assert rows and all(r["status"] in ("retry_wait", "failed") and r["last_error"] for r in rows), rows
+    omoctl = str(ROOT / "omoctl")
+    st = subprocess.run([omoctl, "status", job, "--json"], capture_output=True, text=True, env=env, timeout=60)
+    allst = subprocess.run([omoctl, "status", "--json"], capture_output=True, text=True, env=env, timeout=60)
+    hk = subprocess.run([omoctl, "hook", "list"], capture_output=True, text=True, env=env, timeout=60)
+    ex = subprocess.run([omoctl, "export", job, "--out", str(tmp_path / "exp")], capture_output=True, text=True,
+                        env=env, timeout=60)
+    assert st.returncode == 0 and allst.returncode == 0 and hk.returncode == 0 and ex.returncode == 0, \
+        (st.stderr, allst.stderr, hk.stderr, ex.stderr)
+    export_text = "".join(p.read_text() for p in (tmp_path / "exp").glob("*.json"))
+    assert export_text
+    surfaces = {"mcp": mcp_text, "stderr_log": log.read_text(), "status": st.stdout + st.stderr,
+                "status_all": allst.stdout + allst.stderr, "hook_list": hk.stdout + hk.stderr,
+                "export_cli": ex.stdout + ex.stderr, "export_file": export_text}
+    for name, text in surfaces.items():
+        for secret in (HOOK_KEY, ENV_SECRET, URL_TOKEN, ERR_SECRET):
+            assert secret not in text, f"{secret[:12]}... leaked via {name}"
+    assert '"last_error"' in export_text and job in export_text  # export really carries the failed dispatches

@@ -23,9 +23,23 @@ What the design does guarantee for cooperating agents:
   content-addressed and confined to the job's artifact directory: traversal and symlinks are rejected, and sha256 is
   re-verified on every read.
 - The deterministic verifier runs argv lists without a shell, with an env allowlist, a timeout and protected test
-  paths. Missing or template (`OMO_VERIFY_TEMPLATE`) profiles fail closed. The final gate re-runs the verifier on the
+  paths. Missing or template (`OMO_VERIFY_TEMPLATE`) profiles fail closed. Python runs isolated (`-I`,
+  `PYTHONSAFEPATH`, `PYTHONNOUSERSITE`). Candidates are rejected before execution when they touch paths outside the
+  profile's `editable_paths`, protected paths, interpreter/test hooks (`sitecustomize`, `usercustomize`, `.pth`,
+  `conftest.py`, runner config) or add a top-level module that shadows a stdlib/verifier/site-packages name
+  (regression: a committed `unittest/__init__.py` that printed a fake pass). Shadow names come from the host
+  interpreter's `sys.stdlib_module_names` and site-packages listing. The final gate re-runs the verifier on the
   exact final revision.
 - Logs, status, exports, errors and CLI output pass through `redact.py`. `hook list` shows booleans only.
+  Dispatch errors are scrubbed of the webhook URL/key at write time and every http(s) URL in them is cut to
+  `scheme://host` (also on display), so status never shows a webhook URL even in a process that never loaded the hooks
+  file. Exports redact `lease_token` and `claim_token`. MCP argument-validation errors report field names only, never
+  the rejected values.
+- Inline artifacts are written to a content-addressed path (`task/aN/<sha16>/name`) with an atomic temp+link publish;
+  the engine never deletes or overwrites an artifact file, so a rolled-back submission cannot remove a registered
+  artifact and same-content retries are idempotent.
+- Implementation-side tasks (implement, code_review, qa, integrate) can be claimed, checkpointed or completed only under
+  a live approval of the job's current plan revision; revoking an approval cancels their unstarted tasks.
 
 ## Secrets
 - Webhook URL and key pairs live only in `state/secrets/hooks.json` (mode 0600, directory 0700). They are entered

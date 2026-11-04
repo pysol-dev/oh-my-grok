@@ -30,7 +30,7 @@ user ─chat─▶ Hephaestus ─MCP─▶ omo engine ◀─MCP── role routi
 | `hooks.py` | Webhook URL and key store `state/secrets/hooks.json` (0600 file in a 0700 dir). Separate from job state |
 | `artifacts.py` | Immutable, content-addressed artifact files. Path-traversal and symlink checks. sha256 verified on read |
 | `schemas.py` | Strict per-kind result schemas and the `blocked` / `not_applicable` alternatives |
-| `verifier.py` | Deterministic verifier profiles (argv, no shell, env allowlist, timeout, protected paths). Template or missing profiles fail closed |
+| `verifier.py` | Deterministic verifier profiles (argv, no shell, isolated `-I` interpreter, env allowlist, timeout, protected + editable paths, pre-run rejection of shadowing modules and interpreter/test hooks). Template, missing or non-isolated profiles fail closed |
 | `gitops.py` | Per-job worktree and branch (`omo/<job-id-prefix>`). Repo hooks are disabled. No reset, clean, force or push |
 | `fixture.py` | Synthetic `calc` fixture repo: a failing test, a real fix, and a fake "fix" that edits tests or prints PASS |
 | `redact.py` | Removes bearer tokens, Authorization values, key/token/secret assignments, common token prefixes, PEM private keys and registered secrets |

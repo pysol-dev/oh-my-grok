@@ -61,11 +61,12 @@ def cmd_doctor(args) -> int:
 
     add("python>=3.11", sys.version_info >= (3, 11), sys.version.split()[0])
     try:
-        import mcp  # noqa: F401
+        import importlib
         from importlib.metadata import version
+        importlib.import_module("mcp")
         add("mcp_sdk_importable", True, f"mcp=={version('mcp')}")
-        from mcp.server.mcpserver import MCPServer  # noqa: F401
-        add("mcp_server_api", True, "mcp.server.mcpserver.MCPServer")
+        mod = importlib.import_module("mcp.server.mcpserver")
+        add("mcp_server_api", hasattr(mod, "MCPServer"), "mcp.server.mcpserver.MCPServer")
     except Exception as e:  # pragma: no cover
         add("mcp_sdk_importable", False, str(e))
     try:

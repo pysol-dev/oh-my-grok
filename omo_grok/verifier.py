@@ -40,6 +40,92 @@ def env_identity(prof: dict) -> str:
     return hashlib.sha256(canonical_json({"py": sys.version, "plat": platform.platform(), "exe": exe_id}).encode()).hexdigest()
 
 
+# Names a candidate must never (re)define on an import root: the stdlib, test runners/import hooks, and
+# everything installed in the verifier interpreter's site-packages.
+VERIFIER_SENSITIVE = {"unittest", "pytest", "_pytest", "py", "pluggy", "conftest", "sitecustomize", "usercustomize",
+                      "site", "pkg_resources", "setuptools", "_distutils_hack", "pip", "coverage", "nose", "doctest",
+                      "encodings", "importlib", "runpy"}
+HOOK_FILES = {"sitecustomize.py", "usercustomize.py", "conftest.py", "pytest.ini", "tox.ini", "setup.cfg",
+              "pyproject.toml", ".pth"}
+MODULE_SUFFIXES = (".py", ".pyc", ".pyo", ".pyw", ".so", ".pyd")
+
+
+def _under(path: str, prefix: str) -> bool:
+    p = prefix.rstrip("/")
+    return p in ("", ".") or path == p or path.startswith(p + "/")
+
+
+def _site_names(exe: str) -> set[str]:
+    names: set[str] = set()
+    root = Path(os.path.realpath(exe)).parent.parent / "lib"
+    for sp in root.glob("python*/site-packages"):
+        for e in sp.iterdir():
+            n = e.name
+            if n.endswith((".dist-info", ".egg-info")) or n.startswith("__"):
+                continue
+            names.add(n.split(".")[0])
+    return names
+
+
+def shadow_names(prof: dict) -> set[str]:
+    return set(sys.stdlib_module_names) | VERIFIER_SENSITIVE | _site_names(prof["argv"][0]) | \
+        set(prof.get("extra_shadow_names", []))
+
+
+def import_roots(prof: dict, checkout: Path) -> set[str]:
+    """Checkout-relative dirs that may end up on sys.path: cwd and any directory named in argv (e.g. -s/-t)."""
+    cwd = os.path.normpath(prof.get("cwd", "."))
+    roots = {"" if cwd == "." else cwd}
+    for a in prof["argv"][1:]:
+        if a.startswith("-") or a.startswith("/"):
+            continue
+        rel = os.path.normpath(os.path.join(cwd, a))
+        if not rel.startswith("..") and (checkout / rel).is_dir():
+            roots.add("" if rel == "." else rel)
+    return roots
+
+
+def scope_problems(repo: Path, revision: str, prof: dict, checkout: Path) -> list[str]:
+    """Static, pre-execution rejection of candidates that change verifier-controlled files, edit outside the
+    profile's editable allowlist, or add/modify anything that could shadow an imported module or hook start-up."""
+    base = prof.get("protected_base")
+    if not base:
+        return ["no base revision to diff against; cannot check candidate scope (fail closed)"]
+    changed = gitops.changed_files(repo, base, revision)
+    out = []
+    protected = prof.get("protected_paths", [])
+    hit = [c for c in changed if any(_under(c, p) for p in protected)]
+    if hit:
+        out.append(f"protected verifier paths modified: {hit}")
+    editable = prof.get("editable_paths")
+    if editable is not None:
+        outside = [c for c in changed if not any(_under(c, p) for p in editable)]
+        if outside:
+            out.append(f"paths outside the profile's editable_paths {editable} modified: {outside}")
+    hooks = [c for c in changed if Path(c).name in HOOK_FILES or c.endswith(".pth")]
+    if hooks:
+        out.append(f"interpreter/test-runner hook files added or modified: {hooks}")
+    names = shadow_names(prof)
+    shadow = []
+    for c in changed:
+        for root in import_roots(prof, checkout):
+            if not _under(c, root):
+                continue
+            rel = c[len(root) + 1:] if root else c
+            top = rel.split("/")[0]
+            if "/" in rel:  # a package directory; count it if it is (or was) a regular package or holds modules
+                mod = top
+            elif top.endswith(MODULE_SUFFIXES) or ".cpython-" in top:
+                mod = top.split(".")[0]
+            else:
+                continue
+            if mod in names:
+                shadow.append(c)
+    if shadow:
+        out.append(f"candidate adds/modifies top-level modules shadowing stdlib/verifier modules: {sorted(set(shadow))}")
+    return out
+
+
 def preflight(name: str | None, prof: dict | None) -> list[str]:
     if not name or prof is None:
         return ["no verifier profile configured for this job (fail closed)"]
@@ -69,16 +155,12 @@ def run(repo: Path, revision: str, name: str | None, prof: dict | None, work_roo
                 if TEMPLATE_MARKER.encode() in cand.read_bytes()[:200_000]:
                     return VerifyOutcome("error", None, False, "", "", f"{a} contains {TEMPLATE_MARKER}; fail closed",
                                          ph, eid, prof["argv"])
-        base = prof.get("protected_base")
-        protected = prof.get("protected_paths", [])
-        if protected and base:
-            changed = gitops.changed_files(repo, base, revision)
-            hit = [c for c in changed if any(c == p.rstrip("/") or c.startswith(p.rstrip("/") + "/") for p in protected)]
-            if hit:
-                return VerifyOutcome("failed", None, False, "", "", f"protected verifier paths modified: {hit}",
-                                     ph, eid, prof["argv"])
+        scope = scope_problems(repo, revision, prof, dest)
+        if scope:
+            return VerifyOutcome("failed", None, False, "", "", "candidate rejected before running: " + "; ".join(scope),
+                                 ph, eid, prof["argv"])
         env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LC_ALL": "C.UTF-8", "HOME": str(dest),
-               "PYTHONDONTWRITEBYTECODE": "1"}
+               "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1", "PYTHONSAFEPATH": "1"}
         for k in prof.get("env_allow", []):
             if k in os.environ:
                 env[k] = os.environ[k]

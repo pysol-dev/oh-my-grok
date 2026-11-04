@@ -99,13 +99,26 @@ These live in `config/verifiers.json`. Each profile has these fields:
 
 | Field | Requirement |
 |---|---|
-| `argv` | absolute interpreter, no shell |
+| `argv` | absolute interpreter, no shell; a Python interpreter must be run isolated (`-I` before `-m`) |
 | `cwd` | inside the worktree |
 | `env_allow` | allowed environment variables |
 | `timeout_seconds` | run time limit |
 | `protected_paths` | paths the Executor must not change relative to base |
+| `editable_paths` | allowlist: the ONLY paths the Executor may add, change, delete or rename |
 
-A profile whose argv or referenced script contains `OMO_VERIFY_TEMPLATE` is refused. So is a missing profile.
+A profile whose argv or referenced script contains `OMO_VERIFY_TEMPLATE` is refused. So is a missing profile, and so is
+a Python profile without `-I`.
+
+Before running, the verifier diffs base..candidate (`--no-renames`, so renames count as delete+add) and rejects the
+candidate without executing it when any changed path:
+- is outside `editable_paths` or inside `protected_paths`;
+- is an interpreter or test-runner hook (`sitecustomize.py`, `usercustomize.py`, `*.pth`, `conftest.py`, `pytest.ini`,
+  `tox.ini`, `setup.cfg`, `pyproject.toml`), at any depth;
+- is a top-level module or package (in the cwd or an argv directory) whose name shadows a stdlib module, a module the
+  verifier uses (`unittest`, `pytest`, `site`, `importlib`, ...) or anything in the interpreter's site-packages.
+
+The run itself uses `-I` plus `PYTHONSAFEPATH=1` and `PYTHONNOUSERSITE=1`, so even an unrecognised shadow cannot replace
+the stdlib runner. A missing base revision fails closed.
 `./omoctl doctor` lists the usable profiles.
 
 ## 10. Backups and migrations

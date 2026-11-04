@@ -79,6 +79,16 @@ def validate_profile(name: str, prof: dict) -> list[str]:
     cwd = prof.get("cwd", "")
     if isinstance(cwd, str) and (cwd.startswith("/") or ".." in Path(cwd).parts):
         problems.append("cwd must be relative to the checkout and must not contain '..'")
+    if argv and isinstance(argv[0], str) and Path(argv[0]).name.startswith("python"):
+        flags = argv[1:argv.index("-m")] if "-m" in argv else argv[1:]
+        if "-I" not in flags:
+            problems.append("python verifiers must run isolated: put -I before -m/script (no cwd/user-site/PYTHON* "
+                            "on sys.path)")
+    for key in ("protected_paths", "editable_paths"):
+        v = prof.get(key)
+        if v is not None and (not isinstance(v, list) or not all(isinstance(x, str) and x and not x.startswith("/")
+                                                                  and ".." not in Path(x).parts for x in v)):
+            problems.append(f"{key} must be a list of relative paths without '..'")
     to = prof.get("timeout_seconds")
     if isinstance(to, (int, float)) and not (0 < to <= 3600):
         problems.append("timeout_seconds must be in (0, 3600]")

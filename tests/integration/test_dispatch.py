@@ -171,15 +171,29 @@ def test_item8_reconcile_rewakes_unclaimed_and_is_bounded(h):
 
 
 def test_item8_recovery_survives_process_restart(h):
+    """The process that queued the work exits; a SEPARATE OS process reconciles the same DB and redispatches
+    to the loopback webhook server over real HTTP."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
     e = h.e
     h.hook.plan = [(503, {}), (503, {})]
     job = h.submit()["job_id"]
-    e.close()
-    # a brand new engine (fresh process state) picks up persisted backoff and dispatches
+    assert all(t["dispatch"]["status"] == "retry_wait" for t in e.status(job)["tasks"] if t["dispatch"])
+    sent_before = len(h.hook.requests)
+    e.close()  # the original engine is gone
+    worker = Path(__file__).with_name("_worker.py")
+    proc = subprocess.run([sys.executable, str(worker), "reconcile", job, "-", "-", str(h.clock() + 5000), "-"],
+                          capture_output=True, text=True, timeout=60, env=dict(os.environ))
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert out["pid"] != os.getpid()
+    assert out["report"]["dispatch"]["accepted"] == 2
+    new_reqs = h.hook.requests[sent_before:]
+    assert sorted(q["path"] for q in new_reqs) == ["/explorer", "/librarian"]
+    assert all(q["auth"] == f"Bearer {KEY}" for q in new_reqs)
     e2 = Engine(transport=post_json, clock=h.clock)
-    h.clock.advance(5000)
-    st = e2.reconcile()
-    assert st["dispatch"]["accepted"] == 2
     assert all(t["dispatch"]["status"] == "accepted" for t in e2.status(job)["tasks"] if t["dispatch"])
     h.e = e2
 
@@ -205,8 +219,10 @@ def test_claim_supersedes_pending_duplicates_duplicate_webhook_harmless(h):
     t = h.task(job, "explore")
     e.claim(job, t["id"], t["current_dispatch_id"])
     st = e.flush_outbox()
-    assert st["accepted"] in (0, 1)  # librarian may send; explorer's pending duplicate is superseded
-    assert all(q["path"] != "/explorer" for q in h.hook.requests[2:])
+    assert st["accepted"] == 1  # only librarian's re-wake is sent; explorer's pending duplicate is superseded
+    assert [q["path"] for q in h.hook.requests[2:]] == ["/librarian"]
+    sup = e._one("SELECT status, superseded FROM dispatch_outbox WHERE id=?", (t["current_dispatch_id"],))
+    assert (sup["status"], sup["superseded"]) == ("pending", 1)  # never sent, permanently inert
 
 
 def test_per_bot_serialization(h):
@@ -239,5 +255,14 @@ def test_transport_unit_timeouts():
     assert r.status is None and KEY not in (r.error or "")
 
 
-def test_mock_transport_result_types():
-    assert HttpResult(200, None, None).status == 200
+def test_post_json_maps_real_http_responses(live_hook):
+    live_hook.plan = [(202, {}), (429, {"Retry-After": "7"}), (500, {})]
+    a = post_json(f"{live_hook.url}/x", KEY, {"a": 1}, 2, 2)
+    b = post_json(f"{live_hook.url}/x", KEY, {"a": 1}, 2, 2)
+    c = post_json(f"{live_hook.url}/x", KEY, {"a": 1}, 2, 2)
+    assert (a.status, a.error) == (202, None)
+    assert b.status == 429 and b.retry_after == 7.0
+    assert c.status == 500
+    assert [q["auth"] for q in live_hook.requests] == [f"Bearer {KEY}"] * 3
+    assert all(q["body"] == {"a": 1} and q["ctype"].startswith("application/json") for q in live_hook.requests)
+    assert isinstance(a, HttpResult)

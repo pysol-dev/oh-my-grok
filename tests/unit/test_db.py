@@ -5,7 +5,8 @@ import pytest
 
 from omo_grok import db
 from omo_grok.errors import Conflict
-from omo_grok.states import check_dispatch, check_job, check_task
+from omo_grok.states import (DISPATCH_STATUSES, JOB_PHASES, TASK_STATUSES, check_dispatch, check_job,
+                             check_task)
 
 
 def test_migrations_apply_once_and_record_checksums(tmp_path):
@@ -64,22 +65,72 @@ def test_tx_rolls_back_on_error(tmp_path):
     assert c.execute("SELECT COUNT(*) FROM hooks_meta").fetchone()[0] == 0
 
 
-@pytest.mark.parametrize("src,dst", [("queued", "working"), ("passed", "queued"), ("cancelled", "queued"),
-                                     ("submitted", "working"), ("dispatched", "passed")])
-def test_illegal_task_transitions(src, dst):
-    with pytest.raises(Conflict):
-        check_task(src, dst)
+# Expected allowed transitions, written out independently of omo_grok.states so that any accidental widening
+# (or narrowing) of the engine's table fails this test. Every other (src, dst) pair must raise Conflict.
+_TASK_OK = {
+    "queued": {"dispatched", "awaiting_resume", "blocked", "cancelled"},
+    "dispatched": {"working", "queued", "blocked", "cancelled"},
+    "awaiting_resume": {"working", "dispatched", "blocked", "cancelled"},
+    "working": {"submitted", "queued", "blocked", "failed", "cancelled"},
+    "submitted": {"passed", "rejected", "blocked", "failed", "cancelled"},
+    "blocked": {"queued", "cancelled", "failed"},
+    "passed": set(), "rejected": set(), "failed": set(), "cancelled": set(),
+}
+_STOP = {"blocked", "failed", "cancelled"}
+_JOB_OK = {
+    "research": {"analysis"} | _STOP,
+    "analysis": {"planning"} | _STOP,
+    "planning": {"plan_review"} | _STOP,
+    "plan_review": {"planning", "awaiting_approval"} | _STOP,
+    "awaiting_approval": {"running", "plan_approved", "planning"} | _STOP,
+    "plan_approved": {"running", "planning"} | _STOP,
+    "running": {"done"} | _STOP,
+    "blocked": {"research", "analysis", "planning", "plan_review", "awaiting_approval", "plan_approved", "running",
+                "failed", "cancelled"},
+    "done": set(), "failed": set(), "cancelled": set(),
+}
+_DISPATCH_OK = {
+    "pending": {"sending", "failed"},
+    "sending": {"accepted", "retry_wait", "failed"},
+    "retry_wait": {"sending", "failed"},
+    "accepted": set(), "failed": set(),
+}
 
 
-def test_illegal_job_and_dispatch_transitions():
+def _matrix(ok, statuses):
+    assert set(ok) == set(statuses), "status vocabulary changed; update the expected table deliberately"
+    vocab = list(statuses) + ["bogus"]
+    return [(s, d, d in ok.get(s, set())) for s in vocab for d in vocab]
+
+
+@pytest.mark.parametrize("check,ok,statuses", [
+    (check_task, _TASK_OK, TASK_STATUSES),
+    (check_job, _JOB_OK, JOB_PHASES),
+    (check_dispatch, _DISPATCH_OK, DISPATCH_STATUSES),
+], ids=["task", "job", "dispatch"])
+def test_full_transition_matrix(check, ok, statuses):
+    allowed = rejected = 0
+    for src, dst, expect_ok in _matrix(ok, statuses):
+        if expect_ok:
+            check(src, dst)
+            allowed += 1
+        else:
+            with pytest.raises(Conflict):
+                check(src, dst)
+            rejected += 1
+    n = len(statuses) + 1
+    assert allowed + rejected == n * n and allowed == sum(len(v) for v in ok.values())
+
+
+def test_engine_set_task_enforces_matrix_in_db(harness):
+    """The CAS writer itself (not only the pure check) refuses an illegal pair and leaves the row unchanged."""
+    e = harness.e
+    job = harness.submit()["job_id"]
+    t = harness.task(job, "explore")
     with pytest.raises(Conflict):
-        check_job("research", "done")
-    with pytest.raises(Conflict):
-        check_job("cancelled", "running")
-    with pytest.raises(Conflict):
-        check_dispatch("accepted", "sending")
-    check_job("blocked", "running")
-    check_dispatch("retry_wait", "sending")
+        with db.tx(e.conn):
+            e._set_task(t, "passed")
+    assert harness.task(job, "explore")["status"] == t["status"]
 
 
 def test_backup_and_restore_roundtrip(harness, tmp_path):
@@ -127,3 +178,64 @@ def test_auto_backup_before_migrating_nonempty_db(omo_home):
     assert db.current_version(e.conn) == 2
     assert list(p.backups_dir.glob("pre-migrate-v1-*.sqlite3"))
     e.close()
+
+
+def test_item18_injected_migration_failure_keeps_prior_version(tmp_path, monkeypatch):
+    c = db.connect(tmp_path / "x.sqlite3")
+    db.migrate(c)
+    v = db.current_version(c)
+    bad = (v + 1, "broken", "CREATE TABLE t_new(x INTEGER); INSERT INTO no_such_table VALUES (1)")
+    monkeypatch.setattr(db, "MIGRATIONS", [*db.MIGRATIONS, bad])
+    with pytest.raises(sqlite3.OperationalError):
+        db.migrate(c, target=v + 1)
+    assert db.current_version(c) == v
+    assert not c.execute("SELECT 1 FROM sqlite_master WHERE name='t_new'").fetchone()  # DDL rolled back too
+    good = (v + 1, "fixed", "CREATE TABLE t_new(x INTEGER)")
+    monkeypatch.setattr(db, "MIGRATIONS", [*db.MIGRATIONS[:-1], good])
+    assert db.migrate(c, target=v + 1) == [v + 1] and db.current_version(c) == v + 1
+
+
+_SLOW_MIGRATOR = r"""
+import sys
+sys.path.insert(0, sys.argv[2])
+from omo_grok import db
+c = db.connect(sys.argv[1])
+slow = (db.LATEST_VERSION + 1, "slow",
+        "CREATE TABLE big AS WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<300000000) "
+        "SELECT x FROM n")
+db.MIGRATIONS.append(slow)
+print("MIGRATING", flush=True)
+db.migrate(c, target=slow[0])
+print("FINISHED", flush=True)
+"""
+
+
+def test_item18_killed_mid_migration_subprocess(tmp_path):
+    import signal
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+    p = tmp_path / "x.sqlite3"
+    c = db.connect(p)
+    db.migrate(c)
+    v = db.current_version(c)
+    c.close()
+    root = str(Path(__file__).resolve().parents[2])
+    proc = subprocess.Popen([sys.executable, "-c", _SLOW_MIGRATOR, str(p), root], stdout=subprocess.PIPE, text=True)
+    assert proc.stdout.readline().strip() == "MIGRATING"
+    time.sleep(1.0)
+    assert proc.poll() is None, "migration finished before it could be killed; test would prove nothing"
+    proc.send_signal(signal.SIGKILL)
+    proc.wait(10)
+    assert proc.returncode == -signal.SIGKILL
+    c = db.connect(p)
+    assert c.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    assert db.current_version(c) == v
+    assert not c.execute("SELECT 1 FROM sqlite_master WHERE name='big'").fetchone()
+    quick = (v + 1, "slow-but-quick-now", "CREATE TABLE big(x INTEGER)")
+    db.MIGRATIONS.append(quick)
+    try:
+        assert db.migrate(c, target=v + 1) == [v + 1] and db.current_version(c) == v + 1
+    finally:
+        db.MIGRATIONS.remove(quick)

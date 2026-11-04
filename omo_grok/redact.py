@@ -13,6 +13,10 @@ _PATTERNS = [
     (re.compile(r"\b(xai|sk|ghp|gho|github_pat)[-_][A-Za-z0-9_\-]{16,}\b"), "[REDACTED TOKEN]"),
 ]
 
+# Keys whose values are always secret regardless of content.
+SECRET_KEYS = re.compile(r"(?i)^(authorization|key|bearer|token|secret|password|webhook_key|url_secret|hook_url|"
+                         r"webhook_url|lease_token|claim_token|webhook)$")
+
 _known: set[str] = set()
 
 
@@ -31,12 +35,21 @@ def redact(text: Any) -> str:
     return text
 
 
+_URL = re.compile(r"(?i)\b(https?://)(?:[^/\s\"'@]*@)?([A-Za-z0-9.\-\[\]:]+)[^\s\"'<>]*")
+
+
+def redact_urls(text: Any) -> str:
+    """Secret redaction plus: every http(s) URL keeps only scheme://host. Used for dispatch errors, which may echo a
+    webhook URL even in a process that never loaded the hooks file (so no secret was registered)."""
+    return _URL.sub(r"\1\2/[REDACTED-URL]", redact(text))
+
+
 def redact_obj(obj: Any) -> Any:
     """Redact a JSON-able object by round-tripping each string."""
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
-            if isinstance(k, str) and re.search(r"(?i)^(authorization|key|bearer|token|secret|password|webhook_key|url_secret)$", k):
+            if isinstance(k, str) and SECRET_KEYS.search(k):
                 out[k] = "[REDACTED]"
             else:
                 out[k] = redact_obj(v)

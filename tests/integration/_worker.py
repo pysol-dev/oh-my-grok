@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from omo_grok.engine import Engine  # noqa: E402
 from omo_grok.errors import OmoError  # noqa: E402
-from omo_grok.transport import HttpResult  # noqa: E402
+from omo_grok.transport import HttpResult, post_json  # noqa: E402
 
 RESULTS = {
     "explore": ({"repo_map": "calc", "files": [], "tests": [], "constraints": [], "questions": []},
@@ -22,6 +22,12 @@ RESULTS = {
 
 def main():
     op, job, task, disp, clock, go = sys.argv[1:7]
+    if op == "reconcile":  # fresh OS process after a "crash": real HTTP client against the loopback hook server
+        e = Engine(transport=post_json, clock=lambda: float(clock))
+        rep = e.reconcile(None if job == "-" else job)
+        print(json.dumps({"pid": os.getpid(), "report": rep}, default=str), flush=True)
+        e.close()
+        return
     e = Engine(transport=lambda *a: HttpResult(200, None, None), clock=lambda: float(clock))
     e.policy["inline_dispatch"] = False
     deadline = time.time() + 20

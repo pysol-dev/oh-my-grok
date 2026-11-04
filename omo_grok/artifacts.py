@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import uuid
 import re
 import stat
 from pathlib import Path, PurePosixPath
@@ -64,14 +65,25 @@ def write_inline(root: Path, rel: str, content: str | bytes) -> tuple[str, int]:
     # re-check after mkdir (no symlink introduced in between for our own dirs)
     resolve_inside(root, rel)
     digest = hashlib.sha256(data).hexdigest()
-    if target.exists():
-        existing, _ = sha256_file(target)
-        if existing != digest:
-            raise IntegrityError_("artifact already exists with different content; artifacts are immutable", path=rel)
-        return digest, len(data)
-    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(data)
+    if not target.exists():
+        # atomic publish: private temp file -> fsync -> hard link (fails if the name exists). A crash can leave
+        # only an unpublished temp file, never a partial artifact; nothing published is ever deleted/overwritten.
+        tmp = target.parent / f".tmp-{uuid.uuid4().hex}"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            try:
+                os.link(tmp, target, follow_symlinks=False)
+            except FileExistsError:
+                pass  # a concurrent writer published first; verified below
+        finally:
+            tmp.unlink(missing_ok=True)  # our own private temp name only
+    existing, _ = sha256_file(target)
+    if existing != digest:
+        raise IntegrityError_("artifact already exists with different content; artifacts are immutable", path=rel)
     return digest, len(data)
 
 

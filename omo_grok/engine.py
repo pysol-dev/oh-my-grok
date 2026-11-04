@@ -19,7 +19,7 @@ from .config import canonical_json, load_policy, load_verifier_profiles, profile
 from .errors import Conflict, GateRefused, IntegrityError_, NotFound, OmoError, ValidationError
 from .hooks import hook_status, load_hooks
 from .paths import Paths, get_paths
-from .redact import redact, redact_obj
+from .redact import redact, redact_obj, redact_urls
 from .schemas import SCHEMAS, classify, output_schema
 from .states import (BLOCKED, CANCELLED, D_ACCEPTED, D_FAILED, D_PENDING, D_SENDING, DISPATCHED,
                      AWAITING_RESUME, J_ANALYSIS, J_AWAITING_APPROVAL, J_BLOCKED, J_CANCELLED, J_DONE,
@@ -200,7 +200,9 @@ class Engine:
                   priority=0, max_attempts=None) -> str:
         tid = str(uuid.uuid4())
         now = db.utcnow()
-        job = self._one("SELECT policies_json FROM jobs WHERE id=?", (job_id,))
+        job = self._one("SELECT policies_json, current_plan_revision_id FROM jobs WHERE id=?", (job_id,))
+        if plan_revision_id is None and kind in ("implement", "code_review", "qa", "integrate"):
+            plan_revision_id = job["current_plan_revision_id"]  # post-approval work is bound to the approved revision
         ma = max_attempts or (_l(job["policies_json"]) or {}).get("max_attempts_per_task",
                                                                   self.policy["max_attempts_per_task"])
         self.conn.execute("INSERT INTO tasks(id,job_id,kind,role,status,cycle,priority,max_attempts,plan_revision_id,"
@@ -495,6 +497,9 @@ class Engine:
             if hook:
                 res = self.transport(hook["url"], hook["key"], body, self.policy["http_connect_timeout_seconds"],
                                      self.policy["http_read_timeout_seconds"])
+                if res.error:  # transports may echo the URL/key in exception text: scrub before it is stored
+                    res = HttpResult(res.status, res.retry_after,
+                                     res.error.replace(hook["url"], "<webhook-url>").replace(hook["key"], "[REDACTED]"))
                 stats["sent"] += 1
             else:
                 res = HttpResult(None, None, err)
@@ -523,18 +528,19 @@ class Engine:
                 err = f"HTTP {code}: routine missing, paused or disabled"
             elif code == 429:
                 err = "HTTP 429: platform rate limit"
+            err = redact_urls(err)[:500]  # stored/shown text never carries a webhook URL, loaded hooks or not
             rc = row["retry_count"] + 1
             if retryable and rc <= row["max_retries"]:
                 nxt = now + self._backoff(rc, res.retry_after)
                 self.conn.execute("UPDATE dispatch_outbox SET status='retry_wait', http_status=?, retry_count=?, "
                                   "next_attempt_at=?, last_error=?, updated_at=? WHERE id=?",
-                                  (code, rc, nxt, redact(err)[:500], db.utcnow(), dispatch_id))
+                                  (code, rc, nxt, err, db.utcnow(), dispatch_id))
                 self._ev("dispatch_retry_wait", row["job_id"], row["task_id"], "dispatcher", dispatch_id=dispatch_id,
                          http_status=code, retry_count=rc, next_attempt_in=round(nxt - now, 1), error=err)
                 stats["retry_wait"] += 1
                 return
             self.conn.execute("UPDATE dispatch_outbox SET status='failed', http_status=?, retry_count=?, last_error=?, "
-                              "updated_at=? WHERE id=?", (code, rc, redact(err)[:500], db.utcnow(), dispatch_id))
+                              "updated_at=? WHERE id=?", (code, rc, err, db.utcnow(), dispatch_id))
             self._ev("dispatch_failed", row["job_id"], row["task_id"], "dispatcher", dispatch_id=dispatch_id,
                      http_status=code, error=err)
             stats["failed"] += 1
@@ -587,6 +593,7 @@ class Engine:
             d = self._one("SELECT * FROM dispatch_outbox WHERE id=?", (dispatch_id,))
             if not d or d["task_id"] != task_id or d["job_id"] != job_id or d["superseded"] or d["status"] == D_FAILED:
                 raise Conflict("dispatch record is not claimable")
+            self._require_plan_authorization(job, t)
             if t["attempt_no"] >= t["max_attempts"]:
                 self._block_task(t, "attempt budget exhausted")
                 raise Conflict("attempt budget exhausted")
@@ -728,11 +735,10 @@ class Engine:
                     raise ValidationError("inline artifact needs a safe 'name'")
                 if not isinstance(r["content"], str):
                     raise ValidationError("inline content must be a string")
-                rel = f"{t['id']}/a{a['attempt_no']}/{name}"
-                if not self._one("SELECT 1 FROM artifacts WHERE job_id=? AND rel_path=?", (job["id"], rel)):
-                    stale = art.resolve_inside(root, rel)
-                    if stale.exists():  # unregistered leftover from a rolled-back submission of this attempt
-                        stale.unlink()
+                # content-addressed path: a retry with the same content reuses the file; different content gets a
+                # different path. Nothing is deleted or overwritten outside a transaction (or ever).
+                digest = sha256_text(r["content"])
+                rel = f"{t['id']}/a{a['attempt_no']}/{digest[:16]}/{name}"
                 sha, size = art.write_inline(root, rel, r["content"])
             elif "path" in r:
                 rel = str(r["path"])
@@ -787,6 +793,7 @@ class Engine:
         prepared = self._prepare_artifacts(job, t, a, artifact_refs)
         with db.tx(self.conn):
             job, t, a = self._live_attempt(job_id, task_id, attempt_id)
+            self._require_plan_authorization(job, t)
             ids = self._register_artifacts(job_id, t, a, prepared)
             lease = self.now() + self._policy(job)["lease_seconds"]
             cur = self.conn.execute("UPDATE tasks SET lease_expires_at=?, updated_at=? WHERE id=? AND "
@@ -814,6 +821,7 @@ class Engine:
         post: list[tuple] = []
         with db.tx(self.conn):
             job, t, a = self._live_attempt(job_id, task_id, attempt_id)
+            self._require_plan_authorization(job, t)
             ids = self._register_artifacts(job_id, t, a, prepared)
             self.conn.execute("UPDATE task_attempts SET status='completed', ended_at=?, evidence_json=? WHERE id=?",
                               (db.utcnow(), _j(redact_obj(evidence)) if evidence is not None else None, attempt_id))
@@ -958,6 +966,13 @@ class Engine:
                               "NULL", (db.utcnow(), reason, job_id)).rowcount
         if n:
             self._ev("approval_revoked", job_id, None, "engine", reason=reason, count=n)
+        # not-yet-started implementation-side tasks of the revoked plan can never run
+        q = ",".join("?" * len(self.PLAN_BOUND_KINDS))
+        for t in self._all(f"SELECT * FROM tasks WHERE job_id=? AND kind IN ({q}) AND status IN "
+                           "('queued','dispatched','awaiting_resume')", (job_id, *self.PLAN_BOUND_KINDS)):
+            self._set_task(t, CANCELLED, block_reason=f"plan approval revoked: {reason}"[:500])
+            self.conn.execute("UPDATE dispatch_outbox SET superseded=1 WHERE task_id=? AND status IN "
+                              "('pending','retry_wait')", (t["id"],))
 
     def _prevalidate_commit(self, job, sha):
         if not job["worktree_path"]:
@@ -1041,8 +1056,7 @@ class Engine:
         prof = self.profiles.get(name) if name else None
         if prof is not None:
             prof = dict(prof)
-            if prof.get("protected_paths"):
-                prof["protected_base"] = job["base_revision"]
+            prof["protected_base"] = job["base_revision"]  # scope/shadow checks always diff against the job base
         return name, prof
 
     def _start_verification(self, job, task_id, purpose, sha) -> tuple[str, str | None, dict | None]:
@@ -1102,6 +1116,18 @@ class Engine:
                 "timed_out": out.timed_out, "artifact_ids": [so, se], "profile_hash": out.profile_hash}
 
     # ------------------------------------------------------------------ approval
+    PLAN_BOUND_KINDS = ("implement", "code_review", "qa", "integrate")
+
+    def _require_plan_authorization(self, job, t) -> None:
+        """Implementation-side work is valid only under a live approval of the job's CURRENT plan revision."""
+        if t["kind"] not in self.PLAN_BOUND_KINDS:
+            return
+        if not self._valid_approval(job):
+            raise GateRefused("plan approval is missing, revoked or for a superseded plan revision; "
+                              "implementation-side work is not authorized")
+        if t["plan_revision_id"] and t["plan_revision_id"] != job["current_plan_revision_id"]:
+            raise GateRefused("task belongs to a superseded plan revision")
+
     def _valid_approval(self, job):
         rev = self._one("SELECT * FROM plan_revisions WHERE id=?", (job["current_plan_revision_id"],)) \
             if job["current_plan_revision_id"] else None
@@ -1342,14 +1368,17 @@ class Engine:
     def cancel(self, job_id, reason, actor, confirmed=False) -> dict:
         if not isinstance(reason, str) or not reason.strip():
             raise ValidationError("reason required")
-        job = self._job(job_id)
-        if job["phase"] in (J_DONE, J_FAILED, J_CANCELLED):
-            return {"ok": True, "phase": job["phase"], "changed": False}
-        if job["worktree_path"] and job["mode"] != "fixture" and not confirmed:
-            return {"ok": False, "requires_human_confirmation": True,
-                    "message": f"job has real implementation work; ask the user to run: omoctl cancel {job_id}"}
-        with db.tx(self.conn):
+        with db.tx(self.conn):  # every check happens under the same BEGIN IMMEDIATE write lock as the change
             job = self._job(job_id)
+            if job["phase"] in (J_DONE, J_FAILED, J_CANCELLED):
+                return {"ok": True, "phase": job["phase"], "changed": False}
+            has_real_work = job["mode"] != "fixture" and (
+                job["worktree_path"] or job["phase"] in (J_PLAN_APPROVED, J_RUNNING) or
+                self._one("SELECT 1 FROM approvals WHERE job_id=? AND revoked_at IS NULL", (job_id,)))
+            if has_real_work and not confirmed:
+                return {"ok": False, "requires_human_confirmation": True,
+                        "message": f"job has approved/real implementation work; ask the user to run: "
+                                   f"omoctl cancel {job_id}"}
             for t in self._all("SELECT * FROM tasks WHERE job_id=? AND status NOT IN ('passed','rejected','failed',"
                                "'cancelled')", (job_id,)):
                 if t["current_attempt_id"]:
@@ -1498,7 +1527,8 @@ class Engine:
                                      "cycle": t["cycle"], "attempt_no": t["attempt_no"],
                                      "block_reason": t["block_reason"], "lease_expires_at": t["lease_expires_at"],
                                      "candidate_revision": t["candidate_revision"],
-                                     "dispatch": d and dict(d)})
+                                     "dispatch": d and dict(d, last_error=d["last_error"] and
+                                                             redact_urls(d["last_error"]))})
             out["verifications"] = [dict(v) for v in self._all(
                 "SELECT id,purpose,revision,status,exit_code,detail,started_at FROM verifications WHERE job_id=? "
                 "ORDER BY started_at", (job["id"],))]

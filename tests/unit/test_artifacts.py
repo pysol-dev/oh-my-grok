@@ -131,3 +131,42 @@ def test_dispatch_body_not_executed_claim_requires_exact_ids(harness):
         harness.e.claim(job, t["id"], "$(rm -rf /)")
     with pytest.raises(Conflict):
         harness.e.claim(job, t["id"], "00000000-0000-4000-8000-000000000000")
+
+
+def test_failed_submission_retries_are_idempotent_and_never_delete(harness):
+    """Inline artifacts are content-addressed: a rolled-back submit leaves a harmless file, a retry with the same or
+    different content succeeds, and no file (registered or not) is deleted or overwritten."""
+    e = harness.e
+    job = harness.submit()["job_id"]
+    pkt = harness.claim(job, "explore")
+    good = {"repo_map": "x", "files": [], "tests": [], "constraints": [], "questions": []}
+    with pytest.raises(ValidationError):  # first ref is written, second is invalid -> whole submit rejected
+        e.complete(job, pkt["task_id"], pkt["attempt_id"], good,
+                   [{"kind": "explore", "name": "r.md", "content": "v1"},
+                    {"kind": "explore", "name": "../evil", "content": "x"}])
+    root = e._art_root(job)
+    v1 = [p for p in root.rglob("r.md")]
+    assert len(v1) == 1 and e._one("SELECT COUNT(*) c FROM artifacts WHERE job_id=?", (job,))["c"] == 0
+    r = e.complete(job, pkt["task_id"], pkt["attempt_id"], good, [{"kind": "explore", "name": "r.md", "content": "v2"}])
+    assert r["task_status"] == "passed"
+    files = sorted(p.read_text() for p in root.rglob("r.md"))
+    assert files == ["v1", "v2"] and all(p.exists() for p in v1)  # leftover kept, not deleted
+    row = e._one("SELECT * FROM artifacts WHERE id=?", (r["artifact_ids"][0],))
+    assert (root / row["rel_path"]).read_text() == "v2"
+    assert not list(root.rglob(".tmp-*"))  # no temp files left behind
+
+
+def test_tampered_file_at_artifact_path_fails_closed_not_deleted(harness):
+    e = harness.e
+    job = harness.submit()["job_id"]
+    pkt = harness.claim(job, "explore")
+    from omo_grok.config import sha256_text
+    rel = f"{pkt['task_id']}/a{pkt['attempt_no']}/{sha256_text('real')[:16]}/r.md"
+    p = e._art_root(job) / rel
+    p.parent.mkdir(parents=True)
+    p.write_text("planted by someone else")
+    good = {"repo_map": "x", "files": [], "tests": [], "constraints": [], "questions": []}
+    with pytest.raises(IntegrityError_):
+        e.complete(job, pkt["task_id"], pkt["attempt_id"], good, [{"kind": "explore", "name": "r.md", "content": "real"}])
+    assert p.read_text() == "planted by someone else"
+    assert harness.task(job, "explore")["status"] == "working"

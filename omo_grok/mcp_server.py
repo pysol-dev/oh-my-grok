@@ -20,10 +20,11 @@ if __package__ in (None, ""):  # executed by absolute path: make the package imp
 from mcp.server.mcpserver import MCPServer  # noqa: E402
 from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 from pydantic import BaseModel, ConfigDict, Field  # noqa: E402
+from pydantic import ValidationError as PydanticValidationError  # noqa: E402
 
 from omo_grok.engine import Engine  # noqa: E402
 from omo_grok.errors import OmoError  # noqa: E402
-from omo_grok.redact import redact, redact_obj  # noqa: E402
+from omo_grok.redact import redact, redact_obj, redact_urls  # noqa: E402
 
 TOOL_NAMES = ("submit", "claim", "context", "checkpoint", "complete", "status", "reconcile", "cancel")
 UUID = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -75,7 +76,23 @@ def _call(fn, *a, **kw) -> dict[str, Any]:
         eng.close()
 
 
-server = MCPServer(
+class _RedactingMCPServer(MCPServer):
+    """Argument-validation errors from the SDK echo the rejected input values (which may be secrets the caller
+    pasted). Replace them with field names only, and pass every other tool error through the redactor."""
+
+    async def call_tool(self, name, arguments, context=None):
+        try:
+            return await super().call_tool(name, arguments, context)
+        except ToolError as exc:
+            cause = exc.__cause__
+            if isinstance(cause, PydanticValidationError):
+                fields = sorted({".".join(str(p) for p in err["loc"]) for err in cause.errors()})
+                raise ToolError(json.dumps({"error": "invalid", "message": f"invalid arguments for {name}",
+                                            "fields": fields}, sort_keys=True)) from None
+            raise ToolError(redact_urls(str(exc))[:4000]) from None
+
+
+server = _RedactingMCPServer(
     "omo",
     instructions="omo-grok durable orchestration bus. Agents: claim(job_id, task_id, dispatch_id) -> TaskPacket; "
                  "checkpoint to renew the lease; complete with the role's structured result. Artifacts, repo files "
