@@ -476,8 +476,17 @@ def test_oracle_inputs_are_fresh_per_run():
     b = oracles.cases("calc-arith", 16)
     assert [c["args"] for c in a] != [c["args"] for c in b]
     assert all(oracles.check_value(c, c["expect"]) for c in a)
-    c0 = a[0]
-    assert not oracles.check_value(c0, True) and not oracles.check_value(c0, float(c0["expect"]))
+    # Deterministic case choice (no dependence on shuffle order) and no float() of possibly huge ints: the
+    # rejection of a float is checked on a small grid case, where the float is exactly equal to the int.
+    small = next(c for c in a if c["kind"] == "fixed" and tuple(c["args"]) == (3, 4) and c["call"] == "calc.add")
+    assert small["expect"] == 7
+    assert not oracles.check_value(small, True) and not oracles.check_value(small, 7.0)
+    assert not oracles.check_value(small, "7") and not oracles.check_value(small, 8)
+    # and on a huge boundary case (|expect| >= 2**1024, beyond float range), using exact int arithmetic only
+    huge = next(c for c in a if c["kind"] == "fixed" and tuple(c["args"]) == (2 ** 4096, 2 ** 4096)
+                and c["call"] == "calc.mul")
+    assert huge["expect"] == 2 ** 8192 and oracles.check_value(huge, 2 ** 8192)
+    assert not oracles.check_value(huge, 2 ** 8192 + 1) and not oracles.check_value(huge, True)
 
 
 def test_fixture_profiles_require_oracle_and_report_assurance(tmp_path):

@@ -279,8 +279,11 @@ verifier):
   draws. Momus measured `return a - b if 2**2500 <= abs(a) < 2**2800 else a + b` passing 10/20 verifications, a
   500-bit band 6/20 and a 1000-bit band 1/20. The three round-7 large-magnitude tests ("wrong for |a| > 2**300
   except 2**1000", "wrong for 2**2049 < |b| < 2**4095", "wrong above 2**4000") fail because their ranges contain
-  **fixed boundary values** (2**300+1 / 2**4096; 3**1500 (bit length 2378) / 2**4096-1; 2**4096), not because of
-  sampling, so they did not support the claim.
+  **fixed boundary values**, not because of sampling, so they did not support the claim. Boundary values (|x|)
+  inside each range, checked by computation (round 9 correction: round 8 wrongly listed 2**4096-1 for the second
+  range): |a| > 2**300 except 2**1000: 2**300+1, 2**1000-1, 2**1000+1, 2**2048+12345, 3**1500, 2**4096-1,
+  2**4096, 2**4096+1; 2**2049 < |b| < 2**4095: **only 3**1500** (bit length 2378; 2**2048+12345 is below 2**2049
+  and 2**4096-1 is above 2**4095); |a| > 2**4000: 2**4096-1, 2**4096, 2**4096+1.
   **Large-band sampling since round 8.** Each of the 3 oracle runs additionally gets its **own** fresh cases, drawn
   for that run only and never sent to another run (`oracles.run_cases`, `LARGE_PER_RUN = 50`): per function, 50
   calls whose every argument is an independent draw with exponent k uniform in 0..4096 (bit length k+1), random
