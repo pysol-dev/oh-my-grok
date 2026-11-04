@@ -19,7 +19,7 @@ Owner: Hephaestus (bot f497e4a7-5d7d-46e4-829f-b0da987cbac4).
 | T04 | Outbox dispatcher, leases, retries, reconcile (§7) | T02 | mock-HTTP tests 7,8,22 pass | DONE for 7,8 (loopback HTTP server + mocks). Item 22 is LIVE: harness only, NOT RUN |
 | T05 | Artifacts, plan hashes, approvals, worktrees, verifier profiles, fixture, final gate (§8,§9) | T02-T04 | spec §10 tests 1-19 pass | DONE: items 1-19 automated, 40 integration passed, exit 0. Approval is SOFT only; strict/external approval documented, not implemented |
 | T06 | Docs: ARCHITECTURE, SECURITY, RUNBOOK, MIGRATION, README; routines/<role>.md; agents/ | T05 | files exist and match code | DONE (routines are drafts, not created in any Bot) |
-| T07 | Independent review of T02-T06 by Momus | T06 | Momus pass with evidence | IN REVIEW: Momus FAILED d3ac281; all listed findings fixed in follow-up commit; re-review by Momus pending |
+| T07 | Independent review of T02-T06 by Momus | T06 | Momus pass with evidence | IN REVIEW: Momus FAILED d3ac281 and b7cdc15; round-2 findings (G/D/E/F + test hygiene) fixed in follow-up commit; re-review #3 by Momus pending |
 | T08 | Register `omo` MCP in Grok Bot (command server); confirm in >=2 Bots | T07 | real tool call readback from 2 bots | TODO |
 | T09 | Role→Bot→routine registry with real bot ids; webhook routines omo-bus-<role> created per bot | T08 | routines read back | TODO |
 | T10 | Webhook URL/key collection via masked `omoctl hook set` (user-only step) | T09 | hook list shows configured | TODO (likely USER BLOCKER) |
@@ -54,3 +54,54 @@ Owner: Hephaestus (bot f497e4a7-5d7d-46e4-829f-b0da987cbac4).
   - TEST QUALITY: item 8 restart is a real separate OS process reconciling over real HTTP to the loopback hook; item 9 approve-A/rev-B tests (claim+complete refused, A hash not re-approvable, late plan while running refused); item 18 injected-failure and SIGKILL-mid-migration subprocess tests (version unchanged, integrity ok, re-migrate succeeds); vacuous asserts removed (workflow item3, dispatch accepted-in-(0,1) and HttpResult tautology, MCP "sk-" check replaced by planted secrets in hooks/env/error inputs checked across MCP/stderr/status/hook list/export); full task/job/dispatch status x status matrix vs an independent expected table.
   - Results: doctor exit 0 (NOT OPERATIONAL banner, hooks unset); unit 109 passed exit 0; integration 45 passed exit 0; pyflakes exit 0; manual shadow-attack repro: rejected before running; isolation-only layer runs the real tests (exit 1); old argv without -I exit 0 'VERIFIED' (the original bypass).
   - Still NOT done: live items 20-22 not run; Bots/routines/hooks unverified; approval SOFT only; MCP not registered (T08); no Auto Review rule; shadow names derived from the host interpreter.
+- 2026-11-03 21:33 MST: Fixes committed b7cdc15 (unit 109, integration 45, pyflakes clean). Re-review requested from Momus.
+- 2026-11-03 21:37 MST: Momus re-review FAIL on b7cdc15 (verifier bypasses: committed .pyc, import-time os._exit(0), monkeypatched assertEqual). Round-2 fixes dispatched to build worker.
+- 2026-11-03 21:38 MST: T08 partial — user approved; 'omo' MCP registered via AddMcpServer (server id user-omo, stdio, 8 tools, connected). Hephaestus live readback: omo.status OK (schema_version 2, 0 jobs, 8 unbound roles). Second-bot readback pending (ask Momus in next review).
+- 2026-11-03 21:45 MST: Round-2 fixes for the Momus FAIL of b7cdc15, built and tested:
+  - **G (planted .pyc).** Candidate diffs may contain only `source_extensions` (default .py). The verifier rejects
+    `__pycache__`, .pyc/.pyo/.so, symlinks, submodules, binary files and non-UTF-8 files. Before the run it purges
+    bytecode in the private checkout and runs with -B, PYTHONDONTWRITEBYTECODE and `-X pycache_prefix=<private dir>`.
+  - **D (os._exit).** Added a trusted runner (omo_grok/trusted_runner.py, run with -I, outside the candidate tree).
+    It runs the profile's expected_tests manifest and writes a JSON result outside the tree, bound to a per-run nonce
+    passed by inherited fd. A pass needs all of: exit 0, the result file, the right nonce, every expected test passed,
+    exact counts and the type checks.
+  - **E (monkeypatched asserts).**
+    - The runner snapshots and re-checks TestCase/TestResult/TestSuite/TestLoader attributes, builtins, key stdlib
+      functions, sys.modules entries and import hooks after import and after the run.
+    - A new static AST scan (omo_grok/candidate_scan.py) covers changed editable .py files. It rejects os._exit,
+      sys.exit, the unittest/builtins/importlib/ctypes/gc/inspect/sys imports, sys.modules, frame and introspection
+      attributes, setattr and module mutation, exec/eval/compile/__import__ and open. It is configurable per profile
+      and cannot be disabled.
+  - **F (int subclass with an always-True __eq__).** Mitigated, not solved.
+    - The scan rejects builtin subclasses, metaclasses and dunder overrides. The runner type_checks require
+      `type(r) is int`.
+    - SECURITY.md states that a test-based verifier cannot in general defeat adversarial in-process code. Code
+      review and QA bound to the same revision are the backstop.
+  - **Profiles.** Python profiles without the trusted runner are refused. Non-Python profiles need
+    `exit_code_only: true` and are labelled REDUCED assurance.
+  - **Shadow names.** Snapshotted at install into config/shadow_names.json.
+  - **Engine.**
+    - A plan-bound task with NULL plan_revision_id fails closed at claim, checkpoint, complete, the packet builder
+      and task creation.
+    - submit rejects an unknown verifier_profile with ValidationError.
+    - db.restore raises IntegrityError_ for corrupt backups.
+  - **Tests.**
+    - G, D (import and call), E (direct and setattr) and F each have three checks:
+      - proven real: the old exit-code-only run gives exit 0
+      - fails the full verifier, rejected statically
+      - fails the runtime layer alone, with static checks disabled
+    - test_without_isolation_the_attack_would_pass now actually runs the attack. Forged and nonce-less results,
+      missing tests and non-source, symlink and binary files are tested.
+    - Added 33 candidate_scan cases and approval-gate tests for code_review and qa claims (revoked approval, changed
+      plan, NULL revision).
+    - Narrowed raises to Conflict and IntegrityError_.
+    - The MCP ERR_SECRET is now pattern-free, and the exact field-only error shape is asserted for status, claim and
+      context.
+  - **Results.** doctor exit 0 (NOT OPERATIONAL banner); unit 168 passed exit 0; integration 54 passed exit 0;
+    pyflakes exit 0. The manual repro of G/D/E/F: all FAILED under the current verifier, and the real-fix control
+    PASSED.
+  - **Still NOT done / residual.**
+    - Live items 20-22 not run; Bots/routines/hooks unverified; approval SOFT only; no Auto Review rule.
+    - The static scan is a tripwire, not a sandbox. In-process code could in principle find the nonce in memory.
+      F is undefeatable in general, so review and QA are the backstop.
+    - The already-registered `user-omo` MCP server process must be restarted to load this code.

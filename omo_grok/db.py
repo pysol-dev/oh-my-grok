@@ -363,10 +363,15 @@ def backup(conn: sqlite3.Connection, dest: Path | str) -> Path:
 
 def restore(backup_path: Path | str, db_path: Path | str) -> None:
     """Restore a backup into db_path using the backup API (destination must not be in use)."""
+    from .errors import IntegrityError_
     src = sqlite3.connect(str(backup_path))
     try:
-        if src.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-            raise RuntimeError("backup file failed integrity_check")
+        try:
+            ok = src.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        except sqlite3.DatabaseError as e:
+            raise IntegrityError_("backup file is not a readable SQLite database", error=type(e).__name__) from None
+        if not ok:
+            raise IntegrityError_("backup file failed integrity_check")
         dst = sqlite3.connect(str(db_path))
         try:
             src.backup(dst)

@@ -28,6 +28,8 @@ DEFAULT_POLICY = {
 }
 
 TEMPLATE_MARKER = "OMO_VERIFY_TEMPLATE"
+RUNNER_NAME = "omo-trusted-unittest"
+TRUSTED_RUNNER = Path(__file__).resolve().parent / "trusted_runner.py"
 
 
 def canonical_json(obj) -> str:
@@ -79,11 +81,38 @@ def validate_profile(name: str, prof: dict) -> list[str]:
     cwd = prof.get("cwd", "")
     if isinstance(cwd, str) and (cwd.startswith("/") or ".." in Path(cwd).parts):
         problems.append("cwd must be relative to the checkout and must not contain '..'")
-    if argv and isinstance(argv[0], str) and Path(argv[0]).name.startswith("python"):
+    is_python = bool(argv) and isinstance(argv[0], str) and Path(argv[0]).name.startswith("python")
+    if is_python:
         flags = argv[1:argv.index("-m")] if "-m" in argv else argv[1:]
         if "-I" not in flags:
             problems.append("python verifiers must run isolated: put -I before -m/script (no cwd/user-site/PYTHON* "
                             "on sys.path)")
+    if prof.get("runner") is not None or is_python:
+        # exit status alone is not trusted for Python: the trusted runner must report per-test results
+        if prof.get("runner") != RUNNER_NAME:
+            problems.append(f"python verifiers must use runner {RUNNER_NAME!r} (exit code alone is not trusted)")
+        elif not argv or argv[-1] != str(TRUSTED_RUNNER) or "-m" in argv:
+            problems.append(f"trusted-runner profiles must end argv with {TRUSTED_RUNNER} and must not use -m")
+        tests = prof.get("expected_tests")
+        if not isinstance(tests, list) or not tests or not all(isinstance(t, str) and t for t in tests):
+            problems.append("expected_tests must be a non-empty list of test ids")
+        elif len(set(tests)) != len(tests):
+            problems.append("expected_tests contains duplicates")
+        if not isinstance(prof.get("start_dir"), str) or ".." in Path(prof.get("start_dir", "")).parts:
+            problems.append("start_dir must be a relative path")
+        if not isinstance(prof.get("editable_paths"), list) or not prof.get("editable_paths"):
+            problems.append("trusted-runner profiles must declare editable_paths")
+        for chk in prof.get("type_checks", []):
+            if not (isinstance(chk, dict) and isinstance(chk.get("call"), str) and "." in chk["call"]
+                    and chk.get("type") in ("int", "float", "str", "bool", "list", "tuple", "dict", "bytes",
+                                            "NoneType")):
+                problems.append(f"invalid type check {chk!r}")
+    elif prof.get("exit_code_only") is not True:
+        problems.append("non-python profiles must set exit_code_only: true to accept exit-status-only (reduced) "
+                        "assurance")
+    scan = prof.get("static_scan", {})
+    if not isinstance(scan, dict) or "enabled" in scan:
+        problems.append("static_scan must be a dict of allow/forbid lists; scanning cannot be disabled")
     for key in ("protected_paths", "editable_paths"):
         v = prof.get(key)
         if v is not None and (not isinstance(v, list) or not all(isinstance(x, str) and x and not x.startswith("/")

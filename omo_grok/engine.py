@@ -203,6 +203,8 @@ class Engine:
         job = self._one("SELECT policies_json, current_plan_revision_id FROM jobs WHERE id=?", (job_id,))
         if plan_revision_id is None and kind in ("implement", "code_review", "qa", "integrate"):
             plan_revision_id = job["current_plan_revision_id"]  # post-approval work is bound to the approved revision
+            if not plan_revision_id:
+                raise GateRefused(f"cannot create {kind} task without a current plan revision (fail closed)")
         ma = max_attempts or (_l(job["policies_json"]) or {}).get("max_attempts_per_task",
                                                                   self.policy["max_attempts_per_task"])
         self.conn.execute("INSERT INTO tasks(id,job_id,kind,role,status,cycle,priority,max_attempts,plan_revision_id,"
@@ -326,6 +328,9 @@ class Engine:
                                   repo=repo_path)
         elif mode == "implement":
             raise ValidationError("implement mode requires repo")
+        if verifier_profile is not None:
+            if not isinstance(verifier_profile, str) or verifier_profile not in self.profiles:
+                raise ValidationError("unknown verifier_profile", known=sorted(self.profiles))
         policies = {}
         if max_repair_cycles is not None:
             if not (1 <= int(max_repair_cycles) <= 10):
@@ -634,6 +639,8 @@ class Engine:
         pol = self._policy(job)
         plan_rev = self._one("SELECT * FROM plan_revisions WHERE id=?", (t["plan_revision_id"],)) \
             if t["plan_revision_id"] else None
+        if t["kind"] in self.PLAN_BOUND_KINDS and not plan_rev:
+            raise GateRefused("plan-bound task has no plan revision; no packet without an approved plan (fail closed)")
         return {
             "schema_version": PACKET_SCHEMA_VERSION,
             "job_id": job_id, "task_id": task_id,
@@ -1125,7 +1132,9 @@ class Engine:
         if not self._valid_approval(job):
             raise GateRefused("plan approval is missing, revoked or for a superseded plan revision; "
                               "implementation-side work is not authorized")
-        if t["plan_revision_id"] and t["plan_revision_id"] != job["current_plan_revision_id"]:
+        if not t["plan_revision_id"]:
+            raise GateRefused("plan-bound task has no plan_revision_id; refusing (fail closed)")
+        if t["plan_revision_id"] != job["current_plan_revision_id"]:
             raise GateRefused("task belongs to a superseded plan revision")
 
     def _valid_approval(self, job):

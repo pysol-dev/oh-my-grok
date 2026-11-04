@@ -277,9 +277,9 @@ def test_item14_review_and_qa_can_reject_passing_build(harness):
     from omo_grok import fixture as fx
     from pathlib import Path
     wt = Path(pkt["worktree_root"])
-    (wt / "calc" / "NOTES.md").write_text("addressed review")
+    (wt / "calc" / "review_notes.py").write_text('"""addressed review"""\n')  # source-only: .md is not allowed
     sha2 = fx.commit_all(wt, "address review")
-    e.complete(job, pkt["task_id"], pkt["attempt_id"], {"commit_sha": sha2, "touched_files": ["calc/NOTES.md"],
+    e.complete(job, pkt["task_id"], pkt["attempt_id"], {"commit_sha": sha2, "touched_files": ["calc/review_notes.py"],
                "summary": "s", "unit_evidence": "u", "deviations": [], "risks": []})
     assert sha2 != sha1
     vs = [v for v in e.status(job)["verifications"] if v["revision"] == sha2]
@@ -536,3 +536,68 @@ def test_item9_plan_change_while_implementer_working_rejects_claim_and_submit(ha
                    {"commit_sha": sha, "touched_files": ["calc/__init__.py"], "summary": "fix",
                     "unit_evidence": "ran unittest", "deviations": [], "risks": []})
     assert harness.task(job, "implement")["status"] == "working"
+
+
+def _to_reviews(harness):
+    job = harness.submit()["job_id"]
+    harness.approve(job, harness.to_approval(job))
+    harness.implement(job)
+    return job
+
+
+@pytest.mark.parametrize("kind", ["code_review", "qa"])
+@pytest.mark.parametrize("how", ["revoked", "plan_changed", "null_plan_revision"])
+def test_review_and_qa_claims_are_approval_gated(harness, kind, how):
+    """code_review and qa claims are refused unless the approval of the CURRENT plan revision is live and the task is
+    bound to that revision; a refused claim changes nothing."""
+    from omo_grok import db
+    e = harness.e
+    job = _to_reviews(harness)
+    t = harness.task(job, kind)
+    assert t["status"] == "dispatched" and t["plan_revision_id"] == e._job(job)["current_plan_revision_id"]
+    with db.tx(e.conn):
+        if how == "revoked":  # approval revoked out-of-band, task left dispatched
+            e.conn.execute("UPDATE approvals SET revoked_at=? WHERE job_id=?", (db.utcnow(), job))
+        elif how == "plan_changed":
+            cur = e._one("SELECT * FROM plan_revisions WHERE id=?", (e._job(job)["current_plan_revision_id"],))
+            e.conn.execute("INSERT INTO plan_revisions(id,job_id,round,artifact_id,content_hash,author_role,"
+                           "submitted_at,review_status) VALUES ('rev-x',?,?,?,?,?,?,'accepted')",
+                           (job, cur["round"] + 1, cur["artifact_id"], "c" * 64, "metis", db.utcnow()))
+            e.conn.execute("UPDATE jobs SET current_plan_revision_id='rev-x' WHERE id=?", (job,))
+        else:
+            e.conn.execute("UPDATE tasks SET plan_revision_id=NULL WHERE id=?", (t["id"],))
+    with pytest.raises(GateRefused):
+        e.claim(job, t["id"], t["current_dispatch_id"])
+    assert harness.task(job, kind)["status"] == "dispatched"
+
+
+def test_plan_bound_tasks_always_carry_a_plan_revision(harness):
+    job = _to_reviews(harness)
+    harness.review(job, "code_review")
+    harness.review(job, "qa")
+    rows = harness.e._all("SELECT kind, plan_revision_id FROM tasks WHERE job_id=? AND kind IN "
+                          "('implement','code_review','qa','integrate')", (job,))
+    assert {r["kind"] for r in rows} >= {"implement", "code_review", "qa"}
+    assert all(r["plan_revision_id"] for r in rows), rows
+
+
+def test_implement_packet_fails_closed_without_plan_revision(harness):
+    from omo_grok import db
+    e = harness.e
+    job = harness.submit()["job_id"]
+    harness.approve(job, harness.to_approval(job))
+    t = harness.task(job, "implement")
+    with db.tx(e.conn):
+        e.conn.execute("UPDATE tasks SET plan_revision_id=NULL WHERE id=?", (t["id"],))
+    with pytest.raises(GateRefused):
+        e.claim(job, t["id"], t["current_dispatch_id"])
+    with pytest.raises(GateRefused):  # and the packet builder itself refuses
+        e._packet(job, t["id"])
+
+
+def test_submit_rejects_unknown_verifier_profile(harness):
+    with pytest.raises(ValidationError):
+        harness.submit(verifier_profile="no-such-profile")
+    with pytest.raises(ValidationError):
+        harness.submit(verifier_profile=["fixture-calc-unittest"])
+    assert harness.submit(verifier_profile="fixture-calc-unittest")["created"]

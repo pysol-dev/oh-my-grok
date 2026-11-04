@@ -57,6 +57,23 @@ def changed_files(repo: Path, base: str, sha: str) -> list[str]:
     return [p for p in out.split("\0") if p]
 
 
+def changed_entries(repo: Path, base: str, sha: str) -> list[tuple[str, str, str]]:
+    """(status, new_mode, path) for every change base..sha; renames are split into delete + add."""
+    out = git(["diff", "--raw", "--no-renames", "-z", base, sha], repo).stdout
+    parts = [p for p in out.split("\0")]
+    res = []
+    i = 0
+    while i < len(parts) - 1:
+        meta = parts[i]
+        if not meta.startswith(":"):
+            i += 1
+            continue
+        fields = meta[1:].split()
+        res.append((fields[4][0], fields[1], parts[i + 1]))
+        i += 2
+    return res
+
+
 def create_worktree(repo: Path, dest: Path, branch: str, base: str) -> None:
     """Idempotent: reuses an existing worktree at dest on the same branch; refuses to clobber anything else."""
     if dest.exists():

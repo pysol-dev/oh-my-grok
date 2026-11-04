@@ -82,7 +82,7 @@ def test_item10_server_stdout_is_protocol_only(omo_home):
 HOOK_KEY = "whsec_PLANTED_hookkey_0123456789abcdef"
 ENV_SECRET = "sk-PLANTEDenvSECRET0123456789abcdef"
 URL_TOKEN = "PLANTEDurlTOKEN0123456789"
-ERR_SECRET = "xai-PLANTEDerrSECRET0123456789abcdef"
+ERR_SECRET = "zq7KpMyeHeRdIM1LWpmAKNupNNgJt8ize6nWGPA2HabaY"  # pattern-free: no redaction regex can match it
 
 
 async def _leak_flow(errlog, env):
@@ -103,6 +103,16 @@ async def _leak_flow(errlog, env):
             outs.append(await s.call_tool("status", {"job_id": ERR_SECRET}))
             outs.append(await s.call_tool("claim", {"job_id": job, "task_id": job, "dispatch_id": ERR_SECRET}))
             outs.append(await s.call_tool("context", {"job_id": job, "task_id": ERR_SECRET}))
+            # exact, field-name-only error shape (no input value, no pattern-dependent redaction)
+            for o, (tool, field) in zip(outs[-3:], [("status", "job_id"), ("claim", "dispatch_id"),
+                                                    ("context", "task_id")]):
+                assert o.is_error and len(o.content) == 1
+                assert o.content[0].text == json.dumps({"error": "invalid", "fields": [field],
+                                                        "message": f"invalid arguments for {tool}"}, sort_keys=True)
+            bad = await s.call_tool("submit", {"goal": "x", "idempotency_key": "leak-0002", "mode": "fixture",
+                                               "verifier_profile": ERR_SECRET})
+            assert bad.is_error and "unknown verifier_profile" in bad.content[0].text
+            outs.append(bad)
             text = "\n".join(json.dumps(o.structured_content) + "\n" + "\n".join(
                 getattr(c, "text", "") for c in o.content) for o in outs)
             return job, text

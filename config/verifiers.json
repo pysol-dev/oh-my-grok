@@ -1,29 +1,61 @@
 {
-  "_comment": "Verifier profiles. argv runs with shell=False, isolated interpreter (-I), sanitized env, in a temporary detached checkout of the EXACT revision. Before running, the candidate is diffed against the job base: changes to protected_paths, changes outside editable_paths (allowlist), interpreter/test-runner hook files (sitecustomize, usercustomize, *.pth, conftest.py, pytest/tox/setup config) and top-level modules shadowing stdlib or verifier modules are rejected. Only the exit status decides. Any profile or referenced script containing OMO_VERIFY_TEMPLATE fails closed.",
+  "_comment": "Verifier profiles. argv runs with shell=False in a temporary detached checkout of the EXACT revision, sanitized env, PYTHONDONTWRITEBYTECODE, any __pycache__/*.pyc purged and -X pycache_prefix=<private dir>. Python profiles must use the TRUSTED runner (omo_grok/trusted_runner.py, outside the candidate tree, run with -I): it runs the suite, snapshots test machinery/builtins against tampering and writes a nonce-bound JSON result outside the checkout; a pass needs exit 0 AND the result AND every expected_tests id passed AND exact counts AND type_checks. Before running, the candidate diff is rejected for: protected_paths, paths outside editable_paths, hook files, top-level stdlib/verifier shadowing, non-source/bytecode/binary/symlink files (source_extensions allowlist) and static_scan AST findings (allow/forbid lists; scanning cannot be disabled). Non-python profiles need exit_code_only: true (reduced assurance). OMO_VERIFY_TEMPLATE anywhere fails closed.",
   "profiles": {
     "fixture-calc-unittest": {
+      "runner": "omo-trusted-unittest",
       "argv": [
         "/workspace/omo/.venv/bin/python",
         "-I",
         "-B",
-        "-m",
-        "unittest",
-        "discover",
-        "-s",
-        "tests",
-        "-t",
-        ".",
-        "-v"
+        "/workspace/omo/omo_grok/trusted_runner.py"
       ],
       "cwd": ".",
       "env_allow": [],
       "timeout_seconds": 120,
+      "start_dir": "tests",
+      "expected_tests": [
+        "tests.test_calc.CalcTest.test_add",
+        "tests.test_calc.CalcTest.test_mul"
+      ],
+      "type_checks": [
+        {
+          "call": "calc.add",
+          "args": [
+            2,
+            3
+          ],
+          "type": "int",
+          "expect": 5
+        },
+        {
+          "call": "calc.add",
+          "args": [
+            -4,
+            10
+          ],
+          "type": "int",
+          "expect": 6
+        },
+        {
+          "call": "calc.mul",
+          "args": [
+            3,
+            4
+          ],
+          "type": "int",
+          "expect": 12
+        }
+      ],
       "protected_paths": [
         "tests/"
       ],
       "editable_paths": [
         "calc/"
-      ]
+      ],
+      "source_extensions": [
+        ".py"
+      ],
+      "static_scan": {}
     },
     "example-template-do-not-use": {
       "argv": [
@@ -39,7 +71,8 @@
       ],
       "protected_paths": [
         "tests/"
-      ]
+      ],
+      "exit_code_only": true
     }
   }
 }

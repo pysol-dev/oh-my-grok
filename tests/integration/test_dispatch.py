@@ -159,7 +159,8 @@ def test_item8_reconcile_rewakes_unclaimed_and_is_bounded(h):
     assert t["current_dispatch_id"] != first and t["status"] == "dispatched"
     bodies = [q["body"] for q in h.hook.requests if q["path"] == "/explorer"]
     assert len(bodies) == 2 and bodies[1]["attempt"] == 1 and bodies[1]["dispatch_id"] != first
-    with pytest.raises(Exception):  # old dispatch id can no longer claim
+    from omo_grok.errors import Conflict
+    with pytest.raises(Conflict):  # old dispatch id can no longer claim
         e.claim(job, t["id"], first)
     for _ in range(10):  # bounded: no flooding
         h.clock.advance(e.policy["rewake_after_seconds"] + 1)

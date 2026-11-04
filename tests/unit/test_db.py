@@ -162,8 +162,10 @@ def test_backup_and_restore_roundtrip(harness, tmp_path):
 def test_restore_rejects_corrupt_backup(tmp_path):
     bad = tmp_path / "bad.sqlite3"
     bad.write_bytes(b"SQLite format 3\x00" + b"\xff" * 4000)
-    with pytest.raises(Exception):
+    from omo_grok.errors import IntegrityError_
+    with pytest.raises(IntegrityError_):
         db.restore(bad, tmp_path / "target.sqlite3")
+    assert not (tmp_path / "target.sqlite3").exists() or (tmp_path / "target.sqlite3").stat().st_size == 0
 
 
 def test_auto_backup_before_migrating_nonempty_db(omo_home):
