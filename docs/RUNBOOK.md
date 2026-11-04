@@ -223,3 +223,5 @@ backup on the next open). A missing base revision fails closed.
 | Repair budget exhausted (3 cycles) | The job is `blocked` with each cycle's diagnostics. `resume JOB --grant-repair-cycles 1` only after reading why |
 | `dispatch deferred: no enabled role binding` / `bot_busy` | Bind or verify the role, or wait for the shared Bot to finish (per-Bot serialization) |
 | Doctor shows "NOT OPERATIONAL" | Expected until `omoctl test live --fixture-only` passes with real bindings and hooks |
+| MCP tool returns `stale_server` | The omo code or config on disk changed after this MCP server process started (it fingerprints `omo_grok/**/*.py` and the config dir). Restart the omo MCP server (reload the connector) and retry. This exists because a stale server once ran old verifier code against a new child script |
+| `webhook for ROLE not configured` while `hook list` says configured | Can no longer happen: dispatch, `roles list` and `hook list` all read `state/secrets/hooks.json`. `hooks_meta` is only an audit trail |

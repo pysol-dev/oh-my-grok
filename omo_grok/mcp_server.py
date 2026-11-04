@@ -24,6 +24,7 @@ from pydantic import ValidationError as PydanticValidationError  # noqa: E402
 
 from omo_grok.engine import Engine  # noqa: E402
 from omo_grok.errors import OmoError  # noqa: E402
+from omo_grok.fingerprint import fingerprint  # noqa: E402
 from omo_grok.redact import redact, redact_obj, redact_urls  # noqa: E402
 
 TOOL_NAMES = ("submit", "claim", "context", "checkpoint", "complete", "status", "reconcile", "cancel")
@@ -62,7 +63,19 @@ def _refs(refs):
     return None if refs is None else [r.model_dump(exclude_none=True) for r in refs]
 
 
+STARTUP_FINGERPRINT = fingerprint()
+STALE_MESSAGE = ("omo code or config on disk changed since this MCP server started; refusing to serve with stale "
+                 "in-memory code. Restart the omo MCP server (reload the connector), then retry.")
+
+
+def _check_fresh() -> None:
+    if fingerprint() != STARTUP_FINGERPRINT:
+        log.warning("stale server: refusing tool call")
+        raise ToolError(json.dumps({"error": "stale_server", "message": STALE_MESSAGE}, sort_keys=True))
+
+
 def _call(fn, *a, **kw) -> dict[str, Any]:
+    _check_fresh()
     eng = Engine()
     try:
         return redact_obj(fn(eng, *a, **kw))

@@ -297,8 +297,9 @@ class Engine:
             self._ev("hook_configured", actor="operator", role=role, configured=configured)
 
     def _hook_ok(self, role) -> bool:
-        r = self._one("SELECT configured FROM hooks_meta WHERE role=?", (role,))
-        return bool(r and r["configured"])
+        """Single source of truth: hooks.json (same reader as `roles list` / `hook list`). hooks_meta is an audit
+        trail only, so storing a hook via set_hook directly can never leave dispatch out of sync."""
+        return hook_status(self.paths).get(role, False)
 
     # ------------------------------------------------------------------ submit
     def submit(self, goal: str, idempotency_key: str, repo: str | None = None, constraints: list | None = None,
