@@ -5,7 +5,9 @@ The verifier parent (which never imports candidate code) builds the cases for ev
   2. fixed BOUNDARY values (0, +-1, +-2, sign mixes, 2**31/2**32/2**53/2**63/2**64 neighbourhoods, +-10**18,
      +-2**200, +-2**300(+1), +-2**1000(+-1), 2**2048+c, 3**1500, +-2**4096(+-1)) combined pairwise,
   3. FRESH random draws from the OS CSPRNG across magnitude bands, including a band of |x| ~ 2**k with k uniform in
-     0..4096 and a random mantissa.
+     0..4096 and a random mantissa (shared by the 3 runs), and
+  4. (round 8) per run, LARGE_PER_RUN extra cases per function whose arguments are all independent large-band draws,
+     drawn separately for each run (see LARGE_PER_RUN for the catch-rate formula).
 Magnitude ceiling (stated): nothing above about 2**4097 is ever sent. Products of two such values stay below
 Python's default 4300-digit int<->str conversion limit, which the JSON protocol needs.
 It sends them one at a time, in a shuffled order, to an untrusted child that calls the candidate, and compares the raw
@@ -27,6 +29,12 @@ _rng = secrets.SystemRandom()
 
 GRID = range(-16, 17)  # exhaustive small grid per argument
 LARGE_EXP_MAX = 4096   # random large-magnitude band: |x| ~ 2**k, k in 0..4096
+# Round 8: per oracle RUN (not shared between runs), per function, this many extra cases whose every argument is a
+# fresh independent large-band draw. Per argument position that is LARGE_PER_RUN * 3 runs = 150 independent draws
+# per verification, so a candidate wrong exactly when the bit length of one argument lies in a band of W bit lengths
+# (W of the 4097 equally likely k values) is caught with probability >= 1 - (1 - W/4097)**150 by these draws alone
+# (W=50: 0.841, W=100: 0.9754, W=300: 0.999989, W=1000: 1 - 6e-19). Computed by large_band_catch_rate().
+LARGE_PER_RUN = 50
 
 
 def _boundary_ints() -> list[int]:
@@ -43,13 +51,27 @@ def _boundary_ints() -> list[int]:
 BOUNDARY_INTS = _boundary_ints()
 
 
+def rand_large() -> int:
+    """|x| in [2**k, 2**(k+1)) for k uniform in 0..LARGE_EXP_MAX (so bit length k+1 uniform in 1..4097), random
+    mantissa, random sign."""
+    k = _rng.randrange(0, LARGE_EXP_MAX + 1)
+    x = (1 << k) | _rng.getrandbits(k) if k else 1
+    return x if _rng.randrange(2) else -x
+
+
+def large_band_catch_rate(width: int, draws: int | None = None) -> float:
+    """Lower bound on P(at least one of `draws` independent large-band draws for one argument has its exponent k in
+    a given set of `width` of the LARGE_EXP_MAX + 1 possible values). Default draws: one verification's dedicated
+    per-run draws (LARGE_PER_RUN per run, 3 runs). Shared random draws only add to this."""
+    n = LARGE_PER_RUN * 3 if draws is None else draws
+    return 1.0 - (1.0 - width / (LARGE_EXP_MAX + 1)) ** n
+
+
 def rand_int() -> int:
     """Mix of magnitudes: small, medium, 64-bit-ish and arbitrary precision, both signs."""
     band = _rng.randrange(6)
     if band == 5:  # |x| in [2**k, 2**(k+1)) for k uniform in 0..4096, random mantissa, random sign
-        k = _rng.randrange(0, LARGE_EXP_MAX + 1)
-        x = (1 << k) | _rng.getrandbits(k) if k else 1
-        return x if _rng.randrange(2) else -x
+        return rand_large()
     if band == 0:
         return _rng.randint(-100, 100)
     if band == 4:
@@ -175,6 +197,25 @@ def cases(name: str, per_fn: int) -> list[dict]:
     _rng.shuffle(out)
     for i, c in enumerate(out):
         c["id"] = i
+    return out
+
+
+def run_cases(name: str, start_id: int, per_fn: int = LARGE_PER_RUN) -> list[dict]:
+    """Round 8: cases for ONE oracle run only, drawn fresh for that run and never sent to the other runs: per
+    function, `per_fn` calls whose every argument is an independent large-band draw (rand_large), in a random call
+    form. Ids start at `start_id` so they never collide with the shared cases or another run's cases (results of
+    these cases are checked against the oracle, not compared across runs)."""
+    out = []
+    forms = ("pos", "kw", "mixed")
+    for fn in ORACLES[name]:
+        for _ in range(per_fn):
+            while True:
+                args = [rand_large() for _ in range(fn.arity)]
+                if fn.domain(*args):
+                    break
+            out.append(_case(fn, args, "run-large", _rng.choice(forms) if fn.arity >= 2 else "pos"))
+    for i, c in enumerate(out):
+        c["id"] = start_id + i
     return out
 
 

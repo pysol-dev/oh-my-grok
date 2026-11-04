@@ -121,7 +121,7 @@ accepted residual. Mitigations:
   including the plain one with no padding, so code recursing ~1010 deep passed the oracle but raises RecursionError
   in real use (Momus C2-4). Tests: in all three flag sets and with padding 0, 150 and 300, the largest depth a real
   top-level call can reach (measured, 997 here) succeeds and one more raises RecursionError; C2-4 fails the
-  verifier with the scan on and off; a correct depth-700 recursive `add` passes. The runs The runs also differ in **resource limits** (round 5): one run has a random low
+  verifier with the scan on and off; a correct depth-700 recursive `add` passes. The runs also differ in **resource limits** (round 5): one run has a random low
   RLIMIT_AS (256-512 MiB), one the default 4 GiB, one none, so code that senses the memory limit (by allocating or by
   reading it) gets different answers in different runs. The same inputs go to every run; every run must match the
   oracle and all results must be identical across runs. A correct candidate passes all three (tested).
@@ -183,7 +183,11 @@ accepted residual. Mitigations:
   still a tripwire, not a proof: an allowlist can only be as good as the semantics of what it admits (for
   example, `str(x)` of an int with more than 4300 digits raises in every run and in real use alike, so that is an
   error, not a probe; and anything the allowed subset can compute from its arguments alone is by construction not
-  environment-dependent, apart from recursion depth, which C2-4 now matches to real use).
+  environment-dependent, apart from recursion depth. Since C2-4 the oracle gives the candidate exactly the
+  headroom of a **top-level** call in a normal process; that equals real use only for a caller at top level. A
+  real caller nested N frames deep has N fewer frames available, so code that passes the oracle can still hit
+  RecursionError when called from deep inside another program, and code that recurses close to the limit can
+  fail here but work elsewhere (see "False rejections")).
 
 **Which variants each layer stops** (`tests/integration/test_harness_detection.py`; every variant fails the full
 verifier):
@@ -266,19 +270,60 @@ verifier):
   `cases_per_function` fresh CSPRNG draws spread over six bands: |x|<=100, <=1000, <=10**12, <=2**63, <=2**200, and
   (round 7) |x| in [2**k, 2**(k+1)) with k uniform in 0..4096 and a random mantissa, random sign. Round 6 adds
   keyword, mixed and aliased copies and bool cases (C2-1 and the audit above); with the round-7 boundaries that is
-  about 15,700 cases per run and 47,000 per verification (~4 s here). **Magnitudes covered:** exhaustively
+  about 15,700 shared cases per run (47,000 per verification), plus since round 8 100 per-run large-band cases (below); a correct candidate's verification takes about 3.5-4 s here. **Magnitudes covered:** exhaustively
   [-16, 16]; at fixed boundaries up to 2**4096+1; by sampling, every bit length 1..4097 has the same chance per
-  large-band draw (about 16 large-band draws per function per run, so any range of bit lengths wider than a few
-  hundred is hit with near certainty; a test shows "wrong for |a| > 2**300 except 2**1000", "wrong for
-  2**2049 < |b| < 2**4095" and "wrong above 2**4000" all fail). **Not covered:** nothing above about 2**4097 is
+  large-band draw.
+  **Correction (round 8, Momus re-review #8).** Round 7 said "about 16 large-band draws per function per run, so any
+  range of bit lengths wider than a few hundred is hit with near certainty". That was false: the 16 counted both
+  arguments (about 8-10 per argument per verification), and all 3 runs reused the same inputs, so they added no
+  draws. Momus measured `return a - b if 2**2500 <= abs(a) < 2**2800 else a + b` passing 10/20 verifications, a
+  500-bit band 6/20 and a 1000-bit band 1/20. The three round-7 large-magnitude tests ("wrong for |a| > 2**300
+  except 2**1000", "wrong for 2**2049 < |b| < 2**4095", "wrong above 2**4000") fail because their ranges contain
+  **fixed boundary values** (2**300+1 / 2**4096; 3**1500 (bit length 2378) / 2**4096-1; 2**4096), not because of
+  sampling, so they did not support the claim.
+  **Large-band sampling since round 8.** Each of the 3 oracle runs additionally gets its **own** fresh cases, drawn
+  for that run only and never sent to another run (`oracles.run_cases`, `LARGE_PER_RUN = 50`): per function, 50
+  calls whose every argument is an independent draw with exponent k uniform in 0..4096 (bit length k+1), random
+  mantissa and sign, in a random call form. That is exactly **50 x 3 = 150 independent large-band draws per
+  argument position per verification**, in addition to the shared random draws (each shared draw is large-band with
+  probability 1/6: about 8 per argument per verification, not counted below). For a candidate that is wrong exactly
+  when one argument's bit length lies in a set of W of the 4097 possible values, the per-verification catch
+  probability from the dedicated draws alone is **P = 1 - (1 - W/4097)^150**: W=50: 0.841; W=100: 0.9754;
+  W=300: 0.999989 (miss 1.1e-5); W=500: 1 - 3.3e-9; W=1000: 1 - 6e-19. (`oracles.large_band_catch_rate`; a test
+  checks W=300 >= 0.999.) **Measured** (20 verifications each, `return a - b if 2**lo <= abs(a) < 2**hi else a +
+  b` plus a correct `mul`, bands chosen to contain no fixed boundary): Momus's 2**2500..2**2800 (W=300): 0/20
+  passed; 500-bit band 2**3100..2**3600: 0/20; 1000-bit band 2**2400..2**3400: 0/20; also W=100
+  (2**2500..2**2600): 0/20 and W=50 (2**2500..2**2550): 1/20 passed (expected about 0.16 x shared-draw misses).
+  Cost: 100 extra cases per run; a correct candidate's full verification (unittest child + 3 oracle runs) took
+  3.5 s here.
+  **Which tests rely on what.** Fixed boundaries (not sampling): the three round-7 large-magnitude tests in
+  `test_round7_allowlist.py`, HDIST and the grid tests. Sampling only: `test_round8_sampling.py::
+  test_wrong_only_in_a_300_bit_band_fails_by_sampling_alone` (bands 2**2500..2**2800 on `a` and 2**3100..2**3400
+  on `b`; a companion test asserts no fixed boundary, grid value or non-random case has a bit length in either
+  band), and `test_each_run_gets_its_own_large_draws` (ids and values of the per-run draws are disjoint across
+  runs; the shared cases are identical). The sampling tests can fail spuriously with probability about 1e-5 each. **Not covered:** nothing above about 2**4097 is
   ever sent (products must stay under Python's default 4300-digit int-to-str limit that the JSON protocol needs),
   so code wrong only above that passes; and within the large range, a narrow band of bit lengths or a sparse
-  pattern of values is only sampled. Order is shuffled per run. Momus's HDIST
+  pattern of values is only sampled (rates below). Order is shuffled per run. Momus's HDIST
   (wrong for |a|,|b|<=10 except the unittest pairs) now fails every time (tested 5x plus the manual repro).
   **Limit:** outside the grid and the boundary set the oracle samples. A function wrong only on a sparse set of
   inputs that are neither in the grid, nor boundaries, nor likely random draws (e.g. one specific 40-digit value, or
   |a| in 17..99 with a rare pattern) can still pass; review and QA are the backstop. The grid is exhaustive only for
   small integers and only for the functions defined in `oracles.py`.
+- **False rejections and failures of correct code (disclosed, round 8).** The allowlist and the oracle reject some
+  correct code; these are deliberate costs, not bugs:
+  - f-strings (`f"{a}"`), `str.format` and every method call on a value (`s.upper()`, `x.bit_length()`), plus
+    dict/set literals, comprehensions, classes, lambdas, `assert`, `try` and `is None`;
+  - `if __name__ == "__main__":` at module level (reads the dunder `__name__`; a module-level `if` is not
+    allowlisted). Not allowed even though the body would not run on import: excluding the body from the scan would
+    create an unscanned region, and scanning it would reject typical bodies (`print(...)`) anyway;
+  - `__all__` **is allowed since round 8**, but only as `__all__ = (...)` or `[...]` of string constants at module
+    level (it is never readable by the code: any load of `__all__` is still a dunder name and rejected; annotated,
+    augmented and chained forms are rejected; tested);
+  - recursion close to the limit: a correct `add` that always recurses about 990 deep fails, because the advisory
+    unittest child calls it from deeper in its stack (unittest's own frames); measured here: 985 passes, 990 fails
+    (`tests not passed`), 970 passes (tested). The oracle itself allows a top-level call up to the stock depth
+    (997 frames).
 - Residual (all layers): the pure-function rule applies to fixture profiles only. Real-repo profiles have no oracle
   (`cooperative`), so harness detection there is backstopped only by the required independent code review and QA.
 

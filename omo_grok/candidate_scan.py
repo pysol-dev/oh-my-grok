@@ -264,6 +264,13 @@ def _const_ok(v) -> bool:
     return v is None or type(v) in (int, float, str, bool)
 
 
+def _is_dunder_all(st) -> bool:
+    """Module-level `__all__ = (...)` / `[...]` whose elements are all str constants (round 8)."""
+    return isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name) and \
+        st.targets[0].id == "__all__" and isinstance(st.value, (ast.List, ast.Tuple)) and \
+        all(_is_str_const(e) for e in st.value.elts)
+
+
 def _allowlist_problems(tree, allow_imports, local_modules, rel, bad) -> None:
     """Accept ONLY: module docstring; `import m` / `from m import name` for allowlisted modules (names from
     PURE_MODULE_ATTRS) and relative imports of scanned local modules; module-level `NAME = <literal>`; top-level
@@ -316,8 +323,11 @@ def _allowlist_problems(tree, allow_imports, local_modules, rel, bad) -> None:
                         top.add(a.asname or a.name)  # resolution checked by the denylist layer
         elif isinstance(st, ast.FunctionDef):
             top.add(st.name)
-        elif isinstance(st, ast.Assign) and all(isinstance(t, ast.Name) for t in st.targets) and lit(st.value):
+        elif isinstance(st, ast.Assign) and all(isinstance(t, ast.Name) for t in st.targets) and lit(st.value) \
+                and not any(t.id.startswith("__") for t in st.targets):
             top.update(t.id for t in st.targets)
+        elif _is_dunder_all(st):
+            continue  # round 8: `__all__ = (...)` of str constants only; it is never readable by the code
         else:
             bad(st, f"[allowlist] module-level {type(st).__name__} not allowed")
 
@@ -544,6 +554,7 @@ def pure_module_problems(text: str, rel: str, allow_imports, local_modules=froze
                     f"not {type(st).__name__}")
 
     bound = _bound_names(tree)
+    all_targets = {id(st.targets[0]) for st in tree.body if _is_dunder_all(st)}
     for n in ast.walk(tree):
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             if n.name.startswith("__") and n.name not in PURE_ALLOWED_DUNDER_DEFS:
@@ -586,7 +597,7 @@ def pure_module_problems(text: str, rel: str, allow_imports, local_modules=froze
         elif isinstance(n, ast.Name) and n.id in PURE_FORBIDDEN_NAMES:
             bad(n, f"{n.id} is not allowed in pure modules (hash-seed or identity dependent)")
         elif isinstance(n, ast.Name):
-            if n.id.startswith("__"):
+            if n.id.startswith("__") and id(n) not in all_targets:
                 bad(n, f"dunder name {n.id}")
             elif isinstance(n.ctx, ast.Load) and n.id not in bound and n.id not in PURE_BUILTINS:
                 bad(n, f"name {n.id!r} is neither defined in the module nor an allowed pure builtin")

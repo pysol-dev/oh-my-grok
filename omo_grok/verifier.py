@@ -705,8 +705,12 @@ def run_oracle(prof, ctx: _Ctx) -> tuple[list[str], int, str]:
     errs: list[str] = []
     total = 0
     seen: dict[int, str] = {}
+    next_id = len(cases)
     for v in oracle_variants(prof, ctx, rng):
-        order = list(cases)
+        # shared cases (compared across runs) + this run's own fresh large-band cases (round 8; never reused)
+        own = oracles.run_cases(spec["name"], next_id)
+        next_id += len(own)
+        order = list(cases) + own
         rng.shuffle(order)
         w, matched, err, values = _oracle_session(ctx, v, order, mods)
         total += matched
@@ -716,6 +720,8 @@ def run_oracle(prof, ctx: _Ctx) -> tuple[list[str], int, str]:
             why += [f"{x} [run {v['name']}]" for x in w]
             break
         for cid, val in values.items():
+            if cid >= len(cases):
+                continue  # this run's own cases: checked against the oracle only
             if seen.setdefault(cid, val) != val:
                 why.append(f"result for case {cid} differs from an earlier run (environment-dependent "
                            f"behaviour) [run {v['name']}]")
@@ -843,7 +849,8 @@ def _run_python(prof, ctx: _Ctx, ph, eid) -> VerifyOutcome:
                                  prof["argv"], assurance)
         return VerifyOutcome("passed", 0, False, out, err,
                              f"assurance=oracle: {matched}/{matched} oracle cases (exhaustive small grid + boundaries, "
-                             f"positional/keyword/mixed calls, aliased equal arguments, bools, fresh random draws) "
+                             f"positional/keyword/mixed calls, aliased equal arguments, bools, fresh random draws incl. "
+                             f"{oracles.LARGE_PER_RUN} fresh large-magnitude draws per function per run) "
                              f"matched across {ORACLE_RUNS} varied neutral sandboxed runs with "
                              f"different memory limits (parent-computed, identical results); unittest child (advisory self-report) claims "
                              f"{len(prof['expected_tests'])} expected tests passed", ph, eid, prof["argv"], assurance)
