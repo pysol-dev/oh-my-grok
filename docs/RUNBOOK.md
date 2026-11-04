@@ -71,6 +71,29 @@ empty, scheme http/https/empty/other, host present, whether characters were remo
 Metis serves two roles (`metis`, then `qa-executor`) and Momus two (`momus`, then `code-reviewer`); each has its
 own routine (`omo-bus-<role>`) with its own URL and key, so run `hook set` once per role.
 
+**Browser form (when terminal paste delivers nothing):** some GUI paste tools cannot type into a terminal
+(`hook set` then sees length=0). Use the local-only masked form instead:
+
+```bash
+cd /workspace/omo && nohup ./omoctl hook serve > /tmp/omo_hook_serve.log 2>&1 &
+cat /tmp/omo_hook_form_url     # http://127.0.0.1:<random port>/setup/<one-time token>  (file mode 0600)
+```
+
+Open that URL in the box browser. There is one section per async role, in this order: explorer, librarian, metis,
+qa-executor (Metis), momus, code-reviewer (Momus), executor. Each section shows the bot, the routine and a
+"Configured already: yes/no" line, plus two masked fields (URL, key). Paste into the fields, leave both blank to
+skip a role, then press **Save**. The page reports configured / skipped / error per role, with the same safe
+diagnostics as `hook set` and never the values. You can resubmit as often as needed. **Finish** stops the server
+and deletes the URL file. It also exits by itself after 30 idle minutes (`--idle-minutes N`).
+How it is protected:
+- It binds to 127.0.0.1 only, on a random port (`--port`).
+- Every path except `/setup/<token>` returns 404.
+- A Host other than `127.0.0.1:<port>`, or a foreign Origin, gets 403 (DNS-rebinding guard).
+- Values travel only in the POST body (urlencoded, max 64 KB).
+- Request logging is off, and responses are no-store/no-referrer with a strict CSP.
+- Values pass through the same `sanitize_input` and `set_hook` validation as `hook set`, and are stored only
+  in `state/secrets/hooks.json` (0600).
+
 **Rotation:** rotate the key in the routine UI, then run `hook set ROLE` again, then
 `resume JOB` for any job blocked with `webhook key rejected`.
 

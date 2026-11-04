@@ -14,7 +14,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 OMOCTL = str(ROOT / "omoctl")
 DOCUMENTED = [["doctor"], ["migrate"], ["status"], ["submit"], ["plan", "show"], ["approve"], ["deny"], ["cancel"],
-              ["reconcile"], ["hook", "set"], ["hook", "check"], ["hook", "list"], ["test"], ["export"],
+              ["reconcile"], ["hook", "set"], ["hook", "check"], ["hook", "list"], ["hook", "serve"], ["test"], ["export"],
               ["resume"], ["backup"], ["restore"], ["roles", "list"], ["roles", "bind"], ["roles", "import"]]
 
 
