@@ -105,17 +105,17 @@ These live in `config/verifiers.json`. Each profile has these fields:
 | `timeout_seconds` | run time limit |
 | `protected_paths` | paths the Executor must not change relative to base |
 | `editable_paths` | allowlist: the ONLY paths the Executor may add, change, delete or rename |
-| `runner` | `"omo-trusted-unittest"`, required for Python profiles; argv must then end with the absolute path of `omo_grok/trusted_runner.py` (no `-m`) |
-| `start_dir` | relative test discovery dir for the trusted runner (e.g. `tests`) |
+| `runner` | `"omo-unittest-child"`, required for Python profiles; argv must then end with the absolute path of `omo_grok/unittest_child.py` (no `-m`) |
+| `start_dir` | relative test discovery dir for the advisory unittest child (e.g. `tests`) |
 | `expected_tests` | non-empty unique list of test ids that must ALL run and pass (no extras, skips or failures) |
-| `type_checks` | optional `[{"call": "pkg.func", "args": [...], "type": "int", "expect": 5}]`, checked with `type(r) is T` and an exact value |
+| `oracle` | `{"name": "<key in omo_grok/oracles.py ORACLES>", "cases_per_function": 8..2000, "modules": [...]}`. **Required** for every profile named `fixture-*`. Without it a profile is `cooperative` (see below). `type_checks` was removed in T07 round 3 and is refused |
 | `source_extensions` | allowlist of file extensions the candidate may add or change (default `[".py"]`) |
 | `static_scan` | AST-scan rule overrides (`allow_imports`, `allow_attrs`, `allow_calls`, `forbid_imports`, `allow_dunder_overrides`, `allow_builtin_subclass`); cannot be disabled |
 | `exit_code_only` | required `true` for non-Python argv; the pass then rests on exit code alone (REDUCED assurance) |
 
 A profile whose argv or referenced script contains `OMO_VERIFY_TEMPLATE` is refused. So are:
 - a missing profile
-- a Python profile without `-I` or without the trusted runner and `expected_tests`
+- a Python profile without `-I` or without the unittest child and `expected_tests`, or a `fixture-*` profile without an `oracle`
 - a non-Python profile without `exit_code_only: true`
 
 Before running, the verifier diffs base..candidate (`--no-renames`, so renames count as delete+add) and rejects the
@@ -130,17 +130,20 @@ candidate without executing it when any changed path:
 - is a `__pycache__`/`.pyc`/`.pyo`/native file, a symlink, a submodule, has an extension outside `source_extensions`,
   is binary or not UTF-8, or (for `.py`) fails the static AST scan (see SECURITY.md).
 
-The trusted runner then decides the result:
-- exit 0
-- the nonce-bound result file outside the checkout
-- every expected test passed, with exact counts
-- no tamper
-- every type check ok
+The trusted parent (which never imports candidate code) then decides the result:
+- **oracle profiles** (assurance `oracle`): the oracle child must answer every fresh random case with a raw JSON value
+  that is `type(v) is int` and equal to the trusted oracle's answer, then exit 0. The advisory unittest child must also
+  report a clean run; its report can only add failures, never make a run pass.
+- **profiles without an oracle** (assurance `cooperative`): the unittest child's report decides, but a candidate can
+  forge it. The detail line says so, the record stores `assurance=cooperative`, and the final gate requires an accepted
+  `code_review` and `qa` on the same revision.
+- exit-code-only profiles are `cooperative` too.
 
 See SECURITY.md for what this does and does not prove.
 
-The run itself uses `-I` plus `PYTHONSAFEPATH=1` and `PYTHONNOUSERSITE=1`, so even an unrecognised shadow cannot replace
-the stdlib runner. A missing base revision fails closed.
+Both children run with `-I -B`, a scrubbed environment (no `OMO_*`, nothing secret in env, argv or fds) plus
+`PYTHONSAFEPATH=1` and `PYTHONNOUSERSITE=1`. Migration v3 adds `verifications.assurance` (auto-applied with a backup on
+the next open). A missing base revision fails closed.
 `./omoctl doctor` lists the usable profiles.
 
 ## 10. Backups and migrations

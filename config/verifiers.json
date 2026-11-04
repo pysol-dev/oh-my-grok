@@ -1,13 +1,13 @@
 {
-  "_comment": "Verifier profiles. argv runs with shell=False in a temporary detached checkout of the EXACT revision, sanitized env, PYTHONDONTWRITEBYTECODE, any __pycache__/*.pyc purged and -X pycache_prefix=<private dir>. Python profiles must use the TRUSTED runner (omo_grok/trusted_runner.py, outside the candidate tree, run with -I): it runs the suite, snapshots test machinery/builtins against tampering and writes a nonce-bound JSON result outside the checkout; a pass needs exit 0 AND the result AND every expected_tests id passed AND exact counts AND type_checks. Before running, the candidate diff is rejected for: protected_paths, paths outside editable_paths, hook files, top-level stdlib/verifier shadowing, non-source/bytecode/binary/symlink files (source_extensions allowlist) and static_scan AST findings (allow/forbid lists; scanning cannot be disabled). Non-python profiles need exit_code_only: true (reduced assurance). OMO_VERIFY_TEMPLATE anywhere fails closed.",
+  "_comment": "Verifier profiles. The verifier parent never imports candidate code. It checks out the EXACT revision privately, rejects the diff statically (protected/editable paths, hook files, stdlib/verifier shadowing, non-source/bytecode/binary/symlink files, non-UTF-8 encodings and the static_scan AST tripwire), purges bytecode, and spawns UNTRUSTED children with -I, -B, a throwaway pycache_prefix and a scrubbed env (no secret, nonce or result path anywhere in a process that imports candidate code). oracle profiles (required for fixture-*): the parent sends fresh random inputs one at a time to oracle_child.py and recomputes every expected value from omo_grok/oracles.py (assurance=oracle). The unittest_child.py run of expected_tests is advisory: a negative report fails, a positive one proves nothing alone. Profiles without an oracle are assurance=cooperative (forgeable by adversarial code; independent code_review and qa on the same revision are required). Non-python profiles need exit_code_only: true. OMO_VERIFY_TEMPLATE anywhere fails closed.",
   "profiles": {
     "fixture-calc-unittest": {
-      "runner": "omo-trusted-unittest",
+      "runner": "omo-unittest-child",
       "argv": [
         "/workspace/omo/.venv/bin/python",
         "-I",
         "-B",
-        "/workspace/omo/omo_grok/trusted_runner.py"
+        "/workspace/omo/omo_grok/unittest_child.py"
       ],
       "cwd": ".",
       "env_allow": [],
@@ -16,35 +16,6 @@
       "expected_tests": [
         "tests.test_calc.CalcTest.test_add",
         "tests.test_calc.CalcTest.test_mul"
-      ],
-      "type_checks": [
-        {
-          "call": "calc.add",
-          "args": [
-            2,
-            3
-          ],
-          "type": "int",
-          "expect": 5
-        },
-        {
-          "call": "calc.add",
-          "args": [
-            -4,
-            10
-          ],
-          "type": "int",
-          "expect": 6
-        },
-        {
-          "call": "calc.mul",
-          "args": [
-            3,
-            4
-          ],
-          "type": "int",
-          "expect": 12
-        }
       ],
       "protected_paths": [
         "tests/"
@@ -55,7 +26,14 @@
       "source_extensions": [
         ".py"
       ],
-      "static_scan": {}
+      "static_scan": {},
+      "oracle": {
+        "name": "calc-arith",
+        "cases_per_function": 48,
+        "modules": [
+          "calc"
+        ]
+      }
     },
     "example-template-do-not-use": {
       "argv": [

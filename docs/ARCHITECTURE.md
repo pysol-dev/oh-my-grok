@@ -31,7 +31,9 @@ user ─chat─▶ Hephaestus ─MCP─▶ omo engine ◀─MCP── role routi
 | `artifacts.py` | Immutable, content-addressed artifact files. Path-traversal and symlink checks. sha256 verified on read |
 | `schemas.py` | Strict per-kind result schemas and the `blocked` / `not_applicable` alternatives |
 | `verifier.py` | Deterministic verifier profiles (argv, no shell, isolated `-I` interpreter, env allowlist, timeout, protected + editable paths, pre-run rejection of shadowing modules and interpreter/test hooks). Template, missing or non-isolated profiles fail closed |
-| `trusted_runner.py` | Standalone stdlib-only test runner executed by the verifier with `-I`, outside the candidate tree: runs the expected test manifest, snapshots test machinery/builtins against tampering, runs type checks, writes a nonce-bound JSON result to a private dir |
+| `oracles.py` | Trusted oracles (e.g. `calc-arith`): fresh SystemRandom inputs, expected values, strict `type(v) is int` checks. Lives in the trusted tree, never in the candidate |
+| `oracle_child.py` | Untrusted probe child: imports the candidate under `-I`, answers one oracle request at a time over stdin/stdout with raw JSON values. Its claims are never trusted |
+| `unittest_child.py` | Untrusted advisory child: runs the expected test manifest and prints one `OMO-UNITTEST-REPORT` line. The report can only add failures |
 | `candidate_scan.py` | Static AST tripwire over changed editable `.py` files (forbidden imports/attrs/calls, introspection, dunder overrides, builtin subclasses); per-profile allow/forbid lists; fail closed |
 | `gitops.py` | Per-job worktree and branch (`omo/<job-id-prefix>`). Repo hooks are disabled. No reset, clean, force or push |
 | `fixture.py` | Synthetic `calc` fixture repo: a failing test, a real fix, and a fake "fix" that edits tests or prints PASS |

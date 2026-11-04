@@ -248,14 +248,14 @@ def test_momus_attacks_fail_full_verifier(tmp_path, name):
     assert "candidate rejected before running" in o.detail  # static layer catches every one of them
 
 
-RUNTIME_EXPECT = {"G_bytecode": "tests not passed", "D_exit_at_import": "no trusted result file",
-                  "D_exit_in_call": "no trusted result file", "E_patch_assert": "tampered",
-                  "E_patch_via_setattr": "tampered", "F_int_subclass": "type checks failed"}
+RUNTIME_EXPECT = {"G_bytecode": "ORACLE: oracle case", "D_exit_at_import": "ORACLE: oracle child exited",
+                  "D_exit_in_call": "ORACLE: oracle child exited", "E_patch_assert": "ORACLE: oracle case",
+                  "E_patch_via_setattr": "ORACLE: oracle case", "F_int_subclass": "ORACLE: oracle case"}
 
 
 @pytest.mark.parametrize("name", sorted(MOMUS_ATTACKS))
 def test_momus_attacks_fail_runtime_layer_alone(tmp_path, monkeypatch, name):
-    """Defence in depth: with ALL static checks disabled, the trusted runner still fails each attack."""
+    """Defence in depth: with ALL static checks disabled, the runtime (oracle/unittest children) still fails each attack."""
     monkeypatch.setattr(verifier, "scope_problems", lambda *a, **k: [])
     repo, base = _repo(tmp_path)
     sha = MOMUS_ATTACKS[name](repo)
@@ -264,18 +264,17 @@ def test_momus_attacks_fail_runtime_layer_alone(tmp_path, monkeypatch, name):
     assert RUNTIME_EXPECT[name] in o.detail, (name, o.detail)
 
 
-def test_forged_result_without_nonce_fails():
+def test_advisory_unittest_report_is_evaluated_strictly():
     prof = dict(PROF)
-    good = {"stage": "done", "tamper": [], "load_errors": [], "type_checks": [{"ok": True}] * 3,
-            "tests": {t: "passed" for t in prof["expected_tests"]},
-            "counts": {"run": 2, "started": 2, "failures": 0, "errors": 0, "skipped": 0, "expected_failures": 0,
+    n = len(prof["expected_tests"])
+    good = {"stage": "done", "tamper": [], "load_errors": [], "tests": {t: "passed" for t in prof["expected_tests"]},
+            "counts": {"run": n, "started": n, "failures": 0, "errors": 0, "skipped": 0, "expected_failures": 0,
                        "unexpected_successes": 0}}
-    assert verifier.evaluate_result(dict(good, nonce="n" * 64), "n" * 64, 0, prof) == []
-    assert verifier.evaluate_result(dict(good, nonce="x" * 64), "n" * 64, 0, prof)
-    assert verifier.evaluate_result(good, "n" * 64, 0, prof)
-    assert verifier.evaluate_result(dict(good, nonce="n" * 64), "n" * 64, 1, prof)
-    one = dict(good, nonce="n" * 64, tests={prof["expected_tests"][0]: "passed"})
-    assert any("not run" in w for w in verifier.evaluate_result(one, "n" * 64, 0, prof))
+    assert verifier.evaluate_report(good, 0, prof) == []
+    assert verifier.evaluate_report(good, 1, prof)
+    assert verifier.evaluate_report(None, 0, prof)
+    one = dict(good, tests={prof["expected_tests"][0]: "passed"})
+    assert any("not run" in w for w in verifier.evaluate_report(one, 0, prof))
 
 
 @pytest.mark.parametrize("files", [
@@ -301,9 +300,175 @@ def test_symlink_and_binary_source_rejected(tmp_path):
     assert o.status == "failed" and "symlink" in o.detail and "binary" in o.detail
 
 
-def test_profile_without_trusted_runner_is_refused():
+def test_profile_without_unittest_child_is_refused():
     p = dict(PROF, argv=OLD_ISOLATED)
     p.pop("runner")
     assert any("trusted" in x or "runner" in x for x in validate_profile("x", p))
     assert any("disabled" in x for x in validate_profile("x", dict(PROF, static_scan={"enabled": False})))
     assert any("expected_tests" in x for x in validate_profile("x", dict(PROF, expected_tests=[])))
+
+
+# ---------------------------------------------------------------- Momus round 3: N1/N2 stack climbing, N3 encoding
+_FORGE_BODY = """
+    g = getattr  # every introspection name is built at runtime, as in Momus's reproduction
+    while f is not None:
+        loc = g(f, 'f_' + 'locals')
+        if 'nonce' in loc and 'result_path' in loc:  # the round-2 runner frame: forge a perfect signed result
+            spec = loc.get('spec') or {}
+            tests = {t: 'passed' for t in spec.get('expected_tests', [])}
+            n = len(tests)
+            g(f, 'f_' + 'globals')['write_result'](loc['result_path'], loc['nonce'], {
+                'stage': 'done', 'tamper': [], 'load_errors': [], 'tests': tests,
+                'counts': {'run': n, 'started': n, 'failures': 0, 'errors': 0, 'skipped': 0,
+                           'expected_failures': 0, 'unexpected_successes': 0},
+                'type_checks': [{'ok': True}] * len(spec.get('type_checks', []))})
+            break
+        f = g(f, 'f_' + 'back')
+    print('VERIFIED', flush=True)
+    import os as _o
+    g(_o, '_' + 'exit')(0)
+
+
+_forge()
+"""
+N1_SRC = """
+
+def _forge():
+    try:
+        raise ValueError
+    except ValueError as e:
+        tb = getattr(e, '__trace' + 'back__')
+    f = getattr(tb, 'tb_' + 'frame')
+""" + _FORGE_BODY
+N2_SRC = """
+import os
+
+
+def _forge():
+    f = os.sys._getframe(0)
+""" + _FORGE_BODY
+
+
+def attack_n1_traceback_frames(repo):
+    _write_calc(repo, (repo / "calc" / "__init__.py").read_text() + N1_SRC)
+    return fx.commit_all(repo, "attack N1: climb traceback frames to the runner and forge its result")
+
+
+def attack_n2_getframe(repo):
+    _write_calc(repo, (repo / "calc" / "__init__.py").read_text() + N2_SRC)
+    return fx.commit_all(repo, "attack N2: os.sys._getframe to the runner and forge its result")
+
+
+def attack_n3_unicode_escape(repo):
+    # Under UTF-8 the payload is inside a comment; under the declared unicode_escape codec the literal backslash-n
+    # sequences become newlines and it executes.
+    src = (repo / "calc" / "__init__.py").read_text()
+    # the hidden payload is the full N1 forger, written as ONE comment line with literal backslash-n separators
+    payload = "# harmless note \\n" + N1_SRC.strip("\n").replace("\n", "\\n") + "\n"
+    (repo / "calc" / "__init__.py").write_bytes(("# -*- coding: unicode_escape -*-\n" + src + payload).encode())
+    return fx.commit_all(repo, "attack N3: unicode_escape coding cookie hides the payload")
+
+
+N_ATTACKS = {"N1_traceback_frames": attack_n1_traceback_frames, "N2_getframe": attack_n2_getframe,
+             "N3_unicode_escape": attack_n3_unicode_escape}
+
+
+def test_n3_payload_really_executes_under_its_cookie(tmp_path):
+    """Prove N3 is real: python honours the cookie and runs the hidden os._exit(0) (exit 0, 'VERIFIED')."""
+    import subprocess
+    repo, base = _repo(tmp_path)
+    sha = attack_n3_unicode_escape(repo)
+    wt = tmp_path / "n3"
+    gitops.git(["worktree", "add", "-q", "--detach", str(wt), sha], repo)
+    r = subprocess.run(["/workspace/omo/.venv/bin/python", "-I", "-c", "import sys; sys.path.insert(0, '.'); "
+                        "import calc; print('NOT REACHED')"], cwd=wt, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0 and "VERIFIED" in r.stdout and "NOT REACHED" not in r.stdout
+    # and the UTF-8 view the old scan saw contained no code at all after the original module
+    assert "'exit')(0)" in (wt / "calc" / "__init__.py").read_text().splitlines()[-1]
+
+
+@pytest.mark.parametrize("name", sorted(N_ATTACKS))
+def test_n_attacks_fail_full_verifier(tmp_path, name):
+    repo, base = _repo(tmp_path)
+    sha = N_ATTACKS[name](repo)
+    o = verifier.run(repo, sha, "p", dict(PROF, protected_base=base), tmp_path / "w")
+    assert o.status == "failed" and "candidate rejected before running" in o.detail, (name, o.detail)
+
+
+@pytest.mark.parametrize("name", sorted(N_ATTACKS))
+def test_n_attacks_fail_with_static_scan_disabled(tmp_path, monkeypatch, name):
+    """Architecture, not tripwire: with every static check off, no process that imports candidate code holds a
+    nonce, result path or result writer, and the parent's oracle decides."""
+    monkeypatch.setattr(verifier, "scope_problems", lambda *a, **k: [])
+    repo, base = _repo(tmp_path)
+    sha = N_ATTACKS[name](repo)
+    o = verifier.run(repo, sha, "p", dict(PROF, protected_base=base), tmp_path / "w")
+    assert o.status == "failed" and "ORACLE: oracle child exited" in o.detail, (name, o.detail)
+
+
+def test_no_secret_reaches_candidate_processes(tmp_path, monkeypatch):
+    """The children get a scrubbed env (no OMO_* at all), no extra fds, and argv carries no secret."""
+    monkeypatch.setattr(verifier, "scope_problems", lambda *a, **k: [])
+    repo, base = _repo(tmp_path)
+    probe = ("\nimport os as _o\n_e = sorted(k for k in _o.environ if 'OMO' in k or 'VERIFY' in k)\n"
+             "_f = sorted(int(x) for x in _o.listdir('/proc/self/fd'))\n"
+             "print('PROBE', _e, _f, flush=True)\n")
+    _write_calc(repo, (repo / "calc" / "__init__.py").read_text().replace(fx.FIX_FROM, fx.FIX_TO) + probe)
+    sha = fx.commit_all(repo, "probe environment")
+    o = verifier.run(repo, sha, "p", dict(PROF, protected_base=base), tmp_path / "w")
+    probes = [ln for ln in o.stderr.splitlines() if ln.startswith("PROBE")]
+    assert probes and all(ln.startswith("PROBE [] ") for ln in probes), probes
+    for ln in probes:  # stdin/stdout/stderr, the dup'd report/protocol channel and listdir's own fd only
+        assert len(eval(ln.split("] ", 1)[1])) <= 5, ln
+    assert o.status == "passed"
+
+
+ORACLE_VARIANTS = {
+    "exit0_early": "import os\nos._exit(0)\n",
+    "printing_VERIFIED": "print('VERIFIED')\nprint('OK')\nimport sys\nsys.exit(0)\n",
+    "forged_stdout": ("import os, json\n_m = [json.dumps({'ready': True})] + "
+                      "[json.dumps({'id': i, 'value': 5}) for i in range(200)] + [json.dumps({'end': True})]\n"
+                      "for _fd in range(1, 20):\n    try:\n        os.write(_fd, ('\\n'.join(_m) + '\\n').encode())\n"
+                      "    except OSError:\n        pass\nprint('VERIFIED')\nos._exit(0)\n"),
+    "always_equal_object": ("class _Eq:\n    def __eq__(self, o):\n        return True\n    __hash__ = None\n\n\n"
+                            "def add(a, b):\n    return _Eq()\n"),
+    "always_equal_int": ("class _Eq(int):\n    def __eq__(self, o):\n        return True\n    __hash__ = int.__hash__\n"
+                         "\n\ndef add(a, b):\n    return _Eq(5)\n"),
+    "constant_answer": "def add(a, b):\n    return 5\n",
+}
+
+
+@pytest.mark.parametrize("name", sorted(ORACLE_VARIANTS))
+def test_oracle_catches_forgery_variants_with_scan_disabled(tmp_path, monkeypatch, name):
+    monkeypatch.setattr(verifier, "scope_problems", lambda *a, **k: [])
+    repo, base = _repo(tmp_path)
+    _write_calc(repo, (repo / "calc" / "__init__.py").read_text() + "\n" + ORACLE_VARIANTS[name])
+    sha = fx.commit_all(repo, f"oracle variant {name}")
+    o = verifier.run(repo, sha, "p", dict(PROF, protected_base=base), tmp_path / "w")
+    assert o.status == "failed" and "ORACLE:" in o.detail, (name, o.detail)
+
+
+def test_oracle_inputs_are_fresh_per_run():
+    from omo_grok import oracles
+    a = oracles.cases("calc-arith", 16)
+    b = oracles.cases("calc-arith", 16)
+    assert [c["args"] for c in a] != [c["args"] for c in b]
+    assert all(oracles.check_value(c, c["expect"]) for c in a)
+    c0 = a[0]
+    assert not oracles.check_value(c0, True) and not oracles.check_value(c0, float(c0["expect"]))
+
+
+def test_fixture_profiles_require_oracle_and_report_assurance(tmp_path):
+    from omo_grok.config import profile_assurance
+    p = dict(PROF)
+    p.pop("oracle")
+    assert any("oracle" in x for x in validate_profile("fixture-x", p))
+    assert validate_profile("realrepo-x", p) == [] and profile_assurance(p) == "cooperative"
+    assert profile_assurance(PROF) == "oracle"
+    assert any("type_checks" in x for x in validate_profile("x", dict(PROF, type_checks=[])))
+    repo, base = _repo(tmp_path)
+    sha = fx.apply_real_fix(repo)
+    coop = verifier.run(repo, sha, "p", dict(p, protected_base=base), tmp_path / "w")
+    assert coop.status == "passed" and coop.assurance == "cooperative" and "forgeable" in coop.detail
+    full = verifier.run(repo, sha, "p", dict(PROF, protected_base=base), tmp_path / "w2")
+    assert full.status == "passed" and full.assurance == "oracle"

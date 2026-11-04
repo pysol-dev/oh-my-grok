@@ -15,7 +15,8 @@ from typing import Callable
 from . import artifacts as art
 from . import db, gitops, verifier
 from . import fixture as fx
-from .config import canonical_json, load_policy, load_verifier_profiles, profile_hash, sha256_text
+from .config import (canonical_json, load_policy, load_verifier_profiles, profile_assurance, profile_hash,
+                     sha256_text)
 from .errors import Conflict, GateRefused, IntegrityError_, NotFound, OmoError, ValidationError
 from .hooks import hook_status, load_hooks
 from .paths import Paths, get_paths
@@ -331,6 +332,9 @@ class Engine:
         if verifier_profile is not None:
             if not isinstance(verifier_profile, str) or verifier_profile not in self.profiles:
                 raise ValidationError("unknown verifier_profile", known=sorted(self.profiles))
+            if mode == "fixture" and profile_assurance(self.profiles[verifier_profile]) != "oracle":
+                raise ValidationError("fixture jobs require an oracle verifier profile (a fixture verifier that "
+                                      "cannot be faked)")
         policies = {}
         if max_repair_cycles is not None:
             if not (1 <= int(max_repair_cycles) <= 10):
@@ -1114,13 +1118,14 @@ class Engine:
         so = self._engine_artifact(job_id, f"engine/verify/{vid}/stdout.txt", out.stdout, "verifier_stdout", task_id)
         se = self._engine_artifact(job_id, f"engine/verify/{vid}/stderr.txt", out.stderr, "verifier_stderr", task_id)
         self.conn.execute("UPDATE verifications SET status=?, exit_code=?, timed_out=?, stdout_artifact_id=?, "
-                          "stderr_artifact_id=?, detail=?, env_identity=?, ended_at=? WHERE id=?",
+                          "stderr_artifact_id=?, detail=?, env_identity=?, assurance=?, ended_at=? WHERE id=?",
                           (out.status, out.exit_code, int(out.timed_out), so, se, redact(out.detail)[:1000],
-                           out.env_identity, db.utcnow(), vid))
+                           out.env_identity, out.assurance, db.utcnow(), vid))
         self._ev("verification", job_id, task_id, "verifier", verification_id=vid, status=out.status,
                  exit_code=out.exit_code, detail=out.detail[:300])
         return {"verification_id": vid, "status": out.status, "exit_code": out.exit_code, "detail": out.detail,
-                "timed_out": out.timed_out, "artifact_ids": [so, se], "profile_hash": out.profile_hash}
+                "timed_out": out.timed_out, "artifact_ids": [so, se], "profile_hash": out.profile_hash,
+                "assurance": out.assurance}
 
     # ------------------------------------------------------------------ approval
     PLAN_BOUND_KINDS = ("implement", "code_review", "qa", "integrate")
@@ -1310,6 +1315,8 @@ class Engine:
         fv_ok = final_verification and final_verification["status"] == "passed"
         chk("final_verification_passed_on_exact_revision", fv_ok,
             final_verification and final_verification.get("detail", ""))
+        v_assurance = (final_verification or {}).get("assurance", "none")
+        chk("verifier_assurance_recorded", v_assurance in ("oracle", "cooperative"), v_assurance)
         for typ in ("code", "qa"):
             r = sha and self._one("SELECT verdict FROM reviews WHERE job_id=? AND type=? AND revision=? AND "
                                   "invalidated=0 ORDER BY created_at DESC LIMIT 1", (job_id, typ, sha))
@@ -1335,7 +1342,10 @@ class Engine:
             (ap is not None and json.loads(ap["scope_json"]).get("accept_reduced_assurance"))
         chk("independence", ind["level"] == "separate_bots_same_account" or reduced_ok or
             not pol["require_independent_assurance"], _j(ind["problems"]))
-        assurance = ind["level"]
+        assurance = ind["level"] + f"+verifier_{v_assurance}"
+        if v_assurance == "cooperative":  # forgeable verifier: the independent review/QA pair is the real backstop
+            chk("cooperative_verifier_backed_by_code_review_and_qa",
+                c["code_review_accepts_exact_revision"]["ok"] and c["qa_review_accepts_exact_revision"]["ok"])
         if ap and ap["mode"] == "synthetic_fixture":
             assurance += "+synthetic_approval"
         elif ap:
@@ -1539,7 +1549,7 @@ class Engine:
                                      "dispatch": d and dict(d, last_error=d["last_error"] and
                                                              redact_urls(d["last_error"]))})
             out["verifications"] = [dict(v) for v in self._all(
-                "SELECT id,purpose,revision,status,exit_code,detail,started_at FROM verifications WHERE job_id=? "
+                "SELECT id,purpose,revision,status,assurance,exit_code,detail,started_at FROM verifications WHERE job_id=? "
                 "ORDER BY started_at", (job["id"],))]
             out["gates"] = [dict(g, checks=_l(g["checks_json"])) for g in self._all(
                 "SELECT id,revision,passed,assurance,checks_json,created_at FROM gate_results WHERE job_id=?",

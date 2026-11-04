@@ -257,6 +257,9 @@ CREATE TABLE gate_results (
 CREATE INDEX outbox_task ON dispatch_outbox(task_id);
 CREATE INDEX attempts_task ON task_attempts(task_id);
 """),
+    (3, "verification_assurance", """
+ALTER TABLE verifications ADD COLUMN assurance TEXT NOT NULL DEFAULT 'none';
+"""),
 ]
 
 LATEST_VERSION = MIGRATIONS[-1][0]

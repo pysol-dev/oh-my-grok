@@ -28,8 +28,9 @@ DEFAULT_POLICY = {
 }
 
 TEMPLATE_MARKER = "OMO_VERIFY_TEMPLATE"
-RUNNER_NAME = "omo-trusted-unittest"
-TRUSTED_RUNNER = Path(__file__).resolve().parent / "trusted_runner.py"
+RUNNER_NAME = "omo-unittest-child"
+UNITTEST_CHILD = Path(__file__).resolve().parent / "unittest_child.py"   # untrusted child: advisory self-report
+ORACLE_CHILD = Path(__file__).resolve().parent / "oracle_child.py"       # untrusted child: raw values only
 
 
 def canonical_json(obj) -> str:
@@ -65,6 +66,33 @@ def load_verifier_profiles(config_dir: Path) -> dict:
 REQUIRED_PROFILE_KEYS = {"argv": list, "cwd": str, "env_allow": list, "timeout_seconds": (int, float)}
 
 
+def _oracle_problems(name: str, prof: dict) -> list[str]:
+    from .oracles import ORACLES
+    o = prof.get("oracle")
+    if o is None:
+        if name.startswith("fixture-"):
+            return ["python fixture profiles must use an oracle (spec section 9: a fixture verifier that cannot be "
+                    "faked)"]
+        return []
+    out = []
+    if not isinstance(o, dict) or o.get("name") not in ORACLES:
+        return [f"oracle must be {{'name': one of {sorted(ORACLES)}, ...}}"]
+    n = o.get("cases_per_function", 48)
+    if not isinstance(n, int) or isinstance(n, bool) or not 8 <= n <= 2000:
+        out.append("oracle.cases_per_function must be an int in 8..2000")
+    mods = sorted({fn.call.rsplit(".", 1)[0] for fn in ORACLES[o["name"]]})
+    if o.get("modules", mods) != mods:
+        out.append(f"oracle.modules must be {mods} for oracle {o['name']!r}")
+    return out
+
+
+def profile_assurance(prof: dict) -> str:
+    """'oracle': the parent recomputed every value from fresh random inputs (decision does not trust the child).
+    'cooperative': the pass rests on a self-report/exit status from a process that ran candidate code; adversarial
+    candidate code can forge it, so independent code_review + qa on the same revision are the backstop."""
+    return "oracle" if prof.get("oracle") else "cooperative"
+
+
 def validate_profile(name: str, prof: dict) -> list[str]:
     """Return a list of problems; empty means structurally valid. Template marker fails closed."""
     problems = []
@@ -88,11 +116,11 @@ def validate_profile(name: str, prof: dict) -> list[str]:
             problems.append("python verifiers must run isolated: put -I before -m/script (no cwd/user-site/PYTHON* "
                             "on sys.path)")
     if prof.get("runner") is not None or is_python:
-        # exit status alone is not trusted for Python: the trusted runner must report per-test results
+        # exit status alone is not trusted for Python: the unittest child must report per-test results
         if prof.get("runner") != RUNNER_NAME:
             problems.append(f"python verifiers must use runner {RUNNER_NAME!r} (exit code alone is not trusted)")
-        elif not argv or argv[-1] != str(TRUSTED_RUNNER) or "-m" in argv:
-            problems.append(f"trusted-runner profiles must end argv with {TRUSTED_RUNNER} and must not use -m")
+        elif not argv or argv[-1] != str(UNITTEST_CHILD) or "-m" in argv:
+            problems.append(f"python profiles must end argv with {UNITTEST_CHILD} and must not use -m")
         tests = prof.get("expected_tests")
         if not isinstance(tests, list) or not tests or not all(isinstance(t, str) and t for t in tests):
             problems.append("expected_tests must be a non-empty list of test ids")
@@ -101,12 +129,10 @@ def validate_profile(name: str, prof: dict) -> list[str]:
         if not isinstance(prof.get("start_dir"), str) or ".." in Path(prof.get("start_dir", "")).parts:
             problems.append("start_dir must be a relative path")
         if not isinstance(prof.get("editable_paths"), list) or not prof.get("editable_paths"):
-            problems.append("trusted-runner profiles must declare editable_paths")
-        for chk in prof.get("type_checks", []):
-            if not (isinstance(chk, dict) and isinstance(chk.get("call"), str) and "." in chk["call"]
-                    and chk.get("type") in ("int", "float", "str", "bool", "list", "tuple", "dict", "bytes",
-                                            "NoneType")):
-                problems.append(f"invalid type check {chk!r}")
+            problems.append("python profiles must declare editable_paths")
+        if "type_checks" in prof:
+            problems.append("type_checks (in-process self-report) were removed; use an oracle profile")
+        problems += _oracle_problems(name, prof)
     elif prof.get("exit_code_only") is not True:
         problems.append("non-python profiles must set exit_code_only: true to accept exit-status-only (reduced) "
                         "assurance")

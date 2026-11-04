@@ -60,3 +60,52 @@ def test_rules_are_configurable_but_fail_closed_by_default():
     assert scan_source("import json\n", "calc/x.py", {"forbid_imports": ["json"]})
     eq = BAD["eq_override"]
     assert scan_source(eq, "calc/x.py", {"allow_dunder_overrides": ["__eq__"]}) == []
+
+
+ROUND3_BAD = {
+    "getattr_nonliteral": "def f(tb):\n    return getattr(tb, 'tb_' + 'frame')\n",
+    "getattr_var": "def f(o, n):\n    return getattr(o, n)\n",
+    "getattr_literal_frame": "def f(tb):\n    return getattr(tb, 'tb_frame')\n",
+    "getattr_literal_dunder": "def f(o):\n    return getattr(o, '__dict__')\n",
+    "hasattr_nonliteral": "def f(o, n):\n    return hasattr(o, n)\n",
+    "traceback_attr": "try:\n    1 / 0\nexcept Exception as e:\n    t = e.__traceback__\n",
+    "os_sys_getframe": "import os\nf = os.sys._getframe(0)\n",
+    "os_sys_chain": "import os\nm = os.sys\n",
+    "os_path_os_sys": "import os\nm = os.path.os.sys.modules\n",
+    "alias_chain": "import os as q\nf = q.sys._getframe\n",
+    "from_os_import_sys": "from os import sys\n",
+    "current_frames": "import os\nx = os.sys._current_frames()\n",
+    "f_locals": "def f(fr):\n    return fr.f_locals\n",
+    "f_globals": "def f(fr):\n    return fr.f_globals\n",
+    "vars_call": "x = vars()\n",
+    "globals_call": "x = globals()\n",
+    "locals_call": "x = locals()\n",
+}
+
+
+@pytest.mark.parametrize("name", sorted(ROUND3_BAD))
+def test_round3_forbidden_constructs_rejected(name):
+    assert scan_source(ROUND3_BAD[name], "calc/__init__.py", {}), name
+
+
+def test_literal_getattr_of_ordinary_attribute_allowed():
+    assert scan_source("def f(o):\n    return getattr(o, 'value', 0)\n", "calc/x.py", {}) == []
+    assert scan_source("import os\np = os.path.join('a', 'b')\n", "calc/x.py", {}) == []
+
+
+@pytest.mark.parametrize("data,ok", [
+    (b"# -*- coding: unicode_escape -*-\nx = 1\n", False),
+    (b"# coding: latin-1\nx = 1\n", False),
+    (b"#!/usr/bin/env python\n# vim: set fileencoding=rot13 :\nx = 1\n", False),
+    (b"\xef\xbb\xbf# coding: latin-1\nx = 1\n", False),  # BOM / cookie mismatch
+    (b"\xff\xfex = 1\n", False),
+    (b"# coding: utf-8\nx = 1\n", True),
+    (b"# coding: utf8\nx = 1\n", True),
+    (b"\xef\xbb\xbfx = 1\n", True),
+    (b"x = '\xc3\xa9'\n", True),
+], ids=["unicode_escape", "latin1", "rot13_line2", "bom_mismatch", "invalid_utf8", "utf8_cookie", "utf8_alias",
+        "bom", "plain_utf8"])
+def test_source_decoded_exactly_as_the_importer_does(data, ok):
+    from omo_grok.verifier import decode_source
+    text, why = decode_source(data)
+    assert (why is None) == ok, why

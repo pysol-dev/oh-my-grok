@@ -1,4 +1,5 @@
 """Workflow invariants with simulated agents acting through the public Engine API (network mocked)."""
+import json
 from pathlib import Path
 
 import pytest
@@ -230,8 +231,12 @@ def test_item12_fake_fix_fails_and_missing_verifier_blocks(harness):
     _, _, res = harness.implement(job, fix=shadow)
     assert res["verification"]["status"] == "failed" and "shadowing" in res["verification"]["detail"]
     assert e.status(job)["repair_cycles"] == 2 and harness.task(job, "code_review") is None
-    # job without a usable verifier profile: blocked, not passed
-    j2 = harness.submit(verifier_profile="example-template-do-not-use")["job_id"]
+    # a fixture job cannot even be submitted with a non-oracle (here: template) profile
+    with pytest.raises(ValidationError):
+        harness.submit(verifier_profile="example-template-do-not-use")
+    # profile becomes unusable after submission (config edited to the template): blocked at runtime, not passed
+    j2 = harness.submit()["job_id"]
+    e.profiles["fixture-calc-unittest"] = e.profiles["example-template-do-not-use"]
     harness.to_approval(j2)
     harness.approve(j2)
     _, _, r2 = harness.implement(j2)
@@ -601,3 +606,36 @@ def test_submit_rejects_unknown_verifier_profile(harness):
     with pytest.raises(ValidationError):
         harness.submit(verifier_profile=["fixture-calc-unittest"])
     assert harness.submit(verifier_profile="fixture-calc-unittest")["created"]
+
+
+def test_verification_records_carry_assurance_and_gate_uses_it(harness):
+    e = harness.e
+    job, sha, _ = harness.full_fixture_job()
+    s = e.status(job)
+    assert s["phase"] == "done"
+    vs = s["verifications"]
+    assert vs and all(v["assurance"] == "oracle" for v in vs if v["status"] == "passed"), vs
+    g = e._one("SELECT * FROM gate_results WHERE job_id=? ORDER BY created_at DESC LIMIT 1", (job,))
+    assert g["passed"] == 1 and "+verifier_oracle" in g["assurance"]
+    checks = json.loads(g["checks_json"])
+    assert checks["verifier_assurance_recorded"]["ok"] and checks["verifier_assurance_recorded"]["detail"] == "oracle"
+
+
+def test_cooperative_verifier_requires_code_review_and_qa_on_same_revision(harness):
+    """A non-oracle (cooperative) final verification can never carry the gate alone."""
+    e = harness.e
+    job = harness.submit()["job_id"]
+    harness.approve(job, harness.to_approval(job))
+    _, sha, _ = harness.implement(job)
+    harness.review(job, "code_review")
+    harness.review(job, "qa")
+    fv = {"status": "passed", "detail": "x", "assurance": "cooperative"}
+    ok, checks, assurance = e.gate_checks(job, fv)
+    assert "+verifier_cooperative" in assurance and checks["cooperative_verifier_backed_by_code_review_and_qa"]["ok"]
+    from omo_grok import db
+    with db.tx(e.conn):
+        e.conn.execute("UPDATE reviews SET invalidated=1 WHERE job_id=? AND type='qa'", (job,))
+    ok, checks, _ = e.gate_checks(job, fv)
+    assert not ok and not checks["cooperative_verifier_backed_by_code_review_and_qa"]["ok"]
+    ok, checks, _ = e.gate_checks(job, {"status": "passed", "detail": "x"})  # no assurance recorded: refused
+    assert not ok and not checks["verifier_assurance_recorded"]["ok"]

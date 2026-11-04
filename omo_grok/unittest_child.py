@@ -1,21 +1,14 @@
-"""Trusted verifier runner. Lives in the orchestrator tree (never in the candidate checkout) and is started by
-verifier.py as `python -I -B -X pycache_prefix=<private> trusted_runner.py` with cwd = the candidate checkout.
+"""UNTRUSTED unittest child. Spawned by verifier.py as `python -I -B -X pycache_prefix=<tmp> unittest_child.py
+<start_dir>` with cwd = the candidate checkout and a scrubbed environment. It holds NO secret, nonce, result path or
+result writer: candidate code runs in this process, so everything it reports is a self-report that adversarial code
+can forge. The verifier treats the report as ADVISORY (a negative report fails the run; a positive one proves
+nothing on its own). For oracle profiles the trusted decision comes from the separate oracle probe; for
+non-oracle profiles the assurance level is 'cooperative'.
 
-Protocol (all channels are verifier-owned and outside the candidate tree):
-  OMO_VERIFY_NONCE_FD  inherited pipe fd carrying a per-run random nonce; read and closed BEFORE any candidate import
-  OMO_VERIFY_SPEC      JSON spec: start_dir, top_level_dir, expected_tests, type_checks
-  OMO_VERIFY_RESULT    path of the JSON result file to write (atomic)
-The verifier passes a candidate only if exit == 0 AND the result file exists AND carries the nonce AND every expected
-test id passed AND the counts match AND no tamper was detected. A candidate that calls os._exit(0) therefore yields
-no result file and fails.
-
-Tamper detection: identities of unittest assert*/run machinery, this runner's own result class, every builtin, key
-stdlib functions, sys.modules entries for the runner's dependencies, sys.meta_path/path_hooks and trace/profile hooks
-are snapshotted before the candidate is imported and compared after import and after the run.
-
-This raises the bar; it cannot make adversarial in-process code safe in general (see docs/SECURITY.md)."""
+The report is one line on the original stdout: `OMO-UNITTEST-REPORT {json}`. The tamper snapshot (identities of
+unittest machinery, builtins, key stdlib functions, import hooks; compared after import and after the run) is a cheap
+tripwire for accidental or naive patching, not a security boundary."""
 import builtins
-import io
 import json
 import operator
 import os
@@ -25,10 +18,8 @@ import unittest.case
 import unittest.result
 import unittest.suite
 
-_open, _dumps, _replace, _fsync, _exit, _isinstance, _type = (io.open, json.dumps, os.replace, os.fsync, os._exit,
-                                                               isinstance, type)
-_TYPES = {"int": int, "float": float, "str": str, "bool": bool, "list": list, "tuple": tuple, "dict": dict,
-          "bytes": bytes, "NoneType": type(None)}
+_dumps, _exit, _isinstance, _type = json.dumps, os._exit, isinstance, type
+REPORT_PREFIX = "OMO-UNITTEST-REPORT "
 
 
 class Recorder(unittest.TextTestResult):
@@ -81,12 +72,12 @@ class Recorder(unittest.TextTestResult):
 
 _CLASSES = (unittest.TestCase, unittest.TestResult, unittest.TextTestResult, unittest.TextTestRunner,
             unittest.TestSuite, unittest.suite.BaseTestSuite, unittest.TestLoader, Recorder)
-_MODULES = ("builtins", "io", "json", "operator", "os", "sys", "unittest", "unittest.case", "unittest.result",
+_MODULES = ("builtins", "json", "operator", "os", "sys", "unittest", "unittest.case", "unittest.result",
             "unittest.suite", "unittest.loader", "unittest.runner", "__main__")
 _FUNCS = {"os._exit": lambda: os._exit, "os.write": lambda: os.write, "os.open": lambda: os.open,
-          "os.replace": lambda: os.replace, "os.fsync": lambda: os.fsync, "os.kill": lambda: os.kill,
+          "os.kill": lambda: os.kill,
           "sys.exit": lambda: sys.exit, "json.dumps": lambda: json.dumps, "json.dump": lambda: json.dump,
-          "io.open": lambda: io.open, "operator.eq": lambda: operator.eq,
+          "operator.eq": lambda: operator.eq,
           "unittest.case.safe_repr": lambda: unittest.case.safe_repr,
           "unittest.main": lambda: unittest.main}
 
@@ -131,76 +122,51 @@ def changed(before, after):
     return sorted(k for k in keys if differs(k))
 
 
-def write_result(path, nonce, payload):
-    payload = dict(payload, nonce=nonce)
-    tmp = path + ".tmp"
-    with _open(tmp, "w") as fh:
-        fh.write(_dumps(payload, sort_keys=True))
-        fh.flush()
-        _fsync(fh.fileno())
-    _replace(tmp, path)
-
-
 def main():
-    fd = int(os.environ.pop("OMO_VERIFY_NONCE_FD"))
-    result_path = os.environ.pop("OMO_VERIFY_RESULT")
-    spec_path = os.environ.pop("OMO_VERIFY_SPEC")
-    with os.fdopen(fd, "r") as fh:
-        nonce = fh.read().strip()
-    with _open(spec_path) as fh:
-        spec = json.load(fh)
-    top = os.path.abspath(spec.get("top_level_dir", "."))
+    start_dir = sys.argv[1]
+    top = os.getcwd()
     sys.path.insert(0, top)
     sys.dont_write_bytecode = True
+    out = os.fdopen(os.dup(1), "w")  # report channel (untrusted anyway); candidate/test prints go to stderr
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
+
+    def report(payload, code):
+        out.write(REPORT_PREFIX + _dumps(payload, sort_keys=True) + "\n")
+        out.flush()
+        return code
+
     base = snapshot()
-    out = {"stage": "load", "tamper": [], "tests": {}, "counts": {}, "type_checks": [], "load_errors": []}
+    rep = {"stage": "load", "tamper": [], "tests": {}, "counts": {}, "load_errors": []}
     try:
-        suite = unittest.TestLoader().discover(os.path.join(top, spec["start_dir"]), top_level_dir=top)
+        suite = unittest.TestLoader().discover(os.path.join(top, start_dir), top_level_dir=top)
     except BaseException as e:  # noqa: BLE001 - any failure to load is a failed verification
-        out["load_errors"].append(f"{_type(e).__name__}: {e}"[:500])
-        write_result(result_path, nonce, out)
-        return 1
-    out["tamper"] = changed(base, snapshot())
-    if out["tamper"]:
-        out["stage"] = "after_import"
-        write_result(result_path, nonce, out)
-        return 1
-    out["stage"] = "run"
+        rep["load_errors"].append(f"{_type(e).__name__}: {e}"[:500])
+        return report(rep, 1)
+    rep["tamper"] = changed(base, snapshot())
+    if rep["tamper"]:
+        rep["stage"] = "after_import"
+        return report(rep, 1)
+    rep["stage"] = "run"
     runner = unittest.TextTestRunner(stream=sys.stderr, verbosity=2, resultclass=Recorder)
     try:
         res = runner.run(suite)
     except BaseException as e:  # noqa: BLE001
-        out["load_errors"].append(f"run aborted: {_type(e).__name__}: {e}"[:500])
-        write_result(result_path, nonce, out)
-        return 1
-    out["tamper"] = changed(base, snapshot())
+        rep["load_errors"].append(f"run aborted: {_type(e).__name__}: {e}"[:500])
+        return report(rep, 1)
+    rep["tamper"] = changed(base, snapshot())
     if not _isinstance(res, Recorder) or _type(res) is not Recorder:
-        out["tamper"].append("result object is not the trusted Recorder")
+        rep["tamper"].append("result object is not the Recorder")
     else:
-        out["tests"] = dict(res.outcomes)
-        out["counts"] = {"run": res.testsRun, "started": res.started, "failures": len(res.failures),
+        rep["tests"] = dict(res.outcomes)
+        rep["counts"] = {"run": res.testsRun, "started": res.started, "failures": len(res.failures),
                          "errors": len(res.errors), "skipped": len(res.skipped),
                          "expected_failures": len(res.expectedFailures),
                          "unexpected_successes": len(res.unexpectedSuccesses)}
-        out["load_errors"] = [t.id() for t, _ in res.errors if t.id().startswith("unittest.loader.")]
-    for chk in spec.get("type_checks", []):
-        rec = {"call": chk["call"], "ok": False}
-        try:
-            modname, fn = chk["call"].rsplit(".", 1)
-            r = getattr(sys.modules.get(modname) or __import__(modname, fromlist=[fn]), fn)(*chk.get("args", []))
-            want = _TYPES[chk["type"]]
-            rec["type"] = _type(r).__name__
-            rec["ok"] = _type(r) is want and ("expect" not in chk or operator.eq(r, chk["expect"]))
-            rec["ok"] = rec["ok"] is True
-        except BaseException as e:  # noqa: BLE001
-            rec["error"] = f"{_type(e).__name__}: {e}"[:300]
-        out["type_checks"].append(rec)
-    out["tamper"] += [t for t in changed(base, snapshot()) if t not in out["tamper"]]
-    out["stage"] = "done"
-    write_result(result_path, nonce, out)
-    ok = (not out["tamper"] and out["tests"] and all(v == "passed" for v in out["tests"].values())
-          and all(c["ok"] for c in out["type_checks"]))
-    return 0 if ok else 1
+        rep["load_errors"] = [t.id() for t, _ in res.errors if t.id().startswith("unittest.loader.")]
+    rep["stage"] = "done"
+    ok = not rep["tamper"] and rep["tests"] and all(v == "passed" for v in rep["tests"].values())
+    return report(rep, 0 if ok else 1)
 
 
 if __name__ == "__main__":

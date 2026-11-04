@@ -41,56 +41,57 @@ What the design does guarantee for cooperating agents:
     Separately, the private checkout has every `__pycache__` and `*.pyc` purged before the run. The run itself uses
     `-B`, `PYTHONDONTWRITEBYTECODE=1` and `-X pycache_prefix=<private dir>`, so a planted UNCHECKED_HASH `.pyc` is
     never loaded.
-  - **Exit code is not trusted (D).** Python profiles must use the trusted runner `omo_grok/trusted_runner.py`. It
-    lives outside the candidate tree and runs with `-I`. It loads the profile's `expected_tests` manifest and runs it.
-    It then writes a JSON result to a private 0700 directory outside the checkout. The result carries a per-run
-    256-bit nonce, which the runner gets over an inherited pipe fd (not the environment) and reads and closes
-    before any candidate import. A pass requires all of:
-    - exit 0
-    - the result file exists with the right nonce (constant-time compare)
-    - stage `done`, no load errors and no tamper
-    - every expected test id passed, with no extras
-    - exact counts (no failures, errors, skips, expected failures or unexpected successes)
-    - every `type_checks` entry ok
-
-    `os._exit(0)` at import or inside a call therefore fails: there is no result file.
-  - **Tamper snapshot (E).** Before importing tests, the runner snapshots the identity of:
-    - every attribute on the MRO of TestCase, TestResult, TextTestResult, TestSuite, TestLoader, the runner and its
-      result recorder
-    - every builtin
-    - key stdlib functions (`os._exit`, `os.write`, `json.dumps`, `operator.eq`, `unittest.main`, ...)
-    - the relevant `sys.modules` entries, `sys.meta_path`/`path_hooks`, trace/profile and except hooks
-
-    It re-checks them after import and after the run. Any change fails the run.
-  - **Static AST scan of every changed editable `.py` file (E).** Fail closed: a file that does not parse is
-    rejected. The scan rejects:
+  - **Round 3 architecture (after Momus attacks N1–N4).** The round-2 design ran a "trusted runner" inside the same
+    process as the candidate and trusted its nonce-bound result file. N1 (climbing traceback frames to the runner's
+    nonce, `result_path` and `write_result`) and N2 (the same via `os.sys._getframe`) forged that file; N3 hid the N1
+    payload behind a `# -*- coding: unicode_escape -*-` cookie; N4 read `OMO_VERIFY_RESULT`/`OMO_VERIFY_SPEC` from
+    `/proc/self/environ`. The design was replaced, not patched:
+    - **The parent verifier never imports candidate code.** Every candidate import happens in a child run with
+      `-I -B -X pycache_prefix=<private dir>` and a scrubbed environment (PATH, LC_ALL, HOME, the bytecode/site
+      switches and the profile's `env_allow`/`env_set`; no `OMO_*`). No nonce, result path or other secret is passed
+      in env, argv or fds, so there is nothing for N1/N2/N4 to steal. Everything a child says is untrusted.
+    - **ORACLE mode (assurance `oracle`).** `omo_grok/oracles.py` (trusted tree) generates fresh SystemRandom inputs
+      for every run (magnitudes up to ±2**200, shuffled). `omo_grok/oracle_child.py` imports the candidate and must
+      print `{"ready":true}`; the parent then sends **one** request at a time over stdin and generates the next only
+      after the answer arrives. Each answer must be a raw JSON value; the parent checks `type(v) is int` (bool and
+      float never pass) and equality with its own oracle value. The child must answer every case and exit 0. Exiting
+      early, printing `VERIFIED`, forging stdout, always-equal objects and constant answers all fail, with or
+      without the static scan (regression tests). An oracle is **required** for every `fixture-*` profile, at config
+      load and at submit.
+    - **Advisory unittest child.** `omo_grok/unittest_child.py` runs the `expected_tests` manifest in a separate
+      child and prints one `OMO-UNITTEST-REPORT` line. It still snapshots test machinery, builtins and key stdlib
+      functions as a tripwire (round-2 E). For oracle profiles the report is advisory: a missing or negative report
+      fails the run, but a positive report can never make it pass.
+    - **Cooperative assurance.** A Python profile without an oracle, and every `exit_code_only` profile, is
+      `cooperative`: its pass is forgeable by a malicious candidate. The detail line starts
+      `assurance=cooperative: ... forgeable`, every verification record stores `assurance`, and the final gate
+      requires `verifier_assurance_recorded` plus an accepted `code_review` **and** `qa` on the same revision
+      (`cooperative_verifier_backed_by_code_review_and_qa`). The gate's assurance string carries
+      `+verifier_<level>`.
+  - **Static AST scan of every changed editable `.py` file (tripwire, not a sandbox).** Fail closed: a file that does
+    not parse is rejected. Sources are decoded with `tokenize.detect_encoding`, and any coding cookie other than
+    UTF-8, or a BOM/cookie mismatch, is rejected (N3). The scan rejects:
     - `os._exit`, `sys.exit`, `SystemExit`, `exit`/`quit`
     - importing `unittest`, `builtins`, `importlib`, `ctypes`, `gc`, `inspect`, `sys`, `io`, `threading`,
-      `subprocess`, ...
+      `subprocess`, ..., and from-imports of forbidden modules or attributes
     - `__builtins__`, `sys.modules`, frame and introspection attributes (`__globals__`, `__code__`, `__class__`,
-      `__subclasses__`, `f_back`, ...)
-    - `setattr`/`delattr`, attribute or subscript assignment on imported modules
-    - `exec`/`eval`/`compile`/`__import__`/`open`
-    - `global`, star imports, metaclasses, subclassing builtins
-    - overriding comparison, hash, conversion and attribute dunders (`__eq__`, `__bool__`, `__index__`,
-      `__getattr__`, ...)
+      `__subclasses__`, `__traceback__`, `tb_frame`, `tb_next`, `f_back`, `f_locals`, `f_globals`, `f_trace`,
+      `_getframe`, `_current_frames`, `settrace`, ...)
+    - full attribute chains resolved through aliases: `os.sys._getframe` is "chained access to forbidden module
+      os.sys" (N2)
+    - `getattr`/`hasattr` with a non-literal name, or a literal forbidden/dunder name; any `setattr`/`delattr`
+    - attribute or subscript assignment on imported modules, `exec`/`eval`/`compile`/`__import__`/`open`
+    - `global`, star imports, metaclasses, subclassing builtins, overriding comparison, hash, conversion and
+      attribute dunders
 
-    Profiles may relax this with `static_scan` allow-lists (`allow_imports`, `allow_attrs`, `allow_calls`,
-    `allow_dunder_overrides`, `allow_builtin_subclass`) or tighten it (`forbid_imports`). They cannot disable it:
-    an `enabled` key is refused.
-  - **Residual risk (F) and the limit of this design.** An `int` subclass whose `__eq__` always returns True would
-    satisfy `assertEqual`. The cheap mitigations here:
-    - the scan rejects builtin subclasses and `__eq__` overrides
-    - the runner's `type_checks` require `type(calc.add(2, 3)) is int` and the exact value, compared with a
-      snapshotted `operator.eq`
-
-    **These are mitigations, not a proof.** A test-based verifier that executes adversarial code in its own process
-    cannot, in general, defeat that code. The static scan is a tripwire, not a sandbox: a sufficiently clever
-    candidate may find a construct it does not cover, and in-process code could in principle locate the nonce in
-    memory. The verifier proves only that the expected tests passed under these checks. The real backstop is the
-    independent `code_review` and `qa` tasks, which are bound to the same revision the verifier checked and must
-    both accept before integration. No claim is made that the verifier alone detects a malicious candidate.
-  - Non-Python profiles must declare `exit_code_only: true`. Their detail line says `REDUCED assurance`.
+    Profiles may relax this with `static_scan` allow-lists or tighten it (`forbid_imports`). They cannot disable it.
+  - **Residual risk, stated plainly.**
+    - The oracle is black-box testing. A candidate that senses the oracle harness and behaves correctly only there
+      cannot be detected by it. Code review and QA are the backstop.
+    - The oracle covers only the functions defined in `oracles.py` (today `calc.add`, `calc.mul` for `calc-arith`).
+    - Profiles for real repos without an oracle are `cooperative`: the verifier result is forgeable, and only the
+      required `code_review` + `qa` on the same revision stand behind it.
+    - The static scan is a tripwire and will not cover every construct.
 - Logs, status, exports, errors and CLI output pass through `redact.py`. `hook list` shows booleans only.
   Dispatch errors are scrubbed of the webhook URL/key at write time and every http(s) URL in them is cut to
   `scheme://host` (also on display), so status never shows a webhook URL even in a process that never loaded the hooks

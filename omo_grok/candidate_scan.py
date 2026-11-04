@@ -31,7 +31,10 @@ FORBIDDEN_DUNDER_ATTRS = {"__globals__", "__code__", "__closure__", "__subclasse
                           "__class__", "__dict__", "__builtins__", "__func__", "__self__", "__defaults__",
                           "__kwdefaults__", "__getattribute__", "__setattr__", "__delattr__", "__import__",
                           "__loader__", "__spec__", "f_back", "f_globals", "f_locals", "f_builtins", "tb_frame",
-                          "gi_frame", "cr_frame", "ag_frame", "f_code", "co_code", "__reduce__", "__reduce_ex__"}
+                          "gi_frame", "cr_frame", "ag_frame", "f_code", "co_code", "__reduce__", "__reduce_ex__",
+                          "__traceback__", "tb_next", "f_trace", "f_lineno", "gi_code", "cr_code", "_getframe",
+                          "_current_frames", "_current_exceptions", "settrace", "setprofile", "_exit", "__wrapped__",
+                          "__objclass__", "func_globals"}
 DEFAULT_DUNDER_OVERRIDES = {"__eq__", "__ne__", "__bool__", "__hash__", "__index__", "__int__", "__float__",
                             "__instancecheck__", "__subclasscheck__", "__class_getitem__", "__init_subclass__",
                             "__new__", "__del__", "__getattr__", "__getattribute__", "__set_name__", "__lt__",
@@ -44,6 +47,22 @@ def _root_name(node):
     while isinstance(node, (ast.Attribute, ast.Subscript, ast.Call)):
         node = node.value if not isinstance(node, ast.Call) else node.func
     return node.id if isinstance(node, ast.Name) else None
+
+
+def _chain(node):
+    """Full dotted chain of an attribute expression rooted at a Name: os.sys._getframe -> ['os','sys','_getframe']."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return parts[::-1]
+    return None
+
+
+def _is_str_const(node):
+    return isinstance(node, ast.Constant) and isinstance(node.value, str)
 
 
 def scan_source(text: str, rel: str, rules: dict | None = None) -> list[str]:
@@ -83,14 +102,28 @@ def scan_source(text: str, rel: str, rules: dict | None = None) -> list[str]:
                     continue
                 if node.level == 0 and (top, a.name) in FORBIDDEN_ATTRS and (top, a.name) not in allow_attrs:
                     bad(node, f"forbidden import {top}.{a.name}")
+                if a.name in bad_imports or a.name in FORBIDDEN_DUNDER_ATTRS:
+                    bad(node, f"forbidden from-import of {a.name!r} from {node.module or '.'}")
                 imported_names.add(a.asname or a.name)
         elif isinstance(node, ast.Attribute):
             if node.attr in FORBIDDEN_DUNDER_ATTRS:
                 bad(node, f"forbidden introspection attribute .{node.attr}")
-            root = node.value.id if isinstance(node.value, ast.Name) else None
-            mod = module_alias.get(root, root)
-            if mod and (mod, node.attr) in FORBIDDEN_ATTRS and (mod, node.attr) not in allow_attrs:
-                bad(node, f"forbidden reference {mod}.{node.attr}")
+            chain = _chain(node)
+            if chain:
+                chain = [module_alias.get(chain[0], chain[0]), *chain[1:]]
+                for i in range(len(chain) - 1):  # resolve the WHOLE chain: os.sys._getframe, os.path.os.sys, ...
+                    pair = (chain[i], chain[i + 1])
+                    if pair in FORBIDDEN_ATTRS and pair not in allow_attrs:
+                        bad(node, f"forbidden reference {'.'.join(chain[:i + 2])}")
+                    if i + 1 < len(chain) and chain[i + 1] in bad_imports and chain[0] in module_alias.values():
+                        bad(node, f"chained access to forbidden module {'.'.join(chain[:i + 2])}")
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in (
+                "getattr", "hasattr") and node.func.id not in allow_calls:
+            if len(node.args) < 2 or not _is_str_const(node.args[1]):
+                bad(node, f"non-literal {node.func.id}() attribute name")
+            elif node.args[1].value in FORBIDDEN_DUNDER_ATTRS or node.args[1].value in bad_imports or \
+                    node.args[1].value.startswith("__"):
+                bad(node, f"{node.func.id}() of forbidden attribute {node.args[1].value!r}")
         elif isinstance(node, ast.Name):
             if node.id in FORBIDDEN_NAMES:
                 bad(node, f"forbidden name {node.id}")
