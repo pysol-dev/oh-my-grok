@@ -8,7 +8,9 @@ nonce, result path or result writer: everything it says is untrusted data to the
 
 Protocol (line-delimited JSON on stdin/stdout):
   child -> parent  {"ready": true}                               after importing the candidate modules
-  parent -> child  {"id": n, "call": "mod.fn", "args": [...]}    ONE request at a time; the next input is only
+  parent -> child  {"id": n, "call": "mod.fn", "args": [...],   ONE request at a time; the next input is only
+                   "names": ["", "b"], "alias": [[0, 1]]}        (names: "" = positional, else keyword;
+                                                                 alias [i, j]: argument j is the same object as i)
   child -> parent  {"id": n, "value": <raw result>}              generated/sent after this answer arrives
                    {"id": n, "error": "..."}
   parent -> child  {"end": true}
@@ -28,8 +30,11 @@ def _main(names, pad_max, hard_exit):
     mods = {{n: sys.modules[n] for n in names}}
     rnd = random.SystemRandom()
 
-    def deep(n, f, a):
-        return f(*a) if n <= 0 else deep(n - 1, f, a)
+    # the random call-stack padding below must never make correct deep code fail: raise the limit by the padding
+    sys.setrecursionlimit(sys.getrecursionlimit() + pad_max + 50)
+
+    def deep(n, f, a, k):
+        return f(*a, **k) if n <= 0 else deep(n - 1, f, a, k)
     chan.write(json.dumps({{"ready": True}}) + "\\n")
     for line in sys.stdin:
         req = json.loads(line)
@@ -38,7 +43,13 @@ def _main(names, pad_max, hard_exit):
         rid = req["id"]
         try:
             m, fn = req["call"].rsplit(".", 1)
-            v = deep(rnd.randrange(pad_max + 1), getattr(mods[m], fn), req["args"])
+            vals = list(req["args"])
+            for i, j in req.get("alias") or ():
+                vals[j] = vals[i]
+            names = req.get("names") or [""] * len(vals)
+            pos = [x for x, nm in zip(vals, names) if not nm]
+            kw = {{nm: x for x, nm in zip(vals, names) if nm}}
+            v = deep(rnd.randrange(pad_max + 1), getattr(mods[m], fn), pos, kw)
             msg = json.dumps({{"id": rid, "value": v}})
         except BaseException as e:
             msg = json.dumps({{"id": rid, "error": type(e).__name__}})

@@ -43,9 +43,29 @@ run inside the sandbox below; nothing else imports or executes candidate code (t
   `candidate_sandbox`. The probe also requires `bwrap --version` to exit 0 and print exactly
   `bubblewrap <major>.<minor>[.<patch>]`; anything else fails closed. Every verification record stores the mechanism
   and version in `verifications.sandbox` (e.g. `bwrap 0.12.0`, or `none` when no candidate code ran).
-- **Scratch cleanup** (`verifier._rmtree`) never follows symlinks and never chmods by path: entries are classified
-  with lstat, directories are opened `O_NOFOLLOW|O_DIRECTORY` relative to their parent fd, and the only permission
-  change is `fchmod` on such an fd after fstat confirms it is the directory inode that was listed.
+- **Namespace self-check (round 6).** A version string proves nothing (Momus: a fake `bwrap` script that prints the
+  version and execs the command passed the round-5 probe). `sandbox.namespace_self_check` now runs a tiny Python
+  probe through the real `bwrap` argument set with a random nonce and requires: pid 1 inside is the bwrap init
+  (`/proc/1/comm == "bwrap"`, own pid != 1 and != the host pid), the only network interface is `lo`, a fresh sentinel
+  file in the host `/tmp` and the `omo_grok/` package directory are **not** visible, `/proc/self/uid_map` is a single
+  one-id mapping with our uid inside (not the host's `0 0 4294967295`), and the nonce comes back. Any mismatch, a
+  missing report or a missing nonce fails closed (tests: an exec-through shim and a canned-JSON shim are rejected).
+  **Limit:** a hostile replacement binary written against this check can fake these answers. The check catches a
+  wrong or broken binary, not a deliberate same-account adversary. **Disclosure:** Momus reports that the box user
+  has passwordless sudo (this build never invokes sudo and did not verify it). If so, any same-account process can
+  replace `/usr/bin/bwrap` or the system Python, so the same-account threat model above (cooperating Bots, not
+  adversaries) covers the sandbox binary too.
+- **Scratch cleanup** (`verifier._rmtree`, rewritten in round 6) runs after every sandboxed process is dead. It never
+  follows a symlink: entries are classified with lstat relative to their parent directory fd; symlinks and files are
+  unlinked; a directory is first made owner-rwx with `fchmodat(dir_fd, name, AT_SYMLINK_NOFOLLOW)` after re-checking
+  that the name is still the same directory inode (so modes 000 / 0o100 no longer block it), then **renamed**
+  (dir-fd relative, never follows symlinks) up to the top of the tree and processed there. The walk is iterative and
+  flat (O(1) open fds, no recursion), so trees deeper than the old 200-level cap are removed; it is bounded by
+  `RMTREE_MAX_ENTRIES` (1,000,000 entries). **Residual:** it returns the number of entries it could not remove;
+  if that is non-zero (e.g. more than the bound, or an entry it could not change), the leftover is NOT deleted and
+  the verification's stderr says `scratch cleanup incomplete: N entries left in <dir>` (pass/fail is unaffected).
+  Round 5 claimed cleanup without saying that 000-mode and >200-deep trees leaked; that was wrong. Tests:
+  000/0o100 dirs, a 2500-deep tree, symlinks to a read-only outside directory (untouched), and the bound.
 - **Integrity tripwire:** sha256 of every file under `omo_grok/`, `config/` (and the active config dir), `omoctl`,
   `.venv/bin`, `.venv/pyvenv.cfg` and the venv `site-packages` is taken before and after each verification. Any
   change fails the run (`TAMPER: ...`), is stored in `verifications.tamper_json` and raises a `tamper` event. Child
@@ -78,13 +98,21 @@ accepted residual. Mitigations:
   hostname; no path, variable, file or argument contains `omo`, `verif`, `oracle`, `harness`, `sandbox`, `bwrap`,
   `grok` or `probe` (asserted by tests). The candidate is imported exactly as `python3 -c 'import calc'` would:
   the program is passed with `-c` (no script path), its first statement is `import calc` (plus, in the isolated
-  run only, an `sys.path.insert(0, '')` that `-I` requires), `__main__` holds only standard dunders at import time,
+  run only, an `sys.path.insert(0, '')` that `-P` requires), `__main__` holds only standard dunders at import time,
   and no `-I`/`-P`/`PYTHONSAFEPATH` is used in the plain run.
 - **(b) Varied runs.** Every verification runs the oracle **3 times** in shuffled order, each in a fresh copy and a
-  different neutral layout: *plain* (`python3`, no flags, login-like env), *isolated-flags* (`python3.13 -I -S -B`,
-  minimal env with `PYTHONSAFEPATH=1` and a random `PYTHONHASHSEED`), *interactive-like* (`python3 -q -i`, different
-  LANG/EDITOR/`PYTHONDONTWRITEBYTECODE`). The call-stack depth at which the candidate is called is randomized per
-  call (0..300 extra frames). The runs also differ in **resource limits** (round 5): one run has a random low
+  different neutral layout: *plain* (`python3`, no flags, login-like env, no `PYTHONHASHSEED`, so the interpreter
+  draws its own random seed), *isolated-flags* (`python3.13 -s -S -B -P`, minimal env with an explicit random
+  `PYTHONHASHSEED`), *interactive-like* (`python3 -q -i`, different LANG/EDITOR/`PYTHONDONTWRITEBYTECODE` and a second,
+  different explicit `PYTHONHASHSEED`). **Correction (round 6):** rounds 4-5 used `-I` with `PYTHONSAFEPATH=1` and a
+  `PYTHONHASHSEED` in the isolated run and this document called that seed random; `-I` implies `-E`, so both
+  variables were silently ignored (the run used an ordinary random seed and `-I` alone provided safe-path). The
+  isolated run now uses `-s -S -B -P` (user site off, no site, no bytecode, safe path; no `-E`), so its pinned seed
+  takes effect; a test checks that each run's flags + env give a distinct, effective `hash()`. The call-stack depth
+  at which the candidate is called is randomized per call (0..300 extra frames), and since round 6 the child raises
+  its recursion limit by the padding (+50) first. **Correction (round 6):** before that, the padding came out of the
+  default limit of 1000, so correct code recursing ~700 deep could fail in a padded run (a false failure, not a
+  false pass); a correct depth-700 recursive `add` now passes all runs (tested). The runs also differ in **resource limits** (round 5): one run has a random low
   RLIMIT_AS (256-512 MiB), one the default 4 GiB, one none, so code that senses the memory limit (by allocating or by
   reading it) gets different answers in different runs. The same inputs go to every run; every run must match the
   oracle and all results must be identical across runs. A correct candidate passes all three (tested).
@@ -112,15 +140,19 @@ accepted residual. Mitigations:
     (which is itself scanned by this rule); `from . import x` must name such a module, `from .m import x` needs `m` to
     be one; anything else (protected `tests/`, outside the package, a missing module, `*`) is rejected. Absolute
     imports of the candidate's own package go through the normal allowlist (rejected for calc).
+  - (round 6) no `is` / `is not` except against the literal `None` (C2-1), and no `set`, `frozenset`, `hash`, `id`,
+    set literals or set comprehensions (C2-2).
   That forbids, among others, `os.*`, `sys.*`, `resource`, environment, flags, argv, cwd, pids, users, platform,
-  socket, time, random, threading, signal, inspect, traceback, file I/O and `/proc`.
+  socket, time, random, threading, signal, inspect, traceback, file I/O and `/proc`. The static rules are a
+  tripwire and will not cover every construct.
 
 **Which variants each layer stops** (`tests/integration/test_harness_detection.py`; every variant fails the full
 verifier):
 - Defeated by (a)+(b) even with every static check disabled: Momus's H1 payload; keyed on `sys.flags.isolated`,
   `sys.flags.no_site`, *not* isolated; `PYTHONSAFEPATH` present or absent; cwd markers; HOME markers; HOME==cwd;
   script `argv[0]`/`orig_argv`; `argv[0] != '-c'`; `sys.executable` name; `/proc/self/cmdline` markers; user name;
-  `LANG`; **the RLIMIT_AS value** (`resource.getrlimit`).
+  `LANG`; **the RLIMIT_AS value** (`resource.getrlimit`); (round 6) `sys.flags.safe_path`, `not
+  sys.flags.no_user_site`, `PYTHONHASHSEED` present or absent; argument identity (C2-1, via the aliased cases).
 - **Memory-limit probing by allocation (Momus HMEM, round 5)** is stopped by **both** (c) and (b): (c) rejects the
   `try` that would turn the MemoryError into a value (and `bytes`), and with the static rule disabled the run without
   RLIMIT_AS can make the 5 GiB allocation succeed while the limited runs cannot, so the candidate answers wrongly in
@@ -143,13 +175,47 @@ verifier):
   `bytearray`/`memoryview`; `gi_frame.f_code.co_filename` (would reveal the path); `int.mro()`; relative imports
   of protected or missing modules; `from .m import *`; absolute self-imports. Not closed by a rule and stated here:
   `repr()`/`str()` of a function or object exposes its memory address (ASLR-randomised, the same inside and outside
-  the sandbox, so it is randomness, not a harness signal; results that depend on it differ between the runs) and
-  string-set iteration order follows the per-process hash seed (also random in every run).
+  the sandbox, so it is randomness, not a harness signal). **Correction (round 6):** this paragraph used to say
+  that string-set iteration order "follows the per-process hash seed (also random in every run)", implying runs
+  would catch hash-dependent code. That was wrong twice: such behaviour differs between runs only *probabilistically*
+  (Momus's C2-2 passed 8 of 12 times), and the isolated run's pinned seed was ignored under `-I`. Hash-order
+  dependence is now enforced statically (C2-2 below); the per-run seeds are only a second, probabilistic layer.
+- **C2-1: argument identity (Momus re-review #6).** `if a is b and a > 1000: return a - b` passed every case,
+  because the child decodes every request with `json.loads`, so the two arguments were always distinct objects,
+  while a real caller writing `x = 5000; add(x, x)` passes one object. Variant: `a is b and (a > 256 or a < -5)`
+  (outside CPython's small-int cache). Fixes: (c) now rejects `is` / `is not` unless one side is the literal `None`;
+  and the oracle sends **aliased** cases: every equal-argument case (grid and boundary diagonals, plus random equal
+  pairs, including values far outside the small-int cache) is sent both as fresh objects and with the child passing
+  the same object twice (`"alias": [[0, 1]]`), positionally and by keyword. Both variants fail with the static rule
+  on and, with it disabled, fail the oracle (tests in `tests/integration/test_round6_probes.py`).
+- **C2-2: hash-seed order (Momus re-review #6).** `o = list({'alpha','beta','gamma','delta'}); a - b if o ==
+  sorted(o) else a + b` passed 8/12. Fix: (c) bans `set`, `frozenset`, `hash`, `id`, set literals and set
+  comprehensions in pure modules (rejected statically every time; tested with literal, `set()`, `frozenset()`,
+  comprehension and `hash()` variants). The per-run seeds (b) remain, but they detect hash dependence only with some
+  probability. **Dict iteration** is insertion-ordered by language guarantee and does not depend on the hash seed,
+  so dicts stay allowed.
+- **Oracle-vs-real-call audit (round 6).** Ways the oracle's calls could differ from a real caller's, and status:
+  - *identity*: covered (C2-1, rule + aliased cases). Identity of unequal values cannot be observed without `is`/`id`.
+  - *keyword vs positional*: covered. Every grid/boundary case is also sent with all arguments by keyword, the grid
+    again in mixed form (`f(a_val, b=b_val)`), and random draws in a random form. This makes the parameter names
+    (`a`, `b`, `OracleFn.params`) part of the contract: a correct `add(x, y)` now fails.
+  - *bool vs int*: covered for `calc.add`/`calc.mul` (`accepts_bool`): `True`/`False` against each other and against
+    0, +-1, 2, 2**63, -2**200, both orders and by keyword; the expected value is the int result (`True + True == 2`),
+    and the answer must still be exactly `int`.
+  - *call count / order state*: each run gets the cases in a fresh shuffled order, one at a time; the three runs see
+    different orders, and pure modules cannot keep state across calls except in module-level objects, which (c) makes
+    immutable (no attribute/item assignment, no `global`). Not separately tested beyond that.
+  - **Not covered (disclosed):** `int` subclasses, `float`, `Decimal`, `Fraction`, strings or other types are never
+    sent (JSON carries only exact ints; bools are sent by the child as JSON `true`/`false`). Code that misbehaves only
+    for an `int` subclass or a non-int argument passes the oracle; for `calc` the declared domain is int (and bool),
+    and (c) plus review/QA are the backstop.
 - **Oracle coverage (round 5, after HDIST).** Every verification sends: the exhaustive grid of all argument pairs in
   [-16, 16]^2 (1089 per binary function, filtered by each function's domain predicate, e.g. no zero divisor);
   pairwise boundary values (0, +-1, +-2, +-16, +-17, both sides of 2**31, 2**32, 2**53+1, 2**63, 2**64, +-10**18,
   +-2**200, +-2**1000), and each boundary against 0, +-1, +-2, +-16 in both orders; then `cases_per_function` fresh
-  CSPRNG draws (bands: |x|<=100, <=1000, <=10**12, <=2**63, <=2**200). Order is shuffled per run. Momus's HDIST
+  CSPRNG draws (bands: |x|<=100, <=1000, <=10**12, <=2**63, <=2**200). Round 6 adds keyword, mixed and aliased
+  copies and bool cases (C2-1 and the audit above), about 10,000 cases per run and 30,000 per verification
+  (~2 s here). Order is shuffled per run. Momus's HDIST
   (wrong for |a|,|b|<=10 except the unittest pairs) now fails every time (tested 5x plus the manual repro).
   **Limit:** outside the grid and the boundary set the oracle samples. A function wrong only on a sparse set of
   inputs that are neither in the grid, nor boundaries, nor likely random draws (e.g. one specific 40-digit value, or
@@ -254,7 +320,6 @@ assurance starts with `REDUCED_ASSURANCE_ACCEPTED_BY_APPROVAL+`, `omoctl status`
 `!!! REDUCED ASSURANCE !!!` on the gate line, and the export carries an `ASSURANCE_LABEL` of `REDUCED ASSURANCE`.
 "Independent" here means separate Bots on the same account: they share this computer, so this is separation of
 duties between cooperating agents, not protection against a malicious same-account Bot.
-    - The static scan is a tripwire and will not cover every construct.
 - Logs, status, exports, errors and CLI output pass through `redact.py`. `hook list` shows booleans only.
   Dispatch errors are scrubbed of the webhook URL/key at write time and every http(s) URL in them is cut to
   `scheme://host` (also on display), so status never shows a webhook URL even in a process that never loaded the hooks

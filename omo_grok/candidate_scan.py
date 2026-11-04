@@ -168,8 +168,8 @@ def scan_source(text: str, rel: str, rules: dict | None = None) -> list[str]:
 PURE_IMPORT_CEILING = {"math", "operator", "cmath", "numbers", "__future__"}  # the most any profile may allow
 PURE_BUILTINS = {
     "abs", "all", "any", "bin", "bool", "chr", "complex", "dict", "divmod", "enumerate", "filter", "float",
-    "frozenset", "hex", "int", "isinstance", "issubclass", "iter", "len", "list", "map", "max", "min", "next", "oct",
-    "ord", "pow", "range", "repr", "reversed", "round", "set", "slice", "sorted", "str", "sum", "super", "tuple",
+    "hex", "int", "isinstance", "issubclass", "iter", "len", "list", "map", "max", "min", "next", "oct",
+    "ord", "pow", "range", "repr", "reversed", "round", "slice", "sorted", "str", "sum", "super", "tuple",
     "zip", "NotImplemented", "Ellipsis",
     "ArithmeticError", "ZeroDivisionError", "OverflowError", "ValueError", "TypeError", "KeyError", "IndexError",
     "LookupError", "StopIteration", "NotImplementedError", "AssertionError", "AttributeError"}
@@ -185,6 +185,8 @@ PURE_FORBIDDEN_ATTRS = {"format", "format_map",  # "{0.__globals__}".format(f) r
 # frame / code / generator / coroutine / traceback internals (gi_frame.f_code.co_filename reveals paths, f_builtins
 # reaches open/__import__)
 PURE_FORBIDDEN_ATTR_PREFIXES = ("gi_", "cr_", "ag_", "f_", "co_", "tb_")
+# (round 6, C2-2) set/frozenset iteration order of str/bytes depends on the per-process hash seed: banned outright
+PURE_FORBIDDEN_NAMES = {"set", "frozenset", "id", "hash"}
 PURE_ALLOWED_DUNDER_DEFS = {"__init__"}  # __del__/__exit__/__eq__/__index__/... hooks are not allowed
 
 
@@ -336,6 +338,18 @@ def pure_module_problems(text: str, rel: str, allow_imports, local_modules=froze
             for t in types:
                 if not isinstance(t, ast.Name) or t.id in PURE_FORBIDDEN_HANDLERS:
                     bad(n, f"except {ast.unparse(t)} (broad/environment-probing handler)")
+        elif isinstance(n, (ast.Set, ast.SetComp)):
+            bad(n, "set literal/comprehension (iteration order of str/bytes depends on the hash seed)")
+        elif isinstance(n, ast.Compare) and any(isinstance(op, (ast.Is, ast.IsNot)) for op in n.ops):
+            operands = [n.left, *n.comparators]
+            for k, op in enumerate(n.ops):
+                if isinstance(op, (ast.Is, ast.IsNot)):
+                    lhs, rhs = operands[k], operands[k + 1]
+                    if not any(isinstance(x, ast.Constant) and x.value is None for x in (lhs, rhs)):
+                        bad(n, "identity comparison `is`/`is not` other than against the literal None (object "
+                               "identity distinguishes callers, e.g. a fresh vs a shared int)")
+        elif isinstance(n, ast.Name) and n.id in PURE_FORBIDDEN_NAMES:
+            bad(n, f"{n.id} is not allowed in pure modules (hash-seed or identity dependent)")
         elif isinstance(n, ast.Name):
             if n.id.startswith("__"):
                 bad(n, f"dunder name {n.id}")

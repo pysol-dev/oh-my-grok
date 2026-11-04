@@ -12,8 +12,10 @@ class _CP:
         self.returncode, self.stdout, self.stderr = rc, out, ""
 
 
-def _probe_with(monkeypatch, version_out, rc=0):
+def _probe_with(monkeypatch, version_out, rc=0, self_check=True):
     monkeypatch.setattr(sandbox, "_bwrap_path", lambda: "/usr/bin/bwrap")
+    if self_check:  # version-parsing tests: the namespace self-check is covered by the round-6 tests
+        monkeypatch.setattr(sandbox, "namespace_self_check", lambda bw: None)
 
     def fake_run(argv, **kw):
         if argv[1:] == ["--version"]:
@@ -74,3 +76,9 @@ def test_rmtree_on_a_symlink_only_unlinks_it(tmp_path):
     os.symlink(victim, link)
     _rmtree(link)
     assert not os.path.lexists(link) and (victim / "keep").exists()
+
+
+def test_probe_fails_closed_when_the_self_check_gets_no_report(monkeypatch):
+    """Round 6: a binary that prints the right version and exits 0 for everything is NOT a sandbox."""
+    pr = _probe_with(monkeypatch, "bubblewrap 0.12.0\n", self_check=False)
+    assert not pr.ok and "self-check failed" in pr.detail, pr

@@ -335,9 +335,11 @@ def run(repo: Path, revision: str, name: str | None, prof: dict | None, work_roo
                        staging)
             out = _run_python(prof, ctx, ph, eid) if python else _run_exit_code_only(prof, ctx, ph, eid)
         finally:
-            _rmtree(staging)
+            left = _rmtree(staging)
         changes = integrity.diff(before, integrity.snapshot())
         out.sandbox = sb.label
+        if left:  # never claim a clean cleanup that did not happen (does not affect pass/fail)
+            out.stderr = (out.stderr or "") + f"\n[verifier] scratch cleanup incomplete: {left} entries left in {staging}"
         if changes:
             out.status, out.tamper = "failed", changes
             out.detail = (f"TAMPER: trusted files changed during verification ({len(changes)}): "
@@ -348,76 +350,127 @@ def run(repo: Path, revision: str, name: str | None, prof: dict | None, work_roo
 
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+RMTREE_MAX_ENTRIES = 1_000_000  # sane bound on one staging tree; beyond it the rest is left (and reported)
 
 
-def _rmtree(p: Path) -> None:
-    """Delete a per-run staging tree that sandboxed code could write to. Never follows a symlink and never calls a
-    path-based chmod: every entry is classified with lstat (scandir with follow_symlinks=False), directories are
-    opened with O_NOFOLLOW|O_DIRECTORY relative to their parent's fd, and the only permission change is fchmod on that
-    already-opened fd, after fstat confirms it is the same directory inode that was listed (so a symlink or a swapped
-    path can never redirect it outside the tree). Symlinks themselves are unlinked, not followed. Best effort."""
+def _chmod_dir_nofollow(name: str, dir_fd: int, expect: os.stat_result) -> bool:
+    """Make one listed directory owner-rwx without ever following a symlink: fchmodat(dir_fd, name,
+    AT_SYMLINK_NOFOLLOW) after lstat (relative to the same dir fd) confirms it is still the same directory inode."""
+    try:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) != (expect.st_dev, expect.st_ino):
+            return False
+        if st.st_mode & 0o700 != 0o700:
+            os.chmod(name, 0o700, dir_fd=dir_fd, follow_symlinks=False)
+        return True
+    except (OSError, NotImplementedError):
+        return False
+
+
+def _rmtree(p: Path) -> int:
+    """Delete a per-run staging tree that sandboxed code could write to (all sandboxed processes are dead by now).
+    Returns the number of entries that could NOT be removed (0 = clean).
+
+    Never follows a symlink and never chmods by an absolute path: every entry is classified with lstat relative to
+    its parent directory fd; symlinks and files are unlinked; a directory is first made owner-rwx with
+    fchmodat(AT_SYMLINK_NOFOLLOW) after re-checking its inode (so 000 / 0o100 modes do not block cleanup), then
+    MOVED (rename relative to dir fds, which never follows symlinks) to the top of the tree under a fresh name and
+    processed from there. The walk is therefore iterative and flat: arbitrarily deep trees need O(1) open fds and no
+    recursion. Bounded by RMTREE_MAX_ENTRIES."""
     try:
         st = os.lstat(p)
     except OSError:
-        return
+        return 0
     if not stat.S_ISDIR(st.st_mode):
         try:
             os.unlink(p)
+            return 0
         except OSError:
-            pass
-        return
+            return 1
+    parent_fd = os.open(p.parent, _DIR_FLAGS)
     try:
-        fd = os.open(p, _DIR_FLAGS)
-    except OSError:
-        return
-    try:
-        if (os.fstat(fd).st_dev, os.fstat(fd).st_ino) == (st.st_dev, st.st_ino):
-            _rm_contents(fd)
+        if not _chmod_dir_nofollow(p.name, parent_fd, st):
+            return 1
+        try:
+            root = os.open(p.name, _DIR_FLAGS, dir_fd=parent_fd)
+        except OSError:
+            return 1
+        try:
+            fst = os.fstat(root)
+            if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+                return 1
+            left = _drain_flat(root)
+        finally:
+            os.close(root)
+        try:
+            os.rmdir(p.name, dir_fd=parent_fd)
+        except OSError:
+            left += 1
+        return left
     finally:
-        os.close(fd)
-    try:
-        os.rmdir(p)
-    except OSError:
-        pass
+        os.close(parent_fd)
 
 
-def _rm_contents(fd: int, depth: int = 0) -> None:
-    if depth > 200:
-        return
-    if os.fstat(fd).st_mode & 0o700 != 0o700:
+def _drain_flat(root: int) -> int:
+    pending = [None]  # None = the root itself; strings = directories moved to the root
+    seen = 0
+    counter = 0
+    left = 0
+    while pending:
+        name = pending.pop()
         try:
-            os.fchmod(fd, 0o700)  # fd-based: only this verified directory, never a symlink target
+            fd = root if name is None else os.open(name, _DIR_FLAGS, dir_fd=root)
         except OSError:
-            pass
-    try:
-        entries = list(os.scandir(fd))
-    except OSError:
-        return
-    for e in entries:
-        try:
-            est = e.stat(follow_symlinks=False)
-        except OSError:
+            left += 1
             continue
-        if stat.S_ISDIR(est.st_mode):
+        try:
+            if name is not None:
+                fst = os.fstat(fd)
+                lst = os.stat(name, dir_fd=root, follow_symlinks=False)
+                if (fst.st_dev, fst.st_ino) != (lst.st_dev, lst.st_ino):
+                    left += 1
+                    continue
             try:
-                sub = os.open(e.name, _DIR_FLAGS, dir_fd=fd)
+                entries = list(os.scandir(fd))
             except OSError:
+                left += 1
                 continue
+            for e in entries:
+                seen += 1
+                if seen > RMTREE_MAX_ENTRIES:
+                    return left + 1
+                try:
+                    est = e.stat(follow_symlinks=False)
+                except OSError:
+                    left += 1
+                    continue
+                if stat.S_ISDIR(est.st_mode):
+                    if not _chmod_dir_nofollow(e.name, fd, est):
+                        left += 1
+                        continue
+                    counter += 1
+                    flat = f".rm{counter}-{uuid.uuid4().hex[:8]}"
+                    try:
+                        os.rename(e.name, flat, src_dir_fd=fd, dst_dir_fd=root)
+                    except OSError:
+                        left += 1
+                        continue
+                    pending.append(flat)
+                else:
+                    try:
+                        os.unlink(e.name, dir_fd=fd)
+                    except OSError:
+                        left += 1
+        finally:
+            if fd != root:
+                os.close(fd)
+        if name is not None:
+            # its subdirectories were moved out and its files unlinked: it is empty now
             try:
-                fst = os.fstat(sub)
-                if (fst.st_dev, fst.st_ino) == (est.st_dev, est.st_ino):
-                    _rm_contents(sub, depth + 1)
-            finally:
-                os.close(sub)
-            try:
-                os.rmdir(e.name, dir_fd=fd)
+                os.rmdir(name, dir_fd=root)
             except OSError:
-                pass
-        else:
-            try:
-                os.unlink(e.name, dir_fd=fd)
-            except OSError:
-                pass
+                left += 1
+    return left
 
 
 def _purge_bytecode(dest: Path) -> None:
@@ -594,7 +647,8 @@ def _alias_ok(alias: str, exe: str) -> bool:
 def oracle_variants(prof, ctx: _Ctx, rng) -> list[dict]:
     """Deliberately varied, neutral environments for the oracle runs (user decision H1). Nothing in them names the
     harness: random ordinary user/home/project/hostname, plain `-c` import, no script path. Flags are OFF in the plain
-    run and ON in the isolated run, the third looks like an interactive session; argv[0], env sets, HOME, cwd and the
+    run and ON in the isolated run (-s -S -B -P, not -I, so the per-run PYTHONHASHSEED is honoured), the third looks
+    like an interactive session; each run has its own explicit hash seed; argv[0], env sets, HOME, cwd and the
     call-stack depth differ between runs. A candidate must be correct in every run, with identical results."""
     names = ("python3", "/usr/bin/python3", ctx.exe)
     plain0 = next((a for a in names if _alias_ok(a, ctx.exe)), ctx.exe)
@@ -607,14 +661,24 @@ def oracle_variants(prof, ctx: _Ctx, rng) -> list[dict]:
         if all(lay.project != x.project and lay.home != x.home for x in lays):
             lays.append(lay)
     base = [sandbox.login_env(x) for x in lays]
+    # (round 6, C2-2) a distinct, EFFECTIVE hash seed per run: two explicit distinct seeds, and the plain run's own
+    # random seed; no run uses -I/-E (which would ignore PYTHON* variables): the isolated run gets the same
+    # isolation from -s -S -B -P instead. Detection of hash-order
+    # dependence this way is probabilistic; the pure rule's set/frozenset/hash ban is the enforcement.
+    seeds: list[int] = []
+    while len(seeds) < 2:
+        x = rng.randrange(1, 1 << 32)
+        if x not in seeds:
+            seeds.append(x)
     runs = [
+        # plain: no PYTHONHASHSEED at all (the interpreter draws its own random seed, as in a normal session)
         {"name": "plain", "argv0": plain0, "flags": [], "env": base[0], "pad": 0, "hard": False, "cwd": False},
-        {"name": "isolated-flags", "argv0": other0, "flags": ["-I", "-S", "-B"],
-         "env": {"PATH": "/usr/bin:/bin", "HOME": lays[1].home, "PYTHONSAFEPATH": "1",
-                 "PYTHONHASHSEED": str(rng.randrange(1 << 16))}, "pad": 150, "hard": False, "cwd": True},
+        {"name": "isolated-flags", "argv0": other0, "flags": ["-s", "-S", "-B", "-P"],
+         "env": {"PATH": "/usr/bin:/bin", "HOME": lays[1].home, "PYTHONHASHSEED": str(seeds[0])}, "pad": 150,
+         "hard": False, "cwd": True},
         {"name": "interactive-like", "argv0": plain0, "flags": ["-q", "-i"],
-         "env": dict(base[2], LANG="en_US.UTF-8", PYTHONDONTWRITEBYTECODE="1", EDITOR="vi"), "pad": 300,
-         "hard": True, "cwd": False},
+         "env": dict(base[2], LANG="en_US.UTF-8", PYTHONDONTWRITEBYTECODE="1", EDITOR="vi",
+                     PYTHONHASHSEED=str(seeds[1])), "pad": 300, "hard": True, "cwd": False},
     ]
     # address-space limits differ per run (low / default / none), assigned at random to the variants
     limits = [rng.randrange(256, 513) << 20, sandbox.RLIMITS[resource.RLIMIT_AS], None]
@@ -721,7 +785,7 @@ def _oracle_session(ctx: _Ctx, v: dict, cases: list, mods: list[str]):
         if recv() != {"ready": True}:
             why.append("oracle child did not report ready")
         for c in cases if not why else []:
-            send({"id": c["id"], "call": c["call"], "args": c["args"]})
+            send(oracles.wire(c))
             msg = recv()
             if set(msg) != {"id", "value"} or type(msg["id"]) is not int or msg["id"] != c["id"]:
                 why.append(f"oracle case {c['id']} ({c['call']}): bad/forged reply")
@@ -778,8 +842,9 @@ def _run_python(prof, ctx: _Ctx, ph, eid) -> VerifyOutcome:
             return VerifyOutcome("failed", rc, False, out, err, "assurance=oracle: " + "; ".join(reasons), ph, eid,
                                  prof["argv"], assurance)
         return VerifyOutcome("passed", 0, False, out, err,
-                             f"assurance=oracle: {matched}/{matched} oracle cases (exhaustive small grid + boundaries + "
-                             f"fresh random draws) matched across {ORACLE_RUNS} varied neutral sandboxed runs with "
+                             f"assurance=oracle: {matched}/{matched} oracle cases (exhaustive small grid + boundaries, "
+                             f"positional/keyword/mixed calls, aliased equal arguments, bools, fresh random draws) "
+                             f"matched across {ORACLE_RUNS} varied neutral sandboxed runs with "
                              f"different memory limits (parent-computed, identical results); unittest child (advisory self-report) claims "
                              f"{len(prof['expected_tests'])} expected tests passed", ph, eid, prof["argv"], assurance)
     if adv:

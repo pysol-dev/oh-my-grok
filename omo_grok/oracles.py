@@ -60,12 +60,14 @@ class OracleFn:
     grid: tuple = tuple(GRID)      # exhaustive small values per argument
     boundaries: tuple = tuple(BOUNDARY_INTS)  # combined pairwise (all tuples for arity <= 2)
     domain: Callable[..., bool] = lambda *a: True  # e.g. lambda a, b: b != 0 for a divisor
+    params: tuple = ("a", "b")     # parameter names: the oracle also calls by keyword (part of the contract)
+    accepts_bool: bool = False     # bool is in the declared domain (bool is an int subtype): send bool cases too
 
 
 ORACLES: dict[str, list[OracleFn]] = {
     "calc-arith": [
-        OracleFn("calc.add", 2, rand_int, lambda a, b: a + b, int),
-        OracleFn("calc.mul", 2, rand_int, lambda a, b: a * b, int),
+        OracleFn("calc.add", 2, rand_int, lambda a, b: a + b, int, accepts_bool=True),
+        OracleFn("calc.mul", 2, rand_int, lambda a, b: a * b, int, accepts_bool=True),
     ],
 }
 
@@ -87,27 +89,88 @@ def _fixed_args(fn: OracleFn) -> list[tuple]:
     return out
 
 
+def _case(fn: OracleFn, args, kind: str, form: str = "pos", alias: bool = False) -> dict:
+    """form: pos (all positional) | kw (all by keyword) | mixed (first positional, rest by keyword).
+    alias: the child passes the SAME object for every argument equal to the first one (as `x = ...; f(x, x)` would);
+    otherwise each argument is a fresh object from the JSON decoder."""
+    args = list(args)
+    n = len(args)
+    names = {"pos": [""] * n, "kw": list(fn.params[:n]), "mixed": [""] + list(fn.params[1:n])}[form]
+    al = [[0, k] for k in range(1, n) if alias and type(args[k]) is type(args[0]) and args[k] == args[0]]
+    return {"call": fn.call, "args": args, "names": names, "alias": al, "expect": fn.expect(*args),
+            "type": fn.result_type, "kind": kind}
+
+
+def _bool_args(fn: OracleFn) -> list[tuple]:
+    vals = (True, False)
+    others = (True, False, 0, 1, -1, 2, 2 ** 63, -(2 ** 200))
+    out = []
+    if fn.arity == 2:
+        for b in vals:
+            for o in others:
+                for t in ((b, o), (o, b)):
+                    if t not in out and fn.domain(*t):
+                        out.append(t)
+    return out
+
+
 def cases(name: str, per_fn: int) -> list[dict]:
-    """Exhaustive small grid + boundary cases + `per_fn` fresh random cases per function, interleaved and shuffled,
-    with the oracle's expected value attached (kept in the parent; only id/call/args are ever sent to the child)."""
+    """Every verification sends, per function:
+      - the exhaustive small grid and the boundary pairs, positionally;
+      - the same set again with every argument passed BY KEYWORD, and the small grid again in MIXED form
+        (first positional, rest keyword);
+      - every equal-argument case again with the arguments ALIASED (one shared object, as `f(x, x)`), next to the
+        fresh-object copy (C2-1: identity must not change the answer);
+      - bool arguments where the function's domain includes them (`accepts_bool`);
+      - `per_fn` fresh random draws (mixed forms) plus `max(4, per_fn // 4)` random EQUAL pairs, fresh and aliased.
+    Interleaved and shuffled, with the oracle's expected value attached (kept in the parent; only
+    id/call/args/names/alias are sent to the child)."""
     out = []
     fns = ORACLES[name]
     for fn in fns:
-        for args in _fixed_args(fn):
-            out.append({"call": fn.call, "args": list(args), "expect": fn.expect(*args), "type": fn.result_type,
-                        "kind": "fixed"})
+        fixed = _fixed_args(fn)
+        grid = set(itertools.product(fn.grid, repeat=fn.arity))
+        for args in fixed:
+            out.append(_case(fn, args, "fixed"))
+            out.append(_case(fn, args, "fixed-kw", "kw"))
+            if args in grid and fn.arity >= 2:
+                out.append(_case(fn, args, "fixed-mixed", "mixed"))
+            if fn.arity >= 2 and len(set(args)) == 1:
+                out.append(_case(fn, args, "fixed-alias", "pos", alias=True))
+                out.append(_case(fn, args, "fixed-alias-kw", "kw", alias=True))
+        if fn.accepts_bool:
+            for args in _bool_args(fn):
+                out.append(_case(fn, args, "bool"))
+                out.append(_case(fn, args, "bool-kw", "kw"))
+    forms = ("pos", "kw", "mixed")
     for _ in range(per_fn):
         for fn in fns:
             while True:
                 args = [fn.gen() for _ in range(fn.arity)]
                 if fn.domain(*args):
                     break
-            out.append({"call": fn.call, "args": args, "expect": fn.expect(*args), "type": fn.result_type,
-                        "kind": "random"})
+            out.append(_case(fn, args, "random", _rng.choice(forms) if fn.arity >= 2 else "pos"))
+    for fn in fns:
+        if fn.arity < 2:
+            continue
+        for _ in range(max(4, per_fn // 4)):
+            while True:
+                x = fn.gen()
+                args = [x] * fn.arity
+                if fn.domain(*args):
+                    break
+            out.append(_case(fn, args, "random-equal"))
+            out.append(_case(fn, args, "random-alias", _rng.choice(forms), alias=True))
     _rng.shuffle(out)
     for i, c in enumerate(out):
         c["id"] = i
     return out
+
+
+def wire(case: dict) -> dict:
+    """The only part of a case that is sent to the untrusted child."""
+    return {"id": case["id"], "call": case["call"], "args": case["args"], "names": case["names"],
+            "alias": case["alias"]}
 
 
 def check_value(case: dict, value: Any) -> bool:

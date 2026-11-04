@@ -48,6 +48,11 @@ RUNTIME = {
                                "(b'oracle', b'omo', b'harness', b'verif'))"),
     "user_name": _cand("__import__('getpass').getuser() in ('box', 'root', 'nobody', '')"),
     "lang_c": _cand("os.environ.get('LANG') == 'C.UTF-8'"),
+    # round 6: the isolated run is -s -S -B -P (no -I, so the hash seed is honoured); seeds are per run
+    "flags_safe_path": _cand("sys.flags.safe_path"),
+    "flags_no_user_site": _cand("not sys.flags.no_user_site"),
+    "env_hashseed_set": _cand("'PYTHONHASHSEED' in os.environ"),
+    "env_hashseed_unset": _cand("'PYTHONHASHSEED' not in os.environ"),
     # round 5: the RLIMIT_AS value now differs between the oracle runs (low / default / none)
     "rlimit_as_finite": _cand("resource.getrlimit(resource.RLIMIT_AS)[0] != resource.RLIM_INFINITY",
                               "import resource"),
@@ -105,7 +110,11 @@ def test_harness_has_no_markers_and_runs_really_vary():
     assert len(vs) == verifier.ORACLE_RUNS >= 3
     assert len({v["layout"].project for v in vs}) == len(vs) and len({v["layout"].home for v in vs}) == len(vs)
     flagsets = {tuple(v["flags"]) for v in vs}
-    assert () in flagsets and any("-I" in f for f in flagsets) and any("-i" in f for f in flagsets)
+    assert () in flagsets and any("-P" in f and "-S" in f for f in flagsets) and any("-i" in f for f in flagsets)
+    # round 6: no -I/-E anywhere (they would silently ignore PYTHONHASHSEED); every run has a distinct seed
+    assert not any(x in f for f in flagsets for x in ("-I", "-E"))
+    seeds = [v["env"].get("PYTHONHASHSEED") for v in vs]
+    assert seeds.count(None) == 1 and len({x for x in seeds if x}) == 2 and "0" not in seeds
     for v in vs:
         blob = " ".join([v["argv0"], *v["flags"], *v["env"].values(), v["layout"].project, v["layout"].hostname])
         assert not any(m in blob.lower() for m in sandbox.HARNESS_MARKERS), blob

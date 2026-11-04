@@ -71,8 +71,72 @@ def probe() -> Probe:
     if cp.returncode != 0:
         return Probe(False, "none", "no sandbox available: bwrap cannot create user/mount/net namespaces: "
                      + cp.stderr.strip()[:200])
-    return Probe(True, "bwrap", f"bubblewrap {m.group(1)}; userns+mountns+pidns+netns; kernel {os.uname().release}",
+    bad = namespace_self_check(bw)
+    if bad:
+        return Probe(False, "none", "no sandbox available: bwrap namespace self-check failed: " + bad)
+    return Probe(True, "bwrap", f"bubblewrap {m.group(1)}; userns+mountns+pidns+netns (self-check passed); "
+                 f"kernel {os.uname().release}",
                  bw, m.group(1))
+
+
+_SELF_CHECK = r"""
+import json, os, socket, sys
+def rd(p):
+    try:
+        with open(p) as f:
+            return f.read()
+    except OSError as e:
+        return "ERR " + type(e).__name__
+out = {"nonce": sys.argv[1], "pid": os.getpid(), "comm1": rd("/proc/1/comm").strip(),
+       "ifaces": sorted(n for _, n in socket.if_nameindex()), "uid_map": rd("/proc/self/uid_map").split(),
+       "uid": os.getuid(), "visible": [p for p in sys.argv[2:] if os.path.lexists(p)]}
+print(json.dumps(out))
+"""
+
+
+def namespace_self_check(bw: str) -> str | None:
+    """Fail-closed proof that `bw` really isolates, not just that it prints a bubblewrap version: run a tiny probe
+    inside it and require (a) a private pid namespace whose pid 1 is the bwrap init, (b) no network interface but
+    `lo`, (c) host sentinel paths (a fresh file in the host /tmp, and this package's own directory) invisible,
+    (d) a user namespace with a single one-id mapping (our uid inside) (not the host's full identity map), and (e) the
+    random nonce echoed back. Returns None when all hold, else the first reason. LIMIT: a hostile binary written
+    for this check could fake these answers; that is outside the same-account threat model's reach to prevent
+    (docs/SECURITY.md, "Sandbox probe")."""
+    import json
+    import secrets
+    import tempfile
+    nonce = secrets.token_hex(16)
+    uid = os.getuid()
+    fd, sentinel = tempfile.mkstemp(prefix="sbx-sentinel-")
+    os.close(fd)
+    pkg = str(Path(__file__).resolve().parent)
+    try:
+        cp = subprocess.run([bw, *base_args(), "--", "/usr/bin/python3", "-I", "-S", "-c", _SELF_CHECK, nonce,
+                             sentinel, pkg], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"probe did not run ({type(e).__name__})"
+    finally:
+        try:
+            os.unlink(sentinel)
+        except OSError:
+            pass
+    try:
+        r = json.loads(cp.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return f"probe produced no report (exit {cp.returncode})"
+    if not isinstance(r, dict) or r.get("nonce") != nonce:
+        return "probe report missing the nonce"
+    if r.get("pid") == 1 or r.get("comm1") != "bwrap" or r.get("pid") == os.getpid():
+        return f"no private pid namespace with the bwrap init as pid 1 (pid {r.get('pid')}, pid 1 {r.get('comm1')!r})"
+    if r.get("ifaces") != ["lo"]:
+        return f"network interfaces other than lo are visible: {r.get('ifaces')}"
+    if r.get("visible"):
+        return f"host paths visible inside the sandbox: {r.get('visible')}"
+    um = r.get("uid_map")
+    # exactly one mapping of a single id, our uid inside (the outer id is relative to bwrap's parent namespace)
+    if not (isinstance(um, list) and len(um) == 3 and um[0] == str(uid) and um[2] == "1") or r.get("uid") != uid:
+        return f"unexpected user namespace uid map: {r.get('uid_map')}"
+    return None
 
 
 def base_args() -> list[str]:
