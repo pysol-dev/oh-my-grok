@@ -181,3 +181,19 @@ def test_cli_serve_prints_url_and_stops_on_finish(omo_home, tmp_path):
     finally:
         if p.poll() is None:
             p.kill()
+
+
+def test_referrer_policy_is_same_origin_so_chrome_sends_a_real_origin(srv):
+    # Regression: with no-referrer, Chrome sends `Origin: null` on the same-origin form POST -> 403 for the user.
+    st, body, hdr = req(srv, "GET", f"/setup/{srv.token}")
+    assert st == 200 and hdr["Referrer-Policy"] == "same-origin"
+    assert "<meta name='referrer' content='same-origin'>" in body and "no-referrer" not in body
+    origin = {"Origin": f"http://127.0.0.1:{srv.port}"}
+    st, body, _ = req(srv, "POST", f"/setup/{srv.token}",
+                      urlencode({"url_executor": URL, "key_executor": KEY, "action": "save"}), headers=origin)
+    assert st == 200 and "<b>executor</b>: configured" in body and URL not in body and KEY not in body
+    data = json.loads((Path(os.environ["OMO_HOME"]) / "state" / "secrets" / "hooks.json").read_text())
+    assert data["executor"]["url"] == URL and data["executor"]["key"] == KEY
+    # `null` stays forbidden
+    st, _, _ = req(srv, "POST", f"/setup/{srv.token}", "action=save", headers={"Origin": "null"})
+    assert st == 403

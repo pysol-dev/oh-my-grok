@@ -93,7 +93,7 @@ _CSS = ("body{font-family:sans-serif;max-width:46em;margin:1em auto;padding:0 1e
 
 def render(token: str, labels: dict, status: dict, results: dict | None = None, finished: bool = False) -> bytes:
     esc = html.escape
-    parts = ["<!doctype html><html><head><meta charset='utf-8'><meta name='referrer' content='no-referrer'>",
+    parts = ["<!doctype html><html><head><meta charset='utf-8'><meta name='referrer' content='same-origin'>",
              f"<title>omo webhook setup</title><style>{_CSS}</style></head><body>",
              "<h1>omo webhook setup</h1>"]
     if finished:
@@ -155,7 +155,7 @@ class HookFormServer:
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
-                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("Referrer-Policy", "same-origin")
                 self.send_header("X-Frame-Options", "DENY")
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; "

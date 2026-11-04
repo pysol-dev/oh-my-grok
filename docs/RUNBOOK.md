@@ -90,7 +90,8 @@ How it is protected:
 - Every path except `/setup/<token>` returns 404.
 - A Host other than `127.0.0.1:<port>`, or a foreign Origin, gets 403 (DNS-rebinding guard).
 - Values travel only in the POST body (urlencoded, max 64 KB).
-- Request logging is off, and responses are no-store/no-referrer with a strict CSP.
+- Request logging is off, and responses are no-store with a strict CSP and `Referrer-Policy: same-origin`. With `no-referrer`, Chrome
+  sends `Origin: null` on the same-origin form POST, which the strict Origin check rejects with 403; `null` is never accepted.
 - Values pass through the same `sanitize_input` and `set_hook` validation as `hook set`, and are stored only
   in `state/secrets/hooks.json` (0600).
 
