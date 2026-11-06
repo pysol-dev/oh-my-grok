@@ -13,11 +13,12 @@ by talking to **Hephaestus**. The flow:
 8. Code Reviewer and QA review the exact revision.
 9. A revision-bound final gate closes the job.
 
-**Status: INSTALLED; live tests PASS on DB evidence, receipts pending.** The code and automated tests pass. The `omo` MCP
-is registered, all 7 `omo-bus-<role>` routines exist with webhook keys, and the live tests passed on DB evidence on
-2026-11-04: §10.20 (job e667cf20), §10.21 (same job, plus Hephaestus intake in 9fa4f055) and §10.22 (job 9fa4f055).
-Routine run receipts are pending (not readable from Hephaestus's session). Webhook key rotation is recommended (see
-`docs/SECURITY.md`). See `spec/PROGRESS.md`.
+**Status: PARTIALLY INSTALLED / NOT OPERATIONAL.** The code and automated tests pass (`./omoctl doctor` still reports
+NOT OPERATIONAL). The `omo` MCP is registered, all 7 `omo-bus-<role>` routines exist with webhook keys, and the live
+tests passed on DB evidence on 2026-11-04: §10.20 (job e667cf20), §10.21 (same job, plus a submit via the user-omo MCP
+from Hephaestus's session in 9fa4f055 — actor is the default role name, not an authenticated caller) and §10.22 (job
+9fa4f055). Routine run receipts are pending (not readable from Hephaestus's session). Webhook key rotation is
+recommended (see `docs/SECURITY.md`). See `spec/PROGRESS.md`.
 
 ## Quick start
 ```bash

@@ -127,10 +127,17 @@ def submit(goal: Annotated[str, Field(min_length=1, max_length=20000)],
                                     acceptance_criteria=acceptance_criteria, verifier_profile=verifier_profile))
 
 
+def claim_with_task_role(e: Engine, job_id: str, task_id: str, dispatch_id: str) -> dict[str, Any]:
+    """MCP claim path: stamp actor with the task's bound role so claim_refused/task_claimed events record it.
+    The stdio MCP server has no authenticated caller identity of its own."""
+    role = e._task(job_id, task_id)["role"]
+    return e.claim(job_id, task_id, dispatch_id, actor=role)
+
+
 @server.tool(description="Claim a dispatched task with the dispatch_id from your wake-up payload. Returns the full "
                          "TaskPacket (attempt_id, lease, inputs with sha256, output_schema, policies).")
 def claim(job_id: Id, task_id: Id, dispatch_id: Id) -> dict[str, Any]:
-    return _call(lambda e: e.claim(job_id, task_id, dispatch_id))
+    return _call(lambda e: claim_with_task_role(e, job_id, task_id, dispatch_id))
 
 
 @server.tool(description="Re-read the TaskPacket plus requirements, recorded blockers and approval label. Read-only.")

@@ -2,6 +2,7 @@
 import http.client
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -234,3 +235,51 @@ def test_hook_set_reprompts_on_malformed_url(omo_home, monkeypatch, capsys):
     rc = cli.main(["hook", "set", "explorer"])
     out, err = capsys.readouterr()
     assert rc == 0 and "malformed" in err and "SENTINEL" not in out + err and "internal error" not in err
+
+
+def test_sigterm_stops_server_and_removes_url_file_and_log(omo_home, tmp_path):
+    """Momus r12 N3: kill -TERM must run the same cleanup as Finish (URL file + redirect log)."""
+    uf = tmp_path / "cli_url"
+    log = Path(os.environ["OMO_HOME"]) / "state" / "logs" / "hook_serve.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("status only\n")
+    os.chmod(log, 0o600)
+    # omoctl cleans state/logs/hook_serve.log (and best-effort /tmp/omo_hook_serve.log). Assert the state log goes.
+    p = subprocess.Popen([str(ROOT / "omoctl"), "hook", "serve", "--url-file", str(uf), "--idle-minutes", "5"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=dict(os.environ))
+    try:
+        first = p.stdout.readline()
+        assert "written to" in first
+        for _ in range(50):
+            if uf.exists():
+                break
+            time.sleep(0.1)
+        assert uf.exists() and log.exists()
+        p.send_signal(signal.SIGTERM)
+        out, err = p.communicate(timeout=20)
+        assert p.returncode == 0, (p.returncode, out, err)
+        assert "stopped (SIGTERM)" in out
+        assert not uf.exists(), "URL file must be removed on SIGTERM"
+        assert not log.exists(), "hook_serve.log must be removed on SIGTERM"
+    finally:
+        if p.poll() is None:
+            p.kill()
+
+
+def test_sigint_stops_server_and_removes_url_file(omo_home, tmp_path):
+    uf = tmp_path / "cli_url"
+    p = subprocess.Popen([str(ROOT / "omoctl"), "hook", "serve", "--url-file", str(uf), "--idle-minutes", "5"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=dict(os.environ))
+    try:
+        p.stdout.readline()
+        for _ in range(50):
+            if uf.exists():
+                break
+            time.sleep(0.1)
+        assert uf.exists()
+        p.send_signal(signal.SIGINT)
+        out, err = p.communicate(timeout=20)
+        assert p.returncode == 0 and "stopped (SIGINT)" in out and not uf.exists()
+    finally:
+        if p.poll() is None:
+            p.kill()

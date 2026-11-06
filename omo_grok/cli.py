@@ -368,15 +368,21 @@ def cmd_hook_set(args) -> int:
 
 def cmd_hook_serve(args) -> int:
     """Local-only masked web form (127.0.0.1, random port, per-run session token) for GUIs that cannot paste into a
-    terminal. Writes the URL only to the URL file (0600) unless --print-url; stops on Finish or after the idle timeout."""
+    terminal. Writes the URL only to the URL file (0600) unless --print-url; stops on Finish, idle timeout, Ctrl-C or
+    SIGTERM (URL file and known redirect logs are removed)."""
     from .hook_form import URL_FILE, HookFormServer
-    srv = HookFormServer(get_paths(), _engine, idle_seconds=args.idle_minutes * 60, port=args.port,
-                         url_file=Path(args.url_file) if args.url_file else URL_FILE)
+    paths = get_paths()
+    # Known redirect-log locations (RUNBOOK recipe + legacy /tmp path from earlier drafts).
+    cleanup = [paths.logs_dir / "hook_serve.log", Path("/tmp/omo_hook_serve.log")]
+    srv = HookFormServer(paths, _engine, idle_seconds=args.idle_minutes * 60, port=args.port,
+                         url_file=Path(args.url_file) if args.url_file else URL_FILE,
+                         cleanup_paths=cleanup)
+    srv.arm_signal_handlers()  # before publishing the URL file, so SIGTERM during startup still cleans up
     srv.write_url_file()  # before announcing it, so a reader of the file never races the server start
     if args.print_url:
         print(f"omo webhook setup form (local only, per-run session token): {srv.url}", flush=True)
-    print(f"omo webhook setup form URL written to {srv.url_file} (0600; not printed, use --print-url to show it). Stops on 'Finish' or after {args.idle_minutes:g} idle "
-          f"minutes. Values are never echoed or logged.", flush=True)
+    print(f"omo webhook setup form URL written to {srv.url_file} (0600; not printed, use --print-url to show it). Stops on 'Finish', idle timeout, Ctrl-C or SIGTERM "
+          f"(after {args.idle_minutes:g} idle minutes max). Values are never echoed or logged.", flush=True)
     reason = srv.serve()
     print(f"setup server stopped ({reason})", flush=True)
     return EXIT_OK

@@ -8,8 +8,8 @@ For GUIs whose paste tool cannot type into a terminal. Security properties:
   - values arrive only in the POST body; they are sanitized (hooks.sanitize_input) and validated/stored by
     hooks.set_hook; they are never echoed in a page, never logged (request logging is disabled entirely), and never
     put into a URL; responses are no-store with a strict CSP;
-  - the server stops on 'Finish' or after `idle_seconds` without a request (default 30 minutes), and then removes
-    its URL file."""
+  - the server stops on 'Finish', idle timeout, Ctrl-C (SIGINT) or SIGTERM, and then removes its URL file
+    and any configured cleanup paths (e.g. the RUNBOOK redirect log)."""
 from __future__ import annotations
 
 import hmac
@@ -17,6 +17,7 @@ import html
 import json
 import os
 import secrets
+import signal
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -127,13 +128,15 @@ def render(token: str, labels: dict, status: dict, results: dict | None = None, 
 
 class HookFormServer:
     def __init__(self, paths: Paths, engine_factory, idle_seconds: float = 1800.0, port: int = 0,
-                 url_file: Path | None = None):
+                 url_file: Path | None = None, cleanup_paths: list[Path] | None = None):
         self.paths, self.engine_factory, self.idle_seconds = paths, engine_factory, idle_seconds
         self.token = secrets.token_urlsafe(32)
         self.lock = threading.Lock()
         self.last_activity = time.monotonic()
         self.finished = threading.Event()
         self.url_file = url_file
+        self.cleanup_paths = list(cleanup_paths or [])
+        self._stop_reason = "finished"
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -237,25 +240,69 @@ class HookFormServer:
             os.close(fd)
         os.replace(tmp, self.url_file)  # readers never see an empty or partial file
 
+    def cleanup_files(self) -> None:
+        """Remove the URL file and any extra cleanup paths (e.g. redirect logs). Best-effort."""
+        targets = []
+        if self.url_file is not None:
+            targets.append(self.url_file)
+        targets.extend(self.cleanup_paths)
+        for path in targets:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    def _request_stop(self, reason: str) -> None:
+        self._stop_reason = reason
+        self.finished.set()
+        # shutdown must not run on the signal thread; schedule it
+        threading.Thread(target=self.httpd.shutdown, daemon=True).start()
+
+    def arm_signal_handlers(self) -> dict:
+        """Install SIGINT/SIGTERM handlers before the URL file is published. Returns previous handlers."""
+        self._stop_reason = "finished"
+
+        def _on_signal(signum, _frame):
+            name = "SIGINT" if signum == signal.SIGINT else "SIGTERM"
+            self._request_stop(name)
+
+        prev = {}
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                prev[sig] = signal.signal(sig, _on_signal)
+            except (ValueError, OSError):
+                # not in main thread, or unsupported — skip; Finish/idle still work
+                pass
+        self._prev_signal_handlers = prev
+        return prev
+
     def _watch(self):
         while not self.finished.wait(1.0):
             if time.monotonic() - self.last_activity > self.idle_seconds:
+                self._stop_reason = "idle timeout"
                 self.finished.set()
         time.sleep(0.3)  # let the 'Finished' page go out
         self.httpd.shutdown()
 
     def serve(self) -> str:
-        """Blocks until Finish or idle timeout. Returns the reason."""
+        """Blocks until Finish, idle timeout, SIGINT or SIGTERM. Returns the reason."""
+        prev = getattr(self, "_prev_signal_handlers", None)
+        if prev is None:
+            prev = self.arm_signal_handlers()
         self.write_url_file()
         w = threading.Thread(target=self._watch, daemon=True)
         w.start()
         try:
             self.httpd.serve_forever(poll_interval=0.5)
         finally:
-            self.httpd.server_close()
-            if self.url_file is not None:
+            for sig, handler in prev.items():
                 try:
-                    self.url_file.unlink()
-                except OSError:
+                    signal.signal(sig, handler)
+                except (ValueError, OSError):
                     pass
+            self._prev_signal_handlers = None
+            self.httpd.server_close()
+            self.cleanup_files()
+        if self._stop_reason in ("SIGINT", "SIGTERM", "idle timeout"):
+            return self._stop_reason
         return "finished" if time.monotonic() - self.last_activity <= self.idle_seconds else "idle timeout"

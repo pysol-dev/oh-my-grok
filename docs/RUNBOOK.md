@@ -81,7 +81,7 @@ cat /tmp/omo_hook_form_url     # http://127.0.0.1:<random port>/setup/<per-run s
 
 The tokenized URL is written only to the 0600 URL file, never to stdout (`--print-url` overrides this; don't use
 it with a log redirect). The log is created under umask 077 (mode 0600) in `state/logs/`, holds only status
-lines, and the subshell deletes it once the server stops (Finish or idle timeout). The token is a **per-run session
+lines, and the subshell deletes it once the server stops (Finish, idle timeout, Ctrl-C or SIGTERM); the server itself also removes the URL file and known log paths on those same stops. The token is a **per-run session
 token**: 256 bits from `secrets.token_urlsafe(32)`, valid for any number of requests until the server stops, and
 never reused across runs. It is not single-use.
 
@@ -89,8 +89,7 @@ Open that URL in the box browser. There is one section per async role, in this o
 qa-executor (Metis), momus, code-reviewer (Momus), executor. Each section shows the bot, the routine and a
 "Configured already: yes/no" line, plus two masked fields (URL, key). Paste into the fields, leave both blank to
 skip a role, then press **Save**. The page reports configured / skipped / error per role, with the same safe
-diagnostics as `hook set` and never the values. You can resubmit as often as needed. **Finish** stops the server
-and deletes the URL file. It also exits by itself after 30 idle minutes (`--idle-minutes N`).
+diagnostics as `hook set` and never the values. You can resubmit as often as needed. **Finish**, idle timeout, Ctrl-C (SIGINT) or SIGTERM stops the server and deletes the URL file (and known redirect logs). Idle timeout defaults to 30 minutes (`--idle-minutes N`).
 How it is protected:
 - It binds to 127.0.0.1 only, on a random port (`--port`).
 - Every path except `/setup/<token>` returns 404.

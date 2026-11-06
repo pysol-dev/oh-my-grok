@@ -317,3 +317,21 @@ def test_claim_at_attempt_budget_blocks_and_persists(h):
         e.claim(job, t["id"], disp, actor="explorer")
     t3 = e._one("SELECT status, block_reason FROM tasks WHERE id=?", (t["id"],))
     assert t3["status"] == "blocked" and t3["block_reason"] == "attempt budget exhausted"
+
+def test_mcp_claim_path_records_task_role_as_actor_on_refusal(h):
+    """Momus r12 N4: MCP claim must pass actor=role so claim_refused events are not actor=NULL."""
+    from omo_grok.errors import Conflict
+    from omo_grok.mcp_server import claim_with_task_role
+    e = h.e
+    job = h.submit()["job_id"]
+    t = h.task(job, "explore")
+    disp = t["current_dispatch_id"]
+    claim_with_task_role(e, job, t["id"], disp)
+    with pytest.raises(Conflict):
+        claim_with_task_role(e, job, t["id"], disp)
+    rows = e.conn.execute("SELECT actor, data_json FROM events WHERE task_id=? AND kind='claim_refused'",
+                          (t["id"],)).fetchall()
+    assert len(rows) == 1 and rows[0][0] == "explorer"
+    claimed = e.conn.execute("SELECT actor FROM events WHERE task_id=? AND kind='task_claimed'",
+                             (t["id"],)).fetchall()
+    assert claimed and claimed[0][0] == "explorer"

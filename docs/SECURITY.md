@@ -452,22 +452,26 @@ duties between cooperating agents, not protection against a malicious same-accou
   both failed. The user then chose to paste all 7 webhook URL/key pairs into the Hephaestus chat, and Hephaestus stored
   them. Those keys therefore exist in that chat's history (and any transcript copies), outside `hooks.json`. Treat them
   as exposed: **rotation of all 7 is recommended** (RUNBOOK "Rotation"). Until rotated, anyone who can read that chat
-  history can wake the routines. Even then, a wake-up only carries ids: claiming still needs the engine's dispatch_id
-  match, and the plan gate, approvals and final gate still apply.
+  history holds the routine webhook keys and can POST **arbitrary text into that routine's prompt** (prompt-injection
+  and usage-cost risk). Engine-sent wake-ups carry only ids (job/task/dispatch/attempt); claiming still needs the
+  engine's dispatch_id match, and the plan gate, approvals and final gate still apply. A leaked-key POST is not limited
+  to those ids.
 
 ### `omoctl hook serve` (local masked form)
 - Binds `127.0.0.1` only, random port by default. Only `/setup/<token>` is served (404 otherwise, constant-time compare).
 - Token: **per-run session token**, 256 bits (`secrets.token_urlsafe(32)`). Valid for the whole server lifetime
   (reusable across requests in that run), new each run, not single-use.
-- The tokenized URL goes only to a 0600 URL file (written atomically, deleted on stop). It is not printed unless
-  `--print-url` is given.
+- The tokenized URL goes only to a 0600 URL file (written atomically). It is deleted on Finish, idle timeout,
+  Ctrl-C (SIGINT), or SIGTERM (the serve loop installs handlers so cleanup runs). It is not printed unless
+  `--print-url` is given. The RUNBOOK redirect log (`state/logs/hook_serve.log`, or the legacy `/tmp/omo_hook_serve.log`)
+  is removed by the same cleanup paths when present.
 - Host must be exactly `127.0.0.1:<port>`, and Origin is either absent or exactly `http://127.0.0.1:<port>`
   (`null` refused), as a DNS-rebinding/CSRF guard.
 - Headers: `Cache-Control: no-store`, strict CSP (`default-src 'none'`, `form-action 'self'`, `frame-ancestors
   'none'`), `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: same-origin`.
 - POST body is urlencoded only, capped at 64 KB and 64 fields (over that gives 400). Malformed URLs give a per-role error
   with a value-free diagnostic. No request logging.
-- Idle timeout 30 min (`--idle-minutes`), plus a Finish button.
+- Idle timeout 30 min (`--idle-minutes`), plus a Finish button. SIGTERM/SIGINT stop the server the same way.
 - **Residuals:** any same-account process can read the URL file or connect to loopback, so this is not a boundary
   against same-account code. The token is reusable until stop. Values sit in browser memory and form state until the
   tab closes. It is plain HTTP on loopback. The box browser's own history may record the tokenized URL (harmless once
