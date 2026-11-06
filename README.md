@@ -46,7 +46,7 @@ Upstream OmO is the **oh-my-openagent / LazyCodex** lineage:
 
 **In one sentence:** OmO keeps a multi-agent loop *inside* one Codex session with plugin hooks and boulder state; omo-grok keeps durable job state in SQLite and *pings separate Grok Bots* when a task is ready.
 
-This repo is intended for a **public GitHub** push (done separately). Do not invent the remote URL here until it exists.
+Public repo: [https://github.com/pysol-dev/omo-grok](https://github.com/pysol-dev/omo-grok) (`main`). Secrets (`state/`, `hooks.json`, `.venv`) are gitignored and were never pushed.
 
 ## Quick start
 
