@@ -288,3 +288,32 @@ def test_duplicate_wakeup_claim_is_refused_and_logged_without_secrets(h):
     data = json.loads(rows[0][1])
     assert rows[0][0] == "explorer" and data["dispatch_id"] == disp and "working" in data["reason"]
     assert KEY not in rows[0][1] and "http" not in rows[0][1] and "token" not in rows[0][1].lower()
+
+def test_claim_at_attempt_budget_blocks_and_persists(h):
+    """Regression (Momus r12): `_block_task(..., attempt budget exhausted)` must COMMIT before Conflict is
+    raised. Raising Conflict inside the same tx used to roll the block back, leaving the task claimable forever."""
+    from omo_grok.errors import Conflict
+    e = h.e
+    job = h.submit()["job_id"]
+    t = h.task(job, "explore")
+    disp = t["current_dispatch_id"]
+    # Force the task to its attempt ceiling while still dispatched (autocommit outside a tx).
+    e.conn.execute("UPDATE tasks SET attempt_no = max_attempts WHERE id=?", (t["id"],))
+    with pytest.raises(Conflict, match="attempt budget exhausted"):
+        e.claim(job, t["id"], disp, actor="explorer")
+    t2 = e._one("SELECT status, block_reason, attempt_no, max_attempts FROM tasks WHERE id=?", (t["id"],))
+    assert t2["status"] == "blocked"
+    assert t2["block_reason"] == "attempt budget exhausted"
+    assert t2["attempt_no"] == t2["max_attempts"]
+    job2 = e._one("SELECT phase, failure_reason FROM jobs WHERE id=?", (job,))
+    assert job2["phase"] == "blocked" and "attempt budget exhausted" in (job2["failure_reason"] or "")
+    rows = e.conn.execute("SELECT actor, data_json FROM events WHERE task_id=? AND kind='claim_refused'",
+                          (t["id"],)).fetchall()
+    assert len(rows) == 1
+    data = json.loads(rows[0][1])
+    assert rows[0][0] == "explorer" and data["dispatch_id"] == disp and "attempt budget exhausted" in data["reason"]
+    # A second claim stays refused; the block must still be present (not rolled back).
+    with pytest.raises(Conflict):
+        e.claim(job, t["id"], disp, actor="explorer")
+    t3 = e._one("SELECT status, block_reason FROM tasks WHERE id=?", (t["id"],))
+    assert t3["status"] == "blocked" and t3["block_reason"] == "attempt budget exhausted"

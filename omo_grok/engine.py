@@ -615,24 +615,33 @@ class Engine:
                 raise Conflict("dispatch record is not claimable")
             self._require_plan_authorization(job, t)
             if t["attempt_no"] >= t["max_attempts"]:
+                # Block and COMMIT in this tx (do not raise inside it — Conflict would roll the block back).
                 self._block_task(t, "attempt budget exhausted")
-                raise Conflict("attempt budget exhausted")
-            attempt_no = t["attempt_no"] + 1
-            aid = str(uuid.uuid4())
-            token = pysecrets.token_hex(16)
-            lease = self.now() + self._policy(job)["lease_seconds"]
-            self.conn.execute("INSERT INTO task_attempts(id,task_id,job_id,attempt_no,dispatch_id,claim_token,status,"
-                              "binding_id,started_at,lease_expires_at) VALUES (?,?,?,?,?,?,'working',?,?,?)",
-                              (aid, task_id, job_id, attempt_no, dispatch_id, token, d["binding_id"], db.utcnow(),
-                               lease))
-            self._set_task(t, WORKING, attempt_no=attempt_no, current_attempt_id=aid, lease_token=token,
-                           lease_expires_at=lease, block_reason=None)
-            # any not-yet-sent duplicate wake-ups for this task become harmless no-ops
-            self.conn.execute("UPDATE dispatch_outbox SET superseded=1 WHERE task_id=? AND status IN "
-                              "('pending','retry_wait')", (task_id,))
-            self._ev("task_claimed", job_id, task_id, actor or t["role"], attempt_id=aid, dispatch_id=dispatch_id,
-                     attempt_no=attempt_no)
+                exhausted = True
+            else:
+                exhausted = False
+                self._insert_claim(job, t, d, job_id, task_id, dispatch_id, actor)
+        if exhausted:
+            raise Conflict("attempt budget exhausted")
         return self._packet(job_id, task_id)
+
+    def _insert_claim(self, job, t, d, job_id, task_id, dispatch_id, actor) -> None:
+        """Caller holds the transaction."""
+        attempt_no = t["attempt_no"] + 1
+        aid = str(uuid.uuid4())
+        token = pysecrets.token_hex(16)
+        lease = self.now() + self._policy(job)["lease_seconds"]
+        self.conn.execute("INSERT INTO task_attempts(id,task_id,job_id,attempt_no,dispatch_id,claim_token,status,"
+                          "binding_id,started_at,lease_expires_at) VALUES (?,?,?,?,?,?,'working',?,?,?)",
+                          (aid, task_id, job_id, attempt_no, dispatch_id, token, d["binding_id"], db.utcnow(),
+                           lease))
+        self._set_task(t, WORKING, attempt_no=attempt_no, current_attempt_id=aid, lease_token=token,
+                       lease_expires_at=lease, block_reason=None)
+        # any not-yet-sent duplicate wake-ups for this task become harmless no-ops
+        self.conn.execute("UPDATE dispatch_outbox SET superseded=1 WHERE task_id=? AND status IN "
+                          "('pending','retry_wait')", (task_id,))
+        self._ev("task_claimed", job_id, task_id, actor or t["role"], attempt_id=aid, dispatch_id=dispatch_id,
+                 attempt_no=attempt_no)
 
     def _packet(self, job_id, task_id) -> dict:
         job = self._job(job_id)
