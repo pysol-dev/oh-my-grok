@@ -207,6 +207,13 @@ backup on the next open). A missing base revision fails closed.
 - Fix the cause, then run `./omoctl resume JOB` (add `--grant-repair-cycles N` when the repair budget is exhausted).
   Then run `./omoctl reconcile JOB`.
 
+## 11b. Cutover and rollback
+See `docs/MIGRATION.md` (Cutover and rollback). This build **is** the installation (nothing older under `/workspace/omo`
+to retire). To roll code/DB back: stop omo activity, `./omoctl restore state/backups/pre-migrate-vN-<ts>.sqlite3`, keep
+`state/secrets/hooks.json` at 0600, restart the `user-omo` MCP after a code rollback, and **do not delete** Bots or
+`omo-bus-*` routines. Filesystem backups do not restore Grok Bot conversations or agent memory. Uninstall (§12) is a
+separate destructive path.
+
 ## 12. Cancel and uninstall
 - `./omoctl cancel JOB --reason "..."` asks for TTY confirmation. Nothing is deleted. Worktrees and branches in user
   repos are kept for inspection. Remove them yourself with
@@ -230,6 +237,6 @@ backup on the next open). A missing base revision fails closed.
 | Exhausted retry budget | The dispatch becomes `failed` after `dispatch_max_retries`. Repeated 429 means the platform rate limit: wait, then `resume`. Lower `per_bot_hourly_dispatch_limit` if needed |
 | Repair budget exhausted (3 cycles) | The job is `blocked` with each cycle's diagnostics. `resume JOB --grant-repair-cycles 1` only after reading why |
 | `dispatch deferred: no enabled role binding` / `bot_busy` | Bind or verify the role, or wait for the shared Bot to finish (per-Bot serialization) |
-| Doctor shows "NOT OPERATIONAL" | Expected until `omoctl test live --fixture-only` passes with real bindings and hooks |
+| Doctor shows "NOT OPERATIONAL" | Expected while status is PARTIALLY INSTALLED / NOT OPERATIONAL. Live §10.20–§10.22 passed on DB evidence; routine receipts and other gaps remain (README, `docs/MIGRATION.md`). Doctor OK is not OPERATIONAL |
 | MCP tool returns `stale_server` | The omo code or config on disk changed after this MCP server process started (it fingerprints `omo_grok/**/*.py` and the config dir). Restart the omo MCP server (reload the connector) and retry. This exists because a stale server once ran old verifier code against a new child script |
 | `webhook for ROLE not configured` while `hook list` says configured | Can no longer happen: dispatch, `roles list` and `hook list` all read `state/secrets/hooks.json`. `hooks_meta` is only an audit trail |
