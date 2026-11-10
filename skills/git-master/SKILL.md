@@ -31,6 +31,8 @@ You are changing code in a job worktree on a job branch. Leave a history a revie
 ## What the engine can and cannot check
 
 When `git_discipline` is `enforce`, the final gate verifies, from git itself and not from what you say: the history
-from the base to the candidate has no merge commits, has at most the configured number of commits, and every commit
-message carries the job trailer. That is all. It cannot tell whether you read this document or whether your commits
-are well scoped; independent code review judges that.
+from the base to the candidate has no merge commits, has at most the configured number of commits, every commit
+message carries the job trailer, and the candidate descends from every earlier candidate of this job. A repair that
+replaces that history (`reset --hard` back to the base, or amending a commit already reported) is refused at submit
+with `git_history_not_descendant` and fails the same check in the final gate. The engine still cannot tell whether
+you read this document or whether your commits are well scoped; independent code review judges that.

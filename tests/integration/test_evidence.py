@@ -372,6 +372,70 @@ def test_too_many_commits_fails_final_gate(omo_home):
         h.close()
 
 
+def test_rewritten_repair_is_refused_and_fails_the_history_gate(omo_home):
+    """A repair that resets to the base and re-commits does not descend from the rejected candidate.
+    40d2645 accepted it and the final gate passed."""
+    h = mkh({"git_discipline": "enforce"})
+    try:
+        job = h.submit()["job_id"]
+        h.to_approval(job)
+        h.approve(job)
+        _, sha1, _ = h.implement(job, fix=trailer_fix(job))
+        h.review(job, "code_review", verdict="reject")
+        pkt = h.claim(job, "implement")
+        wt = Path(pkt["worktree_root"])
+        base = h.e._job(job)["base_revision"]
+        subprocess.run(["git", "-C", str(wt), "reset", "--hard", base], check=True, capture_output=True)
+        assert gitops.head(wt) == base
+
+        def rewrite(path):
+            src = path / "calc" / "__init__.py"
+            src.write_text(src.read_text().replace(fx.FIX_FROM, fx.FIX_TO) + "\n# rewritten history\n")
+            return fx.commit_all(path, f"rewritten\n\nOmo-Job: {job}")
+
+        sha2 = rewrite(wt)
+        assert sha2 != sha1 and gitops.is_ancestor(wt, sha1, sha2) is False
+        with pytest.raises(ValidationError, match="git_history_not_descendant"):
+            h.e.complete(job, pkt["task_id"], pkt["attempt_id"],
+                         {"commit_sha": sha2, "touched_files": ["calc/__init__.py"], "summary": "rewritten",
+                          "unit_evidence": "ran", "deviations": [], "risks": []})
+        assert h.e._job(job)["candidate_revision"] == sha1
+        checks: dict = {}
+
+        def chk(name, ok, detail=""):
+            checks[name] = {"ok": bool(ok), "detail": detail}
+
+        h.e._history_gate_checks(job, sha2, chk)
+        assert checks["git_history_not_descendant"]["ok"] is False
+        assert sha1[:12] in checks["git_history_not_descendant"]["detail"]
+    finally:
+        h.close()
+
+
+def test_repair_that_extends_the_rejected_candidate_passes_the_gate(omo_home):
+    h = mkh({"git_discipline": "enforce"})
+    try:
+        job = h.submit()["job_id"]
+        h.to_approval(job)
+        h.approve(job)
+        h.implement(job, fix=trailer_fix(job))
+        h.review(job, "code_review", verdict="reject")
+
+        def extend(wt):
+            p = wt / "calc" / "__init__.py"
+            p.write_text(p.read_text() + "# repair on top\n")
+            return fx.commit_all(wt, f"repair on top\n\nOmo-Job: {job}")
+
+        h.implement(job, fix=extend)
+        h.review(job, "code_review")
+        h.review(job, "qa")
+        _, res = h.integrate(job)
+        assert res["final_gate"]["passed"] is True, res["final_gate"]["checks"]
+        assert res["final_gate"]["checks"]["git_history_not_descendant"]["ok"] is True
+    finally:
+        h.close()
+
+
 def test_shadow_records_history_but_does_not_gate(omo_home):
     h = mkh({"git_discipline": "shadow"})
     try:

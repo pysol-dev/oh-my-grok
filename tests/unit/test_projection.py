@@ -217,6 +217,24 @@ def test_editing_the_file_never_alters_decisions(h):
     assert h.e.status(job)["phase"] == "analysis"
 
 
+@pytest.mark.parametrize("name", ["boulder.json", "boulder.lock"])
+def test_symlink_is_replaced_without_being_followed(h, tmp_path, name):
+    job = h.submit()["job_id"]
+    d = paths_for(job)[1]
+    target = d / name
+    secret = tmp_path / "secret-target"
+    secret.write_text("do-not-touch")
+    target.unlink()
+    target.symlink_to(secret)
+    r = projection.project(h.e.conn, h.e.paths, job)
+    assert r["status"] == "written" and r["tamper"] is True
+    assert target.is_file() and not target.is_symlink()
+    assert secret.read_text() == "do-not-touch"
+    if name == "boulder.json":
+        assert json.loads(target.read_text())["works"][job]["status"] == "active"
+    assert h.e._one("SELECT 1 FROM events WHERE job_id=? AND kind='boulder_tamper'", (job,))
+
+
 def test_plan_file_edit_is_detected_and_restored(h):
     job = h.submit()["job_id"]
     h.to_approval(job, "ORIGINAL PLAN")

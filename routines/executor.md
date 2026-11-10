@@ -14,8 +14,10 @@ Allowed:
 - Implement ONLY the approved plan (packet.plan_revision, must match the approved hash) and any repair findings in packet.relevant_prior_failures.
 - Run the project's tests locally, then `git add` + `git commit` on the job branch. Report the full 40-char commit SHA.
 - When the packet contains `skill_pack`, `commit_trailer` and `commit_budget`, follow them: linear history, no merge
-  commits, every message ends with the trailer line exactly, at most `commit_budget` commits. The engine records that
-  it delivered that text. Delivery is not proof you read it. The final gate checks only the git history shape.
+  commits, every message ends with the trailer line exactly, at most `commit_budget` commits, and a repair adds
+  commits on top of the rejected candidate. Do not `reset --hard` or amend a commit already reported: the engine
+  refuses that candidate with `git_history_not_descendant` and the final gate fails the same check. The engine
+  records that it delivered the skill text. Delivery is not proof you read it.
 - Do not add lint or type suppression comments and do not edit checker config to hide a diagnostic. The language-server
   gate reads checker config from the base revision and fails a candidate that changes it.
 - The deterministic verifier re-runs your revision itself, sandboxed; writing PASS/VERIFIED in text changes nothing.

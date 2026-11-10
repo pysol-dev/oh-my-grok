@@ -13,11 +13,13 @@ Writer protocol (one writer function, everything else calls it):
 No database write transaction is open during file I/O and the lock order is always file lock first, database second."""
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import json
 import os
 import re
+import stat
 import time
 import uuid
 from pathlib import Path
@@ -203,11 +205,27 @@ def _sha(b: bytes | None) -> str | None:
     return hashlib.sha256(b).hexdigest() if b is not None else None
 
 
+def _unlink_if_symlink(p: Path) -> bool:
+    """Remove a symlink without following it. A regular file is left untouched."""
+    try:
+        mode = os.lstat(p).st_mode
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISLNK(mode):
+        return False
+    os.unlink(p)
+    return True
+
+
 def _read(p: Path) -> bytes | None:
     try:
         fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
     except FileNotFoundError:
         return None
+    except OSError as e:
+        if e.errno == errno.ELOOP:  # a symlink; the caller replaces it and does not read the target
+            return None
+        raise
     with os.fdopen(fd, "rb") as fh:
         return fh.read()
 
@@ -317,7 +335,9 @@ def _project(conn, paths: Paths, job_id: str, lock_seconds: float) -> dict:
         _write_atomic(gi, b"*\n")
     boulder_path = d / "boulder.json"
     md_path = plans / f"{plan_name(job_id)}.md"
-    fd = _lock(d / "boulder.lock", lock_seconds)
+    lock_path = d / "boulder.lock"
+    symlink_replaced = _unlink_if_symlink(lock_path)
+    fd = _lock(lock_path, lock_seconds)
     if fd is None:
         prior = conn.execute("SELECT status FROM boulder_projection WHERE job_id=?", (job_id,)).fetchone()
         _record(conn, job_id, "stale", "timed out waiting for boulder.lock")
@@ -327,6 +347,10 @@ def _project(conn, paths: Paths, job_id: str, lock_seconds: float) -> dict:
     try:
         _fault("after_lock")
         _remove_stale_temps(d, plans)
+        if _unlink_if_symlink(boulder_path):
+            symlink_replaced = True
+        if _unlink_if_symlink(md_path):
+            symlink_replaced = True
         rec = conn.execute("SELECT * FROM boulder_projection WHERE job_id=?", (job_id,)).fetchone()
         cur_b, cur_md = _read(boulder_path), _read(md_path)
         trusted_b = {rec["sha256"], rec["pending_sha256"]} - {None} if rec else set()
@@ -339,6 +363,8 @@ def _project(conn, paths: Paths, job_id: str, lock_seconds: float) -> dict:
             tamper = _sha(cur_md) not in trusted_md
         elif not tamper and cur_md is None and rec and rec["plan_sha256"]:
             tamper = True
+        if symlink_replaced:
+            tamper = True  # a symlink is not read; it is removed and the projection is rewritten
         if tamper:
             _event(conn, job_id, "boulder_tamper", boulder_present=cur_b is not None, plan_present=cur_md is not None,
                    action="regenerated from the database; file contents were not imported")

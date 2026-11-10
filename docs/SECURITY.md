@@ -538,7 +538,7 @@ Language servers run in the same bubblewrap sandbox as the verifier. The verifie
 
 `docs` calls `https://mcp.context7.com/mcp` from the engine. An optional `CONTEXT7_API_KEY` is sent as a Bearer header and is not written to logs or receipts. The stored response is what a citation must quote. A second call to the same URL does not prove a bot made the first one.
 
-The git-master skill text is delivered in the executor packet and the engine records that delivery. A linear history with the job trailer proves the git shape. It does not prove the model read or followed the skill.
+The git-master skill text is delivered in the executor packet and the engine records that delivery. A linear history with the job trailer, inside the commit budget, whose candidate descends from every earlier candidate of that job, is what the gate can prove. It does not prove the model read or followed the skill. A repair that rewrites a reported candidate fails `git_history_not_descendant`.
 
 ## External network dependencies
 | Dependency | Failure behaviour |

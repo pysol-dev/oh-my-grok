@@ -208,8 +208,9 @@ review), `F3` (QA), `F4` (final gate). The approved plan text is appended under 
    ever visible. No database write transaction is open during file I/O; the lock order is file lock first, then at
    most one short transaction to record `{generation, sha256, status}` in `boulder_projection`.
 6. If the file's sha256 differs from the recorded one before a write (edited, truncated, deleted), record a
-   `boulder_tamper` event and overwrite from the database. A tampered file never changes any job state and never
-   blocks dispatch.
+   `boulder_tamper` event and overwrite from the database. A symlink at `boulder.json`, `boulder.lock`, or the active
+   plan file is not followed: it is unlinked and the file is regenerated from the database, and that is also a
+   `boulder_tamper` event. A tampered file never changes any job state and never blocks dispatch.
 7. Triggers: every public `Engine` mutation flushes the projections of the jobs whose events it wrote, after the
    outermost call returns (outside every transaction).
 8. Sessions are rows (`work_sessions`, unique `session_token`), not file fields, so concurrent appends cannot be lost
@@ -306,8 +307,10 @@ was not located at the pinned tree, so only its documented configuration surface
 co-author footer, and a footer string, informed the trailer rule). The executor packet field `skill_pack` carries
 `[{name, sha256, text}]`. On claim the engine records an `engine_delivered` receipt with the pack hash and the
 attempt id. Structural consequence checked by the final gate when `git_discipline` is not `off`:
-history `base..candidate` is linear (no merge commits), has at most `max_commits` (default 50) commits, and every
-commit message carries the trailer `Omo-Job: <job_id>`; commits are on the job branch only.
+history `base..candidate` is linear (no merge commits), has at most `max_commits` (default 50) commits, every
+commit message carries the trailer `Omo-Job: <job_id>`, and the candidate descends from every earlier candidate of
+the same job (a repair may not reset or otherwise rewrite a reported candidate). The submit of such a rewrite is
+refused with `git_history_not_descendant`; the final gate fails the same check. Commits are on the job branch only.
 **Limit:** delivery and a conforming history do not prove the executor read or understood the skill.
 
 ## 10. Feature flags (R14)

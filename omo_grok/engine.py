@@ -1326,6 +1326,11 @@ class Engine:
             raise ValidationError("commit is not based on the job base revision")
         if gitops.branch_head(wt, job["branch"]) != sha:
             raise ValidationError("commit is not the head of the job branch")
+        if self._features(job)["git_discipline"] == features.ENFORCE:
+            bad = self._non_descendant_priors(job, sha)
+            if bad:
+                raise ValidationError("git_history_not_descendant: repair candidate does not descend from prior "
+                                      "candidate " + bad[0])
 
     def _on_implement(self, job, t, a, result, ids, cls):
         sha = result["commit_sha"]
@@ -1820,6 +1825,23 @@ class Engine:
             assurance += "+soft_approval"
         return all(v["ok"] for v in c.values()), c, assurance
 
+    def _prior_candidate_revisions(self, job_id: str, sha: str | None) -> list[str]:
+        """Candidate revisions already recorded for this job, oldest first, excluding sha itself."""
+        rows = self._all("SELECT candidate_revision FROM tasks WHERE job_id=? AND kind='implement' AND "
+                         "candidate_revision IS NOT NULL ORDER BY created_at", (job_id,))
+        out = []
+        for r in rows:
+            rev = r["candidate_revision"]
+            if rev and rev != sha and rev not in out:
+                out.append(rev)
+        return out
+
+    def _non_descendant_priors(self, job, sha: str) -> list[str]:
+        if not sha or not job["worktree_path"]:
+            return []
+        wt = Path(job["worktree_path"])
+        return [p for p in self._prior_candidate_revisions(job["id"], sha) if not gitops.is_ancestor(wt, p, sha)]
+
     def _record_git_history(self, job, task_id, sha) -> None:
         mode = self._features(job)["git_discipline"]
         if mode == features.OFF or not sha:
@@ -1827,7 +1849,8 @@ class Engine:
         repo = Path(job["worktree_path"] or job["repo_path"])
         try:
             shape = gitops.history_shape(repo, job["base_revision"], sha, job["id"],
-                                         int(self._policy(job)["git_max_commits"]))
+                                         int(self._policy(job)["git_max_commits"]),
+                                         priors=self._prior_candidate_revisions(job["id"], sha))
             status = "ok" if shape["ok"] else "violations"
         except OmoError as e:
             shape, status = {"error": e.message[:200], "ok": False}, "error"
@@ -1849,6 +1872,11 @@ class Engine:
             f"{s.get('commits')} of {s.get('max_commits')}")
         chk("git_commits_carry_job_trailer", row is not None and not s.get("missing_trailer") and "error" not in s,
             _j((s.get("missing_trailer") or [])[:5]))
+        job = self._job(job_id)
+        bad = self._non_descendant_priors(job, sha) if sha else []
+        recorded = s.get("not_descendant_of") or []
+        chk("git_history_not_descendant", not bad and not recorded,
+            "prior candidate is not an ancestor: " + ", ".join(x[:12] for x in (bad or recorded)))
 
     def _docs_gate_checks(self, job_id, job, chk) -> None:
         scope = _l(job["scope_json"]) or {}
