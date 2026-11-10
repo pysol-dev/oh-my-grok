@@ -19,6 +19,21 @@ def tools_dir() -> Path:
     return Path(os.environ.get("OMO_TOOLS_DIR") or CODE_ROOT / "tools")
 
 
+def _tool_glob(pattern: str, missing: str) -> str:
+    hits = sorted(tools_dir().glob(pattern))
+    return str(hits[0]) if hits else str(tools_dir() / missing)
+
+
+def node_path() -> str:
+    """The node binary shipped inside the bootstrap-installed nodejs-wheel (a path that does not exist if absent,
+    so the profile fails closed with missing_tool instead of falling back to some other node)."""
+    return _tool_glob("venv/lib/python3*/site-packages/nodejs_wheel/bin/node", "venv/MISSING-nodejs_wheel/node")
+
+
+def site_packages() -> str:
+    return _tool_glob("venv/lib/python3*/site-packages", "venv/MISSING-site-packages")
+
+
 def mcp_command() -> str:
     py = python_path()
     if not os.path.exists(py):

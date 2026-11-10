@@ -8,7 +8,7 @@ from pathlib import Path
 
 from . import features
 from .errors import ValidationError
-from .paths import CODE_ROOT, python_path, tools_dir
+from .paths import CODE_ROOT, node_path, python_path, site_packages, tools_dir
 
 DEFAULT_POLICY = {
     "max_repair_cycles": 3,
@@ -70,7 +70,8 @@ _PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 def placeholder_values() -> dict[str, str]:
     """The only variables shipped config may reference, so no file needs to hardcode an install location."""
-    return {"OMO_CODE_ROOT": str(CODE_ROOT), "OMO_PYTHON": python_path(), "OMO_TOOLS": str(tools_dir())}
+    return {"OMO_CODE_ROOT": str(CODE_ROOT), "OMO_PYTHON": python_path(), "OMO_TOOLS": str(tools_dir()),
+            "OMO_NODE": node_path(), "OMO_SITE": site_packages()}
 
 
 def expand_placeholders(obj, values: dict[str, str] | None = None):
