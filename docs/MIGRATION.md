@@ -12,7 +12,7 @@ Still deferred, and not performed here:
 - Renaming live Grok Bot routines from `omo-bus-*` / `omo-reconcile` to `omg-bus-*` / `omg-reconcile`. The files in `routines/` are the new instructions. Do not delete the live routines.
 - Rotating webhook keys. Do not regenerate secrets for this rename.
 
-Compatibility that stays in the code: `omoctl` execs `omg`; `OMO_*` environment variables are accepted when the `OMG_*` name is unset; boulder readers accept `x_omo_grok` as well as `x_omg`; a `state/omo.sqlite3` file is opened when `state/omg.sqlite3` is absent; git history still accepts an `Omo-Job:` trailer; verifier profiles still fail closed on `OMO_VERIFY_TEMPLATE` and accept runner name `omo-unittest-child`.
+Compatibility that stays in the code: `omoctl` execs `omg`; `OMO_*` environment variables are accepted when the `OMG_*` name is unset; boulder readers accept `x_omo_grok` as well as `x_omg`; a `state/omo.sqlite3` file is opened when `state/omg.sqlite3` is absent; git history still accepts an `Omo-Job:` trailer; verifier profiles still fail closed on `OMO_VERIFY_TEMPLATE` and accept runner name `omo-unittest-child`. A profile argv that still ends at `<checkout>/omo_grok/unittest_child.py` (or `oracle_child.py`) is loaded as the same file under `oh_my_grok/`.
 
 `spec/IMPLEMENTATION.md` was not edited and still uses the old names.
 

@@ -68,6 +68,23 @@ def test_legacy_omo_placeholders_and_home_still_work(tmp_path, monkeypatch):
     assert paths.config_dir == (tmp_path / "oldcfg").resolve()
 
 
+def test_legacy_unittest_child_path_is_rewritten_before_validation(tmp_path, monkeypatch):
+    """A copied verifiers.json that still names omo_grok/unittest_child.py must load as the new child."""
+    shipped = json.loads((CODE_ROOT / "config" / "verifiers.json").read_text())
+    prof = shipped["profiles"]["fixture-calc-unittest"]
+    prof["runner"] = "omo-unittest-child"
+    prof["argv"][0] = "${OMO_PYTHON}"
+    prof["argv"][-1] = "${OMO_CODE_ROOT}/omo_grok/unittest_child.py"
+    (tmp_path / "verifiers.json").write_text(json.dumps({"profiles": {"fixture-calc-unittest": prof}}))
+    monkeypatch.delenv("OMG_PYTHON", raising=False)
+    loaded = config.load_verifier_profiles(tmp_path)["fixture-calc-unittest"]
+    assert loaded["argv"][-1] == str(config.UNITTEST_CHILD)
+    assert "omo_grok" not in loaded["argv"][-1]
+    assert config.validate_profile("fixture-calc-unittest", loaded) == []
+    other = dict(loaded, argv=[*loaded["argv"][:-1], "/tmp/omo_grok/unittest_child.py"])
+    assert any("oh_my_grok" in problem for problem in config.validate_profile("fixture-calc-unittest", other))
+
+
 def test_unknown_placeholder_is_refused(tmp_path):
     (tmp_path / "verifiers.json").write_text(json.dumps({"profiles": {"p": {"argv": ["${NOPE}/x"]}}}))
     with pytest.raises(Exception) as ei:

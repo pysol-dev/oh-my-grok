@@ -112,12 +112,43 @@ def expand_placeholders(obj, values: dict[str, str] | None = None):
     return obj
 
 
+def _rewrite_legacy_child(arg: str) -> str:
+    """Point a pre-rename trusted-child argv entry at oh_my_grok.
+
+    Only the code root's own ``omo_grok/unittest_child.py`` or ``omo_grok/oracle_child.py`` is rewritten.
+    Any other path is left alone so a profile cannot be silently retargeted.
+    """
+    if not isinstance(arg, str) or not arg.startswith("/"):
+        return arg
+    path = Path(arg)
+    for name, current in (("unittest_child.py", UNITTEST_CHILD), ("oracle_child.py", ORACLE_CHILD)):
+        if path == CODE_ROOT / "omo_grok" / name:
+            return str(current)
+    return arg
+
+
+def _normalize_legacy_child_paths(prof: dict) -> dict:
+    argv = prof.get("argv")
+    if not isinstance(argv, list):
+        return prof
+    rewritten = [_rewrite_legacy_child(a) if isinstance(a, str) else a for a in argv]
+    if rewritten == list(argv):
+        return prof
+    out = dict(prof)
+    out["argv"] = rewritten
+    return out
+
+
 def load_verifier_profiles(config_dir: Path) -> dict:
     p = config_dir / "verifiers.json"
     if not p.exists():
         return {}
     data = json.loads(p.read_text())
-    return expand_placeholders(data.get("profiles", {}))
+    profiles = expand_placeholders(data.get("profiles", {}))
+    if isinstance(profiles, dict):
+        profiles = {name: _normalize_legacy_child_paths(prof) if isinstance(prof, dict) else prof
+                    for name, prof in profiles.items()}
+    return profiles
 
 
 REQUIRED_PROFILE_KEYS = {"argv": list, "cwd": str, "env_allow": list, "timeout_seconds": (int, float)}

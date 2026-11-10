@@ -12,6 +12,7 @@ This tree is **oh-my-grok** (short name **omg**).
 - Routine files here use `omg-bus-<role>` and `omg-reconcile`. Live Grok Bot routines still have the old names until they are renamed in place at cutover. Do not delete them.
 - Documented checkout: `/workspace/omg`. The live checkout is still `/workspace/omo` until that directory is moved.
 - Environment variables are `OMG_*`. The previous `OMO_*` names are still accepted.
+- A verifier profile whose argv still ends at `<code root>/omo_grok/unittest_child.py` (the pre-rename trusted child, including `${OMO_CODE_ROOT}/omo_grok/unittest_child.py`) is loaded as `oh_my_grok/unittest_child.py`. Other paths are not rewritten. Runner name `omo-unittest-child` is still accepted. `OMO_VERIFY_TEMPLATE` still fails closed.
 - New databases are `state/omg.sqlite3`. If that file is absent and `state/omo.sqlite3` exists, the engine opens the existing file.
 - Boulder files are written with `x_omg`. Readers also accept legacy `x_omo_grok`. The directory `.omo/` is the upstream oh-my-openagent boulder path and is unchanged.
 - `spec/IMPLEMENTATION.md` was **not** updated. It still says omo-grok, omoctl, omo_grok, and `/workspace/omo`. Its SHA-256 is still `9643ee06f6817b08c57ea585fd8f919d4b23639bffd817a4a3084c7c9d0d30ae`. Newer docs use oh-my-grok.
