@@ -4,10 +4,10 @@
     "fixture-calc-unittest": {
       "runner": "omo-unittest-child",
       "argv": [
-        "/workspace/omo/.venv/bin/python",
+        "${OMO_PYTHON}",
         "-I",
         "-B",
-        "/workspace/omo/omo_grok/unittest_child.py"
+        "${OMO_CODE_ROOT}/omo_grok/unittest_child.py"
       ],
       "cwd": ".",
       "env_allow": [],

@@ -82,7 +82,7 @@ Day-to-day: ask Hephaestus in chat (*“Use omo to plan a fix for …”*). CLI 
 |---|---|
 | `omoctl` | Operator CLI wrapper (pinned `.venv`) |
 | `omo_grok/` | Engine, MCP server, CLI, DB/migrations, dispatcher, artifacts, verifier, git worktrees, redaction |
-| `config/` | `verifiers.json`, `bots.json` (unverified Bot ids), `roles.example.json`, `mcp-command.txt`, optional `policy.json` |
+| `config/` | `verifiers.json`, `bots.json` (unverified Bot ids), `roles.example.json`, optional `policy.json` |
 | `routines/` | Instructions for each `omo-bus-<role>` routine, optional Hephaestus resume (`hephaestus.md`), and `omo-reconcile.md` |
 | `agents/hephaestus-omo.md` | Natural-language conventions for Hephaestus |
 | `docs/` | Architecture, security, runbook, migration |

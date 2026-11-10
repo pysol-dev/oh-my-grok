@@ -3,7 +3,7 @@
 Tools (exactly): submit, claim, context, checkpoint, complete, status, reconcile, cancel.
 There are deliberately NO approve / ship / mark_done / shell / secret tools: approval is human-only via omoctl.
 stdout carries MCP protocol only; all logging goes to stderr and is redacted.
-Run:  /workspace/omo/.venv/bin/python /workspace/omo/omo_grok/mcp_server.py
+Run:  <python> <code root>/omo_grok/mcp_server.py   (the exact command: `omoctl mcp-command`)
 """
 from __future__ import annotations
 

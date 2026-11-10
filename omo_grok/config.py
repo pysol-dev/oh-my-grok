@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 from .errors import ValidationError
+from .paths import CODE_ROOT, python_path, tools_dir
 
 DEFAULT_POLICY = {
     "max_repair_cycles": 3,
@@ -59,12 +61,37 @@ def load_policy(config_dir: Path) -> dict:
     return pol
 
 
+_PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def placeholder_values() -> dict[str, str]:
+    """The only variables shipped config may reference, so no file needs to hardcode an install location."""
+    return {"OMO_CODE_ROOT": str(CODE_ROOT), "OMO_PYTHON": python_path(), "OMO_TOOLS": str(tools_dir())}
+
+
+def expand_placeholders(obj, values: dict[str, str] | None = None):
+    values = values or placeholder_values()
+
+    def sub(m):
+        if m.group(1) not in values:
+            raise ValidationError(f"unknown config placeholder ${{{m.group(1)}}}", known=sorted(values))
+        return values[m.group(1)]
+
+    if isinstance(obj, str):
+        return _PLACEHOLDER.sub(sub, obj)
+    if isinstance(obj, list):
+        return [expand_placeholders(x, values) for x in obj]
+    if isinstance(obj, dict):
+        return {k: expand_placeholders(v, values) for k, v in obj.items()}
+    return obj
+
+
 def load_verifier_profiles(config_dir: Path) -> dict:
     p = config_dir / "verifiers.json"
     if not p.exists():
         return {}
     data = json.loads(p.read_text())
-    return data.get("profiles", {})
+    return expand_placeholders(data.get("profiles", {}))
 
 
 REQUIRED_PROFILE_KEYS = {"argv": list, "cwd": str, "env_allow": list, "timeout_seconds": (int, float)}

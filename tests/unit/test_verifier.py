@@ -126,7 +126,7 @@ def test_isolated_interpreter_defeats_shadowing_even_without_static_checks(tmp_p
     assert "test_add" in o.stderr  # the genuine suite ran and failed
 
 
-OLD_ARGV = ["/workspace/omo/.venv/bin/python", "-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v"]
+OLD_ARGV = [PROF["argv"][0], "-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v"]
 
 
 def _old_exit_code_run(repo, sha, tmp_path, argv=OLD_ARGV):
@@ -228,7 +228,7 @@ MOMUS_ATTACKS = {"G_bytecode": attack_g_bytecode, "D_exit_at_import": attack_d_e
 # what an exit-code-only verifier (the previous design) would have said about each attack
 OLD_WOULD_PASS = {"G_bytecode", "D_exit_at_import", "D_exit_in_call", "E_patch_assert", "E_patch_via_setattr",
                   "F_int_subclass"}
-OLD_ISOLATED = ["/workspace/omo/.venv/bin/python", "-I", "-B", "-m", "unittest", "discover", "-s", "tests", "-t", "."]
+OLD_ISOLATED = [PROF["argv"][0], "-I", "-B", "-m", "unittest", "discover", "-s", "tests", "-t", "."]
 
 
 @pytest.mark.parametrize("name", sorted(MOMUS_ATTACKS))
@@ -380,7 +380,7 @@ def test_n3_payload_really_executes_under_its_cookie(tmp_path):
     sha = attack_n3_unicode_escape(repo)
     wt = tmp_path / "n3"
     gitops.git(["worktree", "add", "-q", "--detach", str(wt), sha], repo)
-    r = subprocess.run(["/workspace/omo/.venv/bin/python", "-I", "-c", "import sys; sys.path.insert(0, '.'); "
+    r = subprocess.run([PROF["argv"][0], "-I", "-c", "import sys; sys.path.insert(0, '.'); "
                         "import calc; print('NOT REACHED')"], cwd=wt, capture_output=True, text=True, timeout=30)
     assert r.returncode == 0 and "VERIFIED" in r.stdout and "NOT REACHED" not in r.stdout
     # and the UTF-8 view the old scan saw contained no code at all after the original module

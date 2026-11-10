@@ -1,1 +1,0 @@
-/workspace/omo/.venv/bin/python /workspace/omo/omo_grok/mcp_server.py

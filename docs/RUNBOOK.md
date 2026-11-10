@@ -31,11 +31,12 @@ python3 -m venv .venv
 Register a custom **command** (stdio) MCP server named `omo`:
 
 ```
-/workspace/omo/.venv/bin/python /workspace/omo/omo_grok/mcp_server.py
+<CODE_ROOT>/.venv/bin/python <CODE_ROOT>/omo_grok/mcp_server.py
 ```
 
-This command is also in `config/mcp-command.txt`. It needs no environment variables or secrets. Registration
-applies account-wide.
+Print the exact command for this checkout with `./omoctl mcp-command` (it is computed from the checkout location
+and `OMO_PYTHON`, so a relocated checkout never carries a stale path). Install the runtime first with
+`scripts/bootstrap.sh`. The command needs no environment variables or secrets. Registration applies account-wide.
 
 Confirm it from **at least two Bots**, for example Hephaestus and Explorer: the tool list should contain exactly
 `submit, claim, context, checkpoint, complete, status, reconcile, cancel`, and a `status` call should succeed. A local

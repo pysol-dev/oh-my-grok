@@ -51,6 +51,13 @@ def _confirm(prompt: str, expect: str) -> bool:
     return ans == expect
 
 
+def cmd_mcp_command(args) -> int:
+    """The exact, absolute command to register as the command-based `omo` MCP app (computed, never stored)."""
+    from .paths import mcp_command
+    print(mcp_command())
+    return 0
+
+
 # ---------------------------------------------------------------- doctor / migrate
 def cmd_doctor(args) -> int:
     paths = get_paths()
@@ -505,6 +512,7 @@ def build_parser() -> argparse.ArgumentParser:
         return sp
 
     add("doctor", cmd_doctor, "check installation, DB, permissions, MCP SDK and verifier profiles")
+    add("mcp-command", cmd_mcp_command, "print the exact MCP registration command for this checkout", json_=False)
     sp = add("migrate", cmd_migrate, "apply schema migrations (auto-backup first)")
     sp.add_argument("--dry-run", action="store_true")
     sp = add("status", cmd_status, "show jobs or one job")
