@@ -15,7 +15,7 @@ SCHEMAS: dict[str, dict] = {
     "explore": {"required": {"repo_map": "str", "files": "list", "tests": "list", "constraints": "list",
                              "questions": "list"}, "min_artifacts": 1},
     "research": {"required": {"sources": "list", "api_requirements": "list", "risks": "list"}, "min_artifacts": 1,
-                 "allow_not_applicable": True},
+                 "allow_not_applicable": True, "optional": {"citations": "list"}},
     "analyze": {"required": {"consumed_artifacts": "list", "gap_matrix": "list", "risks": "list",
                              "missing_decisions": "list", "suggested_criteria": "list"}, "min_artifacts": 1},
     "plan": {"required": {"work_units": "list", "acceptance_criteria": "list", "test_procedure": "str",
@@ -46,6 +46,8 @@ def output_schema(kind: str) -> dict:
         else:
             props[k] = {"type": {"str": "string", "list": "array", "dict": "object", "bool": "boolean",
                                  "int": "integer"}[t]}
+    for k, t in s.get("optional", {}).items():
+        props[k] = {"type": "array", "description": "engine receipt citations: [{receipt_id, quote}]"}
     out = {"type": "object", "required": sorted(s["required"]), "properties": props,
            "x-min-artifacts": s["min_artifacts"],
            "x-blocked-alternative": {"status": "blocked", "reason": "string"}}
@@ -86,4 +88,7 @@ def classify(kind: str, result: dict) -> str:
                 raise ValidationError(f"{k} has invalid format")
         elif not isinstance(v, _PY[t]) or (t == "str" and not v.strip()):
             raise ValidationError(f"{k} must be a non-empty {t}")
+    for k, t in s.get("optional", {}).items():
+        if k in result and not isinstance(result[k], _PY[t]):
+            raise ValidationError(f"{k} must be a {t}")
     return "normal"

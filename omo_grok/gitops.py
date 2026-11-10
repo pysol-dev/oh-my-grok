@@ -93,3 +93,20 @@ def temp_checkout(repo: Path, sha: str, dest: Path) -> None:
 def remove_temp_checkout(repo: Path, dest: Path) -> None:
     # only ever used on our own detached verification checkouts under jobs/<id>/verify/
     git(["worktree", "remove", "--force", str(dest)], repo, check=False)
+
+
+def history_shape(repo: Path, base: str, sha: str, job_id: str, max_commits: int) -> dict:
+    """Structural facts about base..sha that git itself can prove: linear, bounded, trailer on every commit."""
+    rows = [r.split() for r in git(["rev-list", "--parents", f"{base}..{sha}"], repo).stdout.splitlines() if r.strip()]
+    merges = [r[0] for r in rows if len(r) > 2]
+    trailer = re.compile(rf"^Omo-Job: {re.escape(job_id)}[ \t]*$", re.MULTILINE)
+    missing = []
+    raw = git(["log", "--format=%H%x1f%B%x1e", f"{base}..{sha}"], repo).stdout
+    for rec in raw.split("\x1e"):
+        if not rec.strip():
+            continue
+        commit, _, body = rec.strip("\n").partition("\x1f")
+        if not trailer.search(body):
+            missing.append(commit.strip())
+    return {"commits": len(rows), "max_commits": max_commits, "merge_commits": merges, "missing_trailer": missing,
+            "ok": bool(rows) and not merges and not missing and len(rows) <= max_commits}

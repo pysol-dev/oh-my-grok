@@ -27,6 +27,10 @@ DEFAULT_POLICY = {
     "repo_allowlist": [],
     "inline_dispatch": True,
     "projection_lock_seconds": 10,
+    "context7_url": "https://mcp.context7.com/mcp",
+    "context7_timeout_seconds": 30,
+    "docs_max_per_job": 20,
+    "git_max_commits": 50,
     "features": {},
 }
 

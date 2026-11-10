@@ -101,14 +101,14 @@ semantics, a real LSP diagnostics gate, engine-proven tool evidence (LSP, Contex
 
 ## Stage 4: evidence, Context7, git-master
 
-- [ ] 4.1 RED `tests/unit/test_context7.py` against a local MCP server (real protocol), covering receipt contents,
+- [x] 4.1 RED `tests/unit/test_context7.py` against a local MCP server (real protocol), covering receipt contents,
   failure to connect, key never logged; `tests/integration/test_context7_live.py` (opt-in `OMO_LIVE_CONTEXT7=1`)
   stores `docs/evidence/context7-live-*.json`.
-- [ ] 4.2 RED `tests/integration/test_evidence.py`: fabricated receipt ids, fabricated quotes, agent-claimed evidence,
+- [x] 4.2 RED `tests/integration/test_evidence.py`: fabricated receipt ids, fabricated quotes, agent-claimed evidence,
   `complete` payloads naming receipts, missing receipts under `enforce` all fail; skill pack hash recorded on claim;
   git history shape (merge commit, missing trailer, too many commits) fails.
-- [ ] 4.3 GREEN `receipts.py`, `context7.py`, `skills.py`, `skills/git-master/SKILL.md`, engine checks, MCP `docs`.
-- [ ] 4.4 Verify and commit.
+- [x] 4.3 GREEN `receipts.py`, `context7.py`, `skills.py`, `skills/git-master/SKILL.md`, engine checks, MCP `docs`.
+- [x] 4.4 Verify and commit.
 
 ## Stage 5: surfaces and instructions
 
