@@ -26,6 +26,7 @@ DEFAULT_POLICY = {
     "max_sends_per_flush": 10,
     "repo_allowlist": [],
     "inline_dispatch": True,
+    "projection_lock_seconds": 10,
     "features": {},
 }
 

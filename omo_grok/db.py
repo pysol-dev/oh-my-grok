@@ -304,19 +304,20 @@ CREATE TABLE work_sessions (
   id TEXT PRIMARY KEY,
   job_id TEXT NOT NULL REFERENCES jobs(id),
   task_id TEXT NOT NULL REFERENCES tasks(id),
-  attempt_id TEXT NOT NULL,
+  attempt_id TEXT NOT NULL UNIQUE,
   session_token TEXT NOT NULL UNIQUE,
   role TEXT NOT NULL,
   bot_id TEXT,
-  status TEXT NOT NULL CHECK (status IN ('running','completed','cancelled')),
-  started_at TEXT NOT NULL,
-  ended_at TEXT
+  started_at TEXT NOT NULL
 );
 CREATE INDEX sessions_job ON work_sessions(job_id);
 CREATE TABLE boulder_projection (
   job_id TEXT PRIMARY KEY REFERENCES jobs(id),
   generation INTEGER NOT NULL,
   sha256 TEXT,
+  pending_sha256 TEXT,
+  plan_sha256 TEXT,
+  pending_plan_sha256 TEXT,
   status TEXT NOT NULL,
   last_error TEXT,
   updated_at TEXT NOT NULL

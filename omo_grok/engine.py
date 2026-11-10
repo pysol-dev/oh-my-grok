@@ -4,6 +4,7 @@ Shared by the MCP server and omoctl. Every mutation runs in a short BEGIN IMMEDI
 compare-and-swap checks; HTTP and subprocess work happens strictly outside transactions."""
 from __future__ import annotations
 
+import functools
 import json
 import re
 import secrets as pysecrets
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import artifacts as art
-from . import db, features, gitops, roster, verifier
+from . import db, features, gitops, projection, roster, verifier
 from . import fixture as fx
 from .config import (canonical_json, load_policy, load_verifier_profiles, profile_assurance, profile_hash,
                      sha256_text)
@@ -25,7 +26,7 @@ from .schemas import SCHEMAS, classify, output_schema
 from .states import (BLOCKED, CANCELLED, D_ACCEPTED, D_FAILED, D_PENDING, D_SENDING, DISPATCHED,
                      AWAITING_RESUME, J_ANALYSIS, J_AWAITING_APPROVAL, J_BLOCKED, J_CANCELLED, J_DONE,
                      J_FAILED, J_PLAN_APPROVED, J_PLAN_REVIEW, J_PLANNING, J_RESEARCH, J_RUNNING,
-                     KIND_ROLE, PASSED, QUEUED, READ_ONLY_ROLES, REJECTED, ROLES, SUBMITTED, TASK_TERMINAL,
+                     JOB_TERMINAL, KIND_ROLE, PASSED, QUEUED, READ_ONLY_ROLES, REJECTED, ROLES, SUBMITTED, TASK_TERMINAL,
                      WORKING, check_dispatch, check_job, check_task)
 from .transport import HttpResult, post_json
 
@@ -89,6 +90,21 @@ def _l(s):
     return json.loads(s) if s else None
 
 
+def _flushes(fn):
+    """Public mutators flush the boulder projection of every job they wrote events for, once, after the outermost
+    call has left all transactions (spec/ADAPTIVE.md 6.4 step 7)."""
+    @functools.wraps(fn)
+    def wrapper(self, *a, **kw):
+        self._depth += 1
+        try:
+            return fn(self, *a, **kw)
+        finally:
+            self._depth -= 1
+            if self._depth == 0:
+                self._flush_projections()
+    return wrapper
+
+
 class Engine:
     def __init__(self, paths: Paths | None = None, transport: Callable[..., HttpResult] | None = None,
                  clock: Callable[[], float] | None = None, auto_migrate: bool = True):
@@ -102,6 +118,8 @@ class Engine:
         self.transport = transport or post_json
         self.clock = clock or time.time
         self._diff_files: dict[str, list[str]] = {}
+        self._depth = 0
+        self._dirty: set[str] = set()
 
     # ------------------------------------------------------------------ infra
     def ensure_schema(self) -> list[int]:
@@ -122,7 +140,23 @@ class Engine:
     def _all(self, sql, args=()):
         return self.conn.execute(sql, args).fetchall()
 
+    def _flush_projections(self) -> None:
+        if not self._dirty or self.conn.in_transaction:
+            return
+        jobs, self._dirty = self._dirty, set()
+        for jid in sorted(jobs):
+            row = self._one("SELECT policies_json FROM jobs WHERE id=?", (jid,))
+            if row and features.frozen(_l(row["policies_json"]))["boulder"] == features.ON:
+                projection.project(self.conn, self.paths, jid, float(self.policy["projection_lock_seconds"]))
+
+    def project_job(self, job_id: str) -> dict:
+        """Explicit refresh (omoctl boulder --refresh). Works for any job, whatever its frozen feature set."""
+        self._job(job_id)
+        return projection.project(self.conn, self.paths, job_id, float(self.policy["projection_lock_seconds"]))
+
     def _ev(self, ev_kind, job_id=None, task_id=None, actor=None, correlation_id=None, **data):
+        if job_id:
+            self._dirty.add(job_id)
         self.conn.execute("INSERT INTO events(ts,job_id,task_id,kind,actor,correlation_id,data_json) "
                           "VALUES (?,?,?,?,?,?,?)", (db.utcnow(), job_id, task_id, ev_kind, actor, correlation_id,
                                                      _j(redact_obj(data)) if data else None))
@@ -172,6 +206,8 @@ class Engine:
         if dst != job["phase"]:
             self._ev("job_phase", job["id"], None, None, src=job["phase"], dst=dst,
                      failure_reason=fields.get("failure_reason"))
+            if dst in JOB_TERMINAL:
+                self.conn.execute("DELETE FROM repo_leases WHERE job_id=?", (job["id"],))
         return self._one("SELECT * FROM jobs WHERE id=?", (job["id"],))
 
     def _block_job(self, job, reason: str):
@@ -311,6 +347,7 @@ class Engine:
         return hook_status(self.paths).get(role, False)
 
     # ------------------------------------------------------------------ submit
+    @_flushes
     def submit(self, goal: str, idempotency_key: str, repo: str | None = None, constraints: list | None = None,
                acceptance_criteria: list | None = None, mode: str | None = None, verifier_profile: str | None = None,
                max_repair_cycles: int | None = None, actor: str = "hephaestus", intent: str | None = None,
@@ -405,6 +442,21 @@ class Engine:
                 if ex["intent"]:
                     out.update(intent=ex["intent"], roster_class=ex["roster_class"])
                 return out
+            if feats["boulder"] == features.ON:
+                dup = self._one("SELECT * FROM jobs WHERE requirements_hash=? AND phase NOT IN ('done','failed',"
+                                "'cancelled') ORDER BY created_at LIMIT 1", (rhash,))
+                if dup:
+                    self._ev("submit_resumed", dup["id"], None, actor, idempotency_key=idempotency_key,
+                             note="identical active request: returned the existing job instead of creating one")
+                    tasks = {r["kind"]: r["id"] for r in self._all("SELECT kind,id FROM tasks WHERE job_id=? AND "
+                                                                    "cycle=0 ORDER BY created_at", (dup["id"],))}
+                    out = {"job_id": dup["id"], "created": False, "resumed": True, "phase": dup["phase"],
+                           "mode": dup["mode"], "task_ids": tasks, "requirements_hash": rhash,
+                           "next_action": self._next_action(dup, self._all(
+                               "SELECT * FROM tasks WHERE job_id=?", (dup["id"],)))}
+                    if dup["intent"]:
+                        out.update(intent=dup["intent"], roster_class=dup["roster_class"])
+                    return out
             now = db.utcnow()
             if mode == "fixture":
                 repo_path = str(self.paths.job_dir(job_id) / "fixture-repo")
@@ -518,6 +570,7 @@ class Engine:
             b = max(b, min(retry_after, self.policy["backoff_cap_seconds"]))
         return b
 
+    @_flushes
     def flush_outbox(self, limit: int | None = None) -> dict:
         """Send due webhook dispatches. HTTP happens outside any DB transaction."""
         limit = limit or self.policy["max_sends_per_flush"]
@@ -639,6 +692,7 @@ class Engine:
                         "producer_task_id": r["task_id"], "revision": r["revision"]})
         return out
 
+    @_flushes
     def claim(self, job_id: str, task_id: str, dispatch_id: str, actor: str | None = None) -> dict:
         if not isinstance(dispatch_id, str) or not UUID_RE.match(dispatch_id):
             raise ValidationError("dispatch_id must be a UUID")
@@ -701,6 +755,13 @@ class Engine:
         # any not-yet-sent duplicate wake-ups for this task become harmless no-ops
         self.conn.execute("UPDATE dispatch_outbox SET superseded=1 WHERE task_id=? AND status IN "
                           "('pending','retry_wait')", (task_id,))
+        bound = self._one("SELECT bot_id FROM role_bindings WHERE id=?", (d["binding_id"],)) \
+            if d["binding_id"] else None
+        self.conn.execute("INSERT INTO work_sessions(id,job_id,task_id,attempt_id,session_token,role,bot_id,"
+                          "started_at) VALUES (?,?,?,?,?,?,?,?)",
+                          (str(uuid.uuid4()), job_id, task_id, aid,
+                           f"omo-grok:{(bound and bound['bot_id']) or t['role']}:{aid}", t["role"],
+                           bound and bound["bot_id"], db.utcnow()))
         self._ev("task_claimed", job_id, task_id, actor or t["role"], attempt_id=aid, dispatch_id=dispatch_id,
                  attempt_no=attempt_no)
 
@@ -878,6 +939,7 @@ class Engine:
         return aid
 
     # ------------------------------------------------------------------ checkpoint
+    @_flushes
     def checkpoint(self, job_id, task_id, attempt_id, progress: str, artifact_refs=None) -> dict:
         if not isinstance(progress, str) or len(progress) > 4000:
             raise ValidationError("progress must be a string <= 4000 chars")
@@ -900,6 +962,7 @@ class Engine:
                 "note": "checkpoint is progress only; it never completes the task"}
 
     # ------------------------------------------------------------------ complete
+    @_flushes
     def complete(self, job_id, task_id, attempt_id, result: dict, artifact_refs=None, evidence=None) -> dict:
         job, t, a = self._live_attempt(job_id, task_id, attempt_id)
         if evidence is not None and (not isinstance(evidence, (dict, list, str)) or len(_j(evidence)) > 64000):
@@ -1202,6 +1265,7 @@ class Engine:
                                _j((prof or {}).get("argv", [])), "pending", db.utcnow()))
         return vid, name, prof
 
+    @_flushes
     def run_candidate_verification(self, job_id, task_id) -> dict:
         job = self._job(job_id)
         t = self._task(job_id, task_id)
@@ -1294,6 +1358,7 @@ class Engine:
                    if r["review_status"] == "accepted" else None}
         return redact_obj({"job_id": job_id, "phase": job["phase"], "current": cur, "revisions": revs})
 
+    @_flushes
     def approve(self, job_id, plan_hash, actor: str, evidence: str, allow_edit: bool = True,
                 accept_reduced_assurance: bool = False, mode: str = "soft") -> dict:
         """Privileged: called ONLY by omoctl after human TTY confirmation (or the synthetic fixture harness).
@@ -1322,6 +1387,8 @@ class Engine:
                      "allow_edit": bool(allow_edit) and job["mode"] in ("implement", "fixture"),
                      "accept_reduced_assurance": bool(accept_reduced_assurance),
                      "production_merge_or_deploy": False}
+            if scope["allow_edit"]:
+                self._acquire_lease(job)
             apid = str(uuid.uuid4())
             self.conn.execute("INSERT INTO approvals(id,job_id,plan_revision_id,plan_hash,requirements_hash,scope_json,"
                               "mode,actor,evidence,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -1342,6 +1409,25 @@ class Engine:
             raise
         self._after()
         return {"approval_id": apid, "mode": mode, "scope": scope, "implementation_started": True}
+
+    def _acquire_lease(self, job) -> None:
+        """One editing job per repository (feature repo_lease). Caller holds the transaction; a refusal rolls back."""
+        mode = self._features(job)["repo_lease"]
+        if mode == features.OFF or not job["repo_path"]:
+            return
+        row = self._one("SELECT * FROM repo_leases WHERE repo_path=?", (job["repo_path"],))
+        if row and row["job_id"] != job["id"]:
+            holder = self._one("SELECT phase FROM jobs WHERE id=?", (row["job_id"],))
+            if holder and holder["phase"] not in JOB_TERMINAL:
+                if mode == features.ENFORCE:
+                    raise GateRefused("repository lease is held by another editing job; finish or cancel it first",
+                                      holder_job=row["job_id"], repo=job["repo_path"])
+                self._ev("repo_lease_conflict", job["id"], None, "engine", holder_job=row["job_id"],
+                         note="shadow mode: recorded, not refused")
+                return
+        self.conn.execute("INSERT INTO repo_leases(repo_path,job_id,acquired_at) VALUES (?,?,?) "
+                          "ON CONFLICT(repo_path) DO UPDATE SET job_id=excluded.job_id, "
+                          "acquired_at=excluded.acquired_at", (job["repo_path"], job["id"], db.utcnow()))
 
     def _start_implementation(self, job_id):
         job = self._job(job_id)
@@ -1373,6 +1459,7 @@ class Engine:
             self._ev("implementation_started", job_id, None, "engine", worktree=str(wt), branch=branch, base=base)
             self._schedule(job_id)
 
+    @_flushes
     def deny(self, job_id, reason, actor) -> dict:
         if not isinstance(reason, str) or not reason.strip():
             raise ValidationError("reason required")
@@ -1492,6 +1579,7 @@ class Engine:
             assurance += "+soft_approval"
         return all(v["ok"] for v in c.values()), c, assurance
 
+    @_flushes
     def run_final_gate(self, job_id, integrate_task_id) -> dict:
         job = self._job(job_id)
         t = self._task(job_id, integrate_task_id)
@@ -1524,6 +1612,7 @@ class Engine:
         return {"gate_id": gid, "passed": ok, "assurance": assurance, "checks": checks, "revision": sha}
 
     # ------------------------------------------------------------------ escalation
+    @_flushes
     def escalate(self, job_id: str, to_class: str, reason: str, actor: str = "hephaestus") -> dict:
         """Add work, never remove it: classes only go up (spec/ADAPTIVE.md 5.4)."""
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
@@ -1584,6 +1673,7 @@ class Engine:
                 "task_ids": {**created, "analyze": analyze, "plan": plan}}
 
     # ------------------------------------------------------------------ cancel / resume
+    @_flushes
     def cancel(self, job_id, reason, actor, confirmed=False) -> dict:
         if not isinstance(reason, str) or not reason.strip():
             raise ValidationError("reason required")
@@ -1611,6 +1701,7 @@ class Engine:
                      note="worktree/branch preserved; nothing deleted")
         return {"ok": True, "phase": J_CANCELLED, "changed": True, "worktree_preserved": job["worktree_path"]}
 
+    @_flushes
     def resume(self, job_id, actor, grant_repair_cycles: int = 0) -> dict:
         with db.tx(self.conn):
             job = self._job(job_id)
@@ -1645,6 +1736,7 @@ class Engine:
         return {"ok": True, "phase": self._job(job_id)["phase"], "requeued_tasks": n}
 
     # ------------------------------------------------------------------ reconcile
+    @_flushes
     def reconcile(self, job_id: str | None = None, flush: bool = True) -> dict:
         now = self.now()
         pol = self.policy
@@ -1768,19 +1860,7 @@ class Engine:
         return out
 
     def _next_action(self, job, tasks) -> str:
-        ph = job["phase"]
-        if ph == J_AWAITING_APPROVAL:
-            return "user: omoctl plan show {0} then omoctl approve {0} --plan-hash <hash> (or deny)".format(job["id"])
-        if ph == J_BLOCKED:
-            return f"inspect blocked reason, fix the cause, then omoctl resume {job['id']}"
-        if ph in (J_DONE, J_FAILED, J_CANCELLED):
-            return "none (terminal)"
-        if any(t["status"] == AWAITING_RESUME for t in tasks):
-            return "hephaestus: claim the awaiting_resume task in-chat (no resume routine bound)"
-        deferred = [t["block_reason"] for t in tasks if t["status"] == QUEUED and t["block_reason"]]
-        if deferred:
-            return "dispatch deferred: " + deferred[0]
-        return "waiting for agents / run omoctl reconcile"
+        return projection.next_action(job, tasks)
 
     def status(self, job_id: str | None = None, include_tasks: bool = True, include_events: bool = False) -> dict:
         if job_id:
@@ -1794,7 +1874,28 @@ class Engine:
             return redact_obj(s)
         jobs = self._all("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 50")
         return redact_obj({"jobs": [self._job_summary(j) for j in jobs], "bindings": self.list_bindings(),
-                           "schema_version": db.current_version(self.conn)})
+                           "active_work": self.active_work(), "schema_version": db.current_version(self.conn)})
+
+    def active_work(self) -> list[dict]:
+        """Every non-terminal job with enough to resume it: where its plan and boulder are, and what is next."""
+        out = []
+        for j in self._all("SELECT * FROM jobs WHERE phase NOT IN ('done','failed','cancelled') "
+                           "ORDER BY created_at"):
+            tasks = self._all("SELECT * FROM tasks WHERE job_id=? ORDER BY created_at", (j["id"],))
+            tmap = {t["id"]: t for t in tasks}
+            on = self._features(j)["boulder"] == features.ON
+            sessions = [{"task_id": r["task_id"], "task_kind": tmap[r["task_id"]]["kind"], "role": r["role"],
+                         "attempt_id": r["attempt_id"], "session_id": r["session_token"],
+                         "status": projection.session_status(r["attempt_status"])}
+                        for r in self._all("SELECT s.*, a.status attempt_status FROM work_sessions s LEFT JOIN "
+                                           "task_attempts a ON a.id=s.attempt_id WHERE s.job_id=? ORDER BY "
+                                           "s.started_at", (j["id"],)) if r["task_id"] in tmap]
+            out.append({"job_id": j["id"], "work_id": j["id"], "plan_name": projection.plan_name(j["id"]),
+                        "phase": j["phase"], "intent": j["intent"], "roster_class": j["roster_class"],
+                        "next_action": self._next_action(j, tasks), "sessions": sessions,
+                        "boulder_path": str(projection.omo_dir(self.paths, j["id"]) / "boulder.json") if on else None,
+                        "resume": {"tool": "omo.status", "job_id": j["id"]}})
+        return out
 
     def export(self, job_id: str, out_dir: Path) -> dict:
         job = self._job(job_id)

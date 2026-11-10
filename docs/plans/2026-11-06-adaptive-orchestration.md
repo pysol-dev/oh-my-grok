@@ -69,17 +69,17 @@ semantics, a real LSP diagnostics gate, engine-proven tool evidence (LSP, Contex
 
 ## Stage 2: continuity and projection
 
-- [ ] 2.1 RED `tests/unit/test_projection.py`: schema fields (upstream shape), checklist grammar, status mapping,
+- [x] 2.1 RED `tests/unit/test_projection.py`: schema fields (upstream shape), checklist grammar, status mapping,
   deterministic bytes, never regress, tamper repair, no import.
-- [ ] 2.2 RED `tests/integration/test_projection_concurrency.py`: N processes each performing engine mutations on one
+- [x] 2.2 RED `tests/integration/test_projection_concurrency.py`: N processes each performing engine mutations on one
   job; reader process asserts the file always parses and `generation` never decreases; kill -9 at injected crash
   points leaves a parseable file and converges on the next flush; flock timeout marks stale without failing the job;
   ENOSPC-style failure (read-only directory) marks stale without failing the job; concurrent session rows all survive.
-- [ ] 2.3 RED `tests/integration/test_continuity.py`: restart (new Engine on same DB) resumes the same job and plan,
+- [x] 2.3 RED `tests/integration/test_continuity.py`: restart (new Engine on same DB) resumes the same job and plan,
   identical active request returns the same job, `status()` reports `active_work`, blocked jobs resume only by
   `resume`, file edits/deletes never alter the database, repo lease refuses a second implement job.
-- [ ] 2.4 GREEN `projection.py`, engine flush hook, `work_sessions` writes in `_insert_claim`, `active_work`.
-- [ ] 2.5 Verify and commit.
+- [x] 2.4 GREEN `projection.py`, engine flush hook, `work_sessions` writes in `_insert_claim`, `active_work`.
+- [x] 2.5 Verify and commit.
 
 ## Stage 3: real LSP
 
