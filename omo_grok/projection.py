@@ -205,21 +205,69 @@ def _sha(b: bytes | None) -> str | None:
     return hashlib.sha256(b).hexdigest() if b is not None else None
 
 
-def _unlink_if_symlink(p: Path) -> bool:
-    """Remove a symlink without following it. A regular file is left untouched."""
+def _unlink_if_symlink_at(dirfd: int, name: str) -> bool:
+    """Remove a symlink in an already-opened directory. The link is not followed."""
     try:
-        mode = os.lstat(p).st_mode
+        mode = os.lstat(name, dir_fd=dirfd).st_mode
     except FileNotFoundError:
         return False
     if not stat.S_ISLNK(mode):
         return False
-    os.unlink(p)
+    os.unlink(name, dir_fd=dirfd)
     return True
 
 
-def _read(p: Path) -> bytes | None:
+def _open_dir_at(parent_fd: int, name: str) -> int:
+    return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+
+
+def _ensure_real_dir(parent_fd: int, name: str) -> tuple[int, bool]:
+    """Open ``parent/name`` as a real directory. A symlink is unlinked and never followed."""
+    replaced = False
+    for _ in range(8):
+        try:
+            st = os.lstat(name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                continue
+            return _open_dir_at(parent_fd, name), replaced
+        if stat.S_ISLNK(st.st_mode):
+            os.unlink(name, dir_fd=parent_fd)
+            replaced = True
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            raise OSError(errno.ENOTDIR, f"{name} exists and is not a directory")
+        try:
+            fd = _open_dir_at(parent_fd, name)
+        except OSError as e:
+            if e.errno == errno.ELOOP:  # replanted as a symlink between lstat and open
+                replaced = True
+                continue
+            raise
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+            os.close(fd)
+            continue
+        return fd, replaced
+    raise OSError(errno.ELOOP, f"{name} kept being replaced by a symlink")
+
+
+def _same_dir(parent_fd: int, name: str, dirfd: int) -> bool:
     try:
-        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
+        st = os.lstat(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        return False
+    opened = os.fstat(dirfd)
+    return (opened.st_dev, opened.st_ino) == (st.st_dev, st.st_ino)
+
+
+def _read_at(dirfd: int, name: str) -> bytes | None:
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
     except FileNotFoundError:
         return None
     except OSError as e:
@@ -230,17 +278,9 @@ def _read(p: Path) -> bytes | None:
         return fh.read()
 
 
-def _fsync_dir(d: Path) -> None:
-    fd = os.open(d, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def _write_atomic(target: Path, data: bytes, point: str | None = None) -> None:
-    tmp = target.parent / f".{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+def _write_atomic_at(dirfd: int, name: str, data: bytes, point: str | None = None) -> None:
+    tmp = f".{name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dirfd)
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
@@ -248,22 +288,22 @@ def _write_atomic(target: Path, data: bytes, point: str | None = None) -> None:
             os.fsync(fh.fileno())
         if point:
             _fault(point)
-        os.replace(tmp, target)
+        os.replace(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
     except BaseException:
         try:
-            os.unlink(tmp)
+            os.unlink(tmp, dir_fd=dirfd)
         except OSError:
             pass
         raise
-    _fsync_dir(target.parent)
+    os.fsync(dirfd)
 
 
-def _remove_stale_temps(*dirs: Path) -> None:
-    for d in dirs:
-        if d.is_dir():
-            for p in d.glob(".*.tmp"):  # we hold the exclusive lock, so any temp file belongs to a dead writer
+def _remove_stale_temps_at(*dirfds: int) -> None:
+    for dirfd in dirfds:
+        for name in os.listdir(dirfd):  # the fd, not the path, so a replanted symlink is not listed
+            if name.startswith(".") and name.endswith(".tmp"):
                 try:
-                    p.unlink()
+                    os.unlink(name, dir_fd=dirfd)
                 except OSError:
                     pass
 
@@ -293,18 +333,36 @@ def _event(conn, job_id: str, kind: str, **data) -> None:
                      (db.utcnow(), job_id, None, kind, "projection", None, json.dumps(data, sort_keys=True)))
 
 
-def _lock(path: Path, seconds: float):
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+def _lock_at(dirfd: int, name: str, seconds: float) -> tuple[int | None, bool]:
+    """Lock ``dirfd/name``. A symlink at that name is removed; the open never follows it."""
+    replaced = False
+    fd = None
+    for _ in range(8):
+        if _unlink_if_symlink_at(dirfd, name):
+            replaced = True
+        try:
+            fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=dirfd)
+            break
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                replaced = True
+                continue
+            raise
+    else:
+        raise OSError(errno.ELOOP, f"{name} kept being replaced by a symlink")
     deadline = time.monotonic() + seconds
     while True:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fd
+            return fd, replaced
         except BlockingIOError:
             if time.monotonic() >= deadline:
                 os.close(fd)
-                return None
+                return None, replaced
             time.sleep(0.01)
+        except BaseException:
+            os.close(fd)
+            raise
 
 
 # --------------------------------------------------------------------------------------------- the writer
@@ -326,33 +384,111 @@ def project(conn, paths: Paths, job_id: str, lock_seconds: float = 10.0) -> dict
         return {"status": "stale", "tamper": False, "error": msg}
 
 
+class _Held:
+    """Directory and lock fds. Closing is idempotent; the lock is released first."""
+
+    def __init__(self):
+        self.job = self.omo = self.plans = self.lock = None
+        self.replaced = False
+
+    def close(self) -> None:
+        if self.lock is not None:
+            try:
+                fcntl.flock(self.lock, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(self.lock)
+            self.lock = None
+        for attr in ("plans", "omo", "job"):
+            fd = getattr(self, attr)
+            if fd is not None:
+                os.close(fd)
+                setattr(self, attr, None)
+
+
+def _reseat_omo(held: _Held, lock_seconds: float) -> bool:
+    """Under the lock, lstat ``.omo``. A replanted symlink is removed and not followed.
+
+    Returns False when the lock could not be reacquired on the replacement directory."""
+    for _ in range(8):
+        if _same_dir(held.job, ".omo", held.omo):
+            return True
+        try:
+            st = os.lstat(".omo", dir_fd=held.job)
+        except FileNotFoundError:
+            st = None
+        if st is not None and stat.S_ISLNK(st.st_mode):
+            os.unlink(".omo", dir_fd=held.job)
+            held.replaced = True
+        elif st is not None and not stat.S_ISDIR(st.st_mode):
+            raise OSError(errno.ENOTDIR, ".omo is not a directory")
+        fcntl.flock(held.lock, fcntl.LOCK_UN)
+        os.close(held.lock)
+        held.lock = None
+        os.close(held.omo)
+        held.omo = None
+        held.omo, rep = _ensure_real_dir(held.job, ".omo")
+        held.replaced = held.replaced or rep
+        held.lock, lock_rep = _lock_at(held.omo, "boulder.lock", lock_seconds)
+        held.replaced = held.replaced or lock_rep
+        if held.lock is None:
+            return False
+    raise OSError(errno.ELOOP, ".omo kept being replaced by a symlink")
+
+
+def _lock_timeout(conn, job_id: str, replaced: bool) -> dict:
+    prior = conn.execute("SELECT status FROM boulder_projection WHERE job_id=?", (job_id,)).fetchone()
+    _record(conn, job_id, "stale", "timed out waiting for boulder.lock")
+    if replaced:
+        _event(conn, job_id, "boulder_tamper", boulder_present=False, plan_present=False,
+               action="symlinked directory removed without following it; lock then timed out")
+    if not prior or prior["status"] != "stale":
+        _event(conn, job_id, "projection_stale", error="timed out waiting for boulder.lock")
+    return {"status": "stale", "tamper": replaced, "error": "lock timeout"}
+
+
 def _project(conn, paths: Paths, job_id: str, lock_seconds: float) -> dict:
-    d = omo_dir(paths, job_id)
-    plans = d / "plans"
-    plans.mkdir(parents=True, exist_ok=True, mode=0o700)
-    gi = d / ".gitignore"
-    if not gi.exists():
-        _write_atomic(gi, b"*\n")
-    boulder_path = d / "boulder.json"
-    md_path = plans / f"{plan_name(job_id)}.md"
-    lock_path = d / "boulder.lock"
-    symlink_replaced = _unlink_if_symlink(lock_path)
-    fd = _lock(lock_path, lock_seconds)
-    if fd is None:
-        prior = conn.execute("SELECT status FROM boulder_projection WHERE job_id=?", (job_id,)).fetchone()
-        _record(conn, job_id, "stale", "timed out waiting for boulder.lock")
-        if not prior or prior["status"] != "stale":
-            _event(conn, job_id, "projection_stale", error="timed out waiting for boulder.lock")
-        return {"status": "stale", "tamper": False, "error": "lock timeout"}
+    job_path = paths.job_dir(job_id)
+    job_path.mkdir(parents=True, exist_ok=True)
+    boulder_path = omo_dir(paths, job_id) / "boulder.json"
+    md_name = f"{plan_name(job_id)}.md"
+    md_path = omo_dir(paths, job_id) / "plans" / md_name
+    held = _Held()
     try:
+        held.job = os.open(job_path, os.O_RDONLY | os.O_DIRECTORY)
+        # A symlinked .omo is replaced before the lock, so the lock file is not created in the outside target.
+        held.omo, rep = _ensure_real_dir(held.job, ".omo")
+        held.replaced = rep
+        held.lock, lock_rep = _lock_at(held.omo, "boulder.lock", lock_seconds)
+        held.replaced = held.replaced or lock_rep
+        if held.lock is None:
+            return _lock_timeout(conn, job_id, held.replaced)
         _fault("after_lock")
-        _remove_stale_temps(d, plans)
-        if _unlink_if_symlink(boulder_path):
-            symlink_replaced = True
-        if _unlink_if_symlink(md_path):
-            symlink_replaced = True
+        if not _reseat_omo(held, lock_seconds):
+            return _lock_timeout(conn, job_id, held.replaced)
+        held.plans, rep = _ensure_real_dir(held.omo, "plans")
+        held.replaced = held.replaced or rep
+        if not _same_dir(held.omo, "plans", held.plans):
+            os.close(held.plans)
+            held.plans = None
+            held.plans, rep = _ensure_real_dir(held.omo, "plans")
+            held.replaced = held.replaced or rep
+            if not _same_dir(held.omo, "plans", held.plans):
+                raise OSError(errno.ELOOP, "plans kept being replaced by a symlink")
+        _remove_stale_temps_at(held.omo, held.plans)
+        if _unlink_if_symlink_at(held.omo, ".gitignore"):
+            held.replaced = True
+        try:
+            os.lstat(".gitignore", dir_fd=held.omo)
+        except FileNotFoundError:
+            _write_atomic_at(held.omo, ".gitignore", b"*\n")
+        if _unlink_if_symlink_at(held.omo, "boulder.json"):
+            held.replaced = True
+        if _unlink_if_symlink_at(held.plans, md_name):
+            held.replaced = True
+        symlink_replaced = held.replaced
         rec = conn.execute("SELECT * FROM boulder_projection WHERE job_id=?", (job_id,)).fetchone()
-        cur_b, cur_md = _read(boulder_path), _read(md_path)
+        cur_b, cur_md = _read_at(held.omo, "boulder.json"), _read_at(held.plans, md_name)
         trusted_b = {rec["sha256"], rec["pending_sha256"]} - {None} if rec else set()
         trusted_md = {rec["plan_sha256"], rec["pending_plan_sha256"]} - {None} if rec else set()
         if cur_b is None:
@@ -396,16 +532,13 @@ def _project(conn, paths: Paths, job_id: str, lock_seconds: float) -> dict:
             return {"status": "unchanged", "tamper": False, "generation": gen, "path": str(boulder_path)}
         _record(conn, job_id, "writing", None, pending_sha256=_sha(new_b), pending_plan_sha256=_sha(new_md))
         if cur_md != new_md or tamper:
-            _write_atomic(md_path, new_md)
+            _write_atomic_at(held.plans, md_name, new_md)
         if cur_b != new_b or tamper:
-            _write_atomic(boulder_path, new_b, point="after_temp_write")
+            _write_atomic_at(held.omo, "boulder.json", new_b, point="after_temp_write")
         _fault("after_replace")
         _record(conn, job_id, "ok", None, generation=gen, sha256=_sha(new_b), plan_sha256=_sha(new_md),
                 pending_sha256=None, pending_plan_sha256=None)
         _fault("after_db_record")
         return {"status": "written", "tamper": tamper, "generation": gen, "path": str(boulder_path)}
     finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+        held.close()

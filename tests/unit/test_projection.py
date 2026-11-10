@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 
 import pytest
@@ -232,6 +233,49 @@ def test_symlink_is_replaced_without_being_followed(h, tmp_path, name):
     assert secret.read_text() == "do-not-touch"
     if name == "boulder.json":
         assert json.loads(target.read_text())["works"][job]["status"] == "active"
+    assert h.e._one("SELECT 1 FROM events WHERE job_id=? AND kind='boulder_tamper'", (job,))
+
+
+def test_symlinked_omo_directory_is_replaced_without_being_followed(h, tmp_path):
+    job = h.submit()["job_id"]
+    omo = paths_for(job)[1]
+    outside = tmp_path / "outside-omo"
+    outside.mkdir()
+    (outside / "marker").write_text("untouched")
+    (outside / "boulder.json").write_text("secret-boulder")
+    (outside / "boulder.lock").write_text("secret-lock")
+    shutil.rmtree(omo)
+    omo.symlink_to(outside, target_is_directory=True)
+    r = projection.project(h.e.conn, h.e.paths, job)
+    assert r["status"] == "written" and r["tamper"] is True
+    assert omo.is_dir() and not omo.is_symlink()
+    assert (outside / "marker").read_text() == "untouched"
+    assert (outside / "boulder.json").read_text() == "secret-boulder"
+    assert (outside / "boulder.lock").read_text() == "secret-lock"
+    assert not (outside / "plans").exists()
+    assert not (outside / ".gitignore").exists()
+    assert json.loads((omo / "boulder.json").read_text())["works"][job]["status"] == "active"
+    assert h.e._one("SELECT 1 FROM events WHERE job_id=? AND kind='boulder_tamper'", (job,))
+
+
+def test_symlinked_plans_directory_is_replaced_without_being_followed(h, tmp_path):
+    job = h.submit()["job_id"]
+    omo = paths_for(job)[1]
+    plans = omo / "plans"
+    outside = tmp_path / "outside-plans"
+    outside.mkdir()
+    plan_leaf = f"omo-{job[:8]}.md"
+    (outside / "marker").write_text("untouched")
+    (outside / plan_leaf).write_text("secret-plan")
+    shutil.rmtree(plans)
+    plans.symlink_to(outside, target_is_directory=True)
+    r = projection.project(h.e.conn, h.e.paths, job)
+    assert r["status"] == "written" and r["tamper"] is True
+    assert plans.is_dir() and not plans.is_symlink()
+    assert (outside / "marker").read_text() == "untouched"
+    assert (outside / plan_leaf).read_text() == "secret-plan"
+    assert sorted(p.name for p in outside.iterdir()) == ["marker", plan_leaf]
+    assert (plans / plan_leaf).is_file() and "secret-plan" not in (plans / plan_leaf).read_text()
     assert h.e._one("SELECT 1 FROM events WHERE job_id=? AND kind='boulder_tamper'", (job,))
 
 

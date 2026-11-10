@@ -198,8 +198,9 @@ review), `F3` (QA), `F4` (final gate). The approved plan text is appended under 
 ### 6.4 Writer protocol (R5, R6)
 
 1. Single writer function `projection.project(conn, paths, job_id)`. Nothing else writes these files.
-2. Take an exclusive `flock` on `boulder.lock` with a bounded wait (default 10 s). On timeout: record
-   `projection_status=stale` with `last_error`, emit `projection_stale`, return. The caller never fails.
+2. Take an exclusive `flock` on `boulder.lock` with a bounded wait (default 10 s). The lock file is opened from
+   the `.omo` directory file descriptor with `O_NOFOLLOW`. On timeout: record `projection_status=stale` with
+   `last_error`, emit `projection_stale`, return. The caller never fails.
 3. Inside the lock, open a read transaction, read the job, tasks, sessions, plan revision and approval, and compute
    `generation = MAX(events.id WHERE job_id=?)` from the same snapshot, render deterministically, close the snapshot.
 4. If the existing file's generation is greater than the rendered generation, do nothing (never regress). If equal and
@@ -210,7 +211,11 @@ review), `F3` (QA), `F4` (final gate). The approved plan text is appended under 
 6. If the file's sha256 differs from the recorded one before a write (edited, truncated, deleted), record a
    `boulder_tamper` event and overwrite from the database. A symlink at `boulder.json`, `boulder.lock`, or the active
    plan file is not followed: it is unlinked and the file is regenerated from the database, and that is also a
-   `boulder_tamper` event. A tampered file never changes any job state and never blocks dispatch.
+   `boulder_tamper` event. A symlink at `.omo` or `plans/` is treated the same way: under the lock each directory is
+   `lstat`ed and opened with `O_NOFOLLOW|O_DIRECTORY` from the parent directory's file descriptor. A symlink is
+   unlinked and a real directory is created in its place. The outside target is not modified. A link replanted
+   between the check and the open fails `O_NOFOLLOW` and is replaced rather than followed. A tampered file never
+   changes any job state and never blocks dispatch.
 7. Triggers: every public `Engine` mutation flushes the projections of the jobs whose events it wrote, after the
    outermost call returns (outside every transaction).
 8. Sessions are rows (`work_sessions`, unique `session_token`), not file fields, so concurrent appends cannot be lost
@@ -306,11 +311,13 @@ against a hostile same-account bot; (c) the true hard boundary is an external CI
 was not located at the pinned tree, so only its documented configuration surface, an env prefix, an optional
 co-author footer, and a footer string, informed the trailer rule). The executor packet field `skill_pack` carries
 `[{name, sha256, text}]`. On claim the engine records an `engine_delivered` receipt with the pack hash and the
-attempt id. Structural consequence checked by the final gate when `git_discipline` is not `off`:
-history `base..candidate` is linear (no merge commits), has at most `max_commits` (default 50) commits, every
-commit message carries the trailer `Omo-Job: <job_id>`, and the candidate descends from every earlier candidate of
-the same job (a repair may not reset or otherwise rewrite a reported candidate). The submit of such a rewrite is
-refused with `git_history_not_descendant`; the final gate fails the same check. Commits are on the job branch only.
+attempt id. When `git_discipline` is not `off`, the engine records the history shape: `base..candidate` is linear
+(no merge commits), has at most `max_commits` (default 50) commits, every commit message carries the trailer
+`Omo-Job: <job_id>`, and whether the candidate descends from every earlier candidate of the same job. Commits are
+on the job branch only. `shadow` records that shape, including a rewrite (`not_descendant_of` in the receipt, status
+`violations`), and does not refuse the candidate or fail the gate. `enforce` refuses a rewrite at submit with
+`git_history_not_descendant` and the final gate fails that check, along with a merge commit, a missing trailer, or
+too many commits.
 **Limit:** delivery and a conforming history do not prove the executor read or understood the skill.
 
 ## 10. Feature flags (R14)
