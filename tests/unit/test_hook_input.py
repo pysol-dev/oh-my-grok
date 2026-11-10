@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from omo_grok import cli
-from omo_grok.hooks import sanitize_input, url_diagnostic, validate_url
+from oh_my_grok import cli
+from oh_my_grok.hooks import sanitize_input, url_diagnostic, validate_url
 from test_cli import _pty_run
 
 URL = "https://example.com/hook"
@@ -92,18 +92,18 @@ def test_prompt_accepts_a_bracketed_paste_on_the_second_try(monkeypatch, capsys)
     assert "oops" not in capsys.readouterr().err
 
 
-def test_hook_set_under_a_pty_with_bracketed_paste(omo_home):
+def test_hook_set_under_a_pty_with_bracketed_paste(omg_home):
     env = dict(os.environ)
     key = "whk_DUMMYKEY_0123456789"
     code, out = _pty_run(["hook", "set", "metis"],
                          ["\x1b[200~" + URL + "\x1b[201~", "\x1b[200~" + key + "\x1b[201~"], env)
     assert code == 0, out
     assert key not in out and "example.com" not in out and "stored" in out
-    data = json.loads((Path(omo_home) / "state" / "secrets" / "hooks.json").read_text())
+    data = json.loads((Path(omg_home) / "state" / "secrets" / "hooks.json").read_text())
     assert data["metis"]["url"] == URL and data["metis"]["key"] == key
 
 
-def test_hook_set_under_a_pty_reprompts_after_a_bad_paste(omo_home):
+def test_hook_set_under_a_pty_reprompts_after_a_bad_paste(omg_home):
     env = dict(os.environ)
     key = "whk_DUMMYKEY_0123456789"
     code, out = _pty_run(["hook", "set", "momus"], ["ftp://secret-host/x", URL, key], env)

@@ -9,8 +9,8 @@ from . import gitops
 from .paths import CODE_ROOT
 
 FIXTURE_SRC = CODE_ROOT / "fixtures" / "calc-src"
-FIXED_ENV = {"GIT_AUTHOR_NAME": "omo-fixture", "GIT_AUTHOR_EMAIL": "fixture@localhost",
-             "GIT_COMMITTER_NAME": "omo-fixture", "GIT_COMMITTER_EMAIL": "fixture@localhost",
+FIXED_ENV = {"GIT_AUTHOR_NAME": "omg-fixture", "GIT_AUTHOR_EMAIL": "fixture@localhost",
+             "GIT_COMMITTER_NAME": "omg-fixture", "GIT_COMMITTER_EMAIL": "fixture@localhost",
              "GIT_AUTHOR_DATE": "2026-01-01T00:00:00+0000", "GIT_COMMITTER_DATE": "2026-01-01T00:00:00+0000"}
 
 FIX_FROM = "return a - b  # BUG"

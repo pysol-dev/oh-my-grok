@@ -9,14 +9,14 @@ from pathlib import Path
 
 import pytest
 
-from omo_grok.paths import get_paths
+from oh_my_grok.paths import get_paths
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 
 
 def _policy(**extra):
-    cfg = Path(os.environ["OMO_CONFIG_DIR"])
+    cfg = Path(os.environ["OMG_CONFIG_DIR"])
     pol = json.loads((cfg / "policy.json").read_text())
     pol.update(extra)
     (cfg / "policy.json").write_text(json.dumps(pol))
@@ -40,7 +40,7 @@ def finish(p, timeout=120):
 
 
 @pytest.fixture
-def h(omo_home):
+def h(omg_home):
     from helpers import Harness
     _policy(features={"boulder": "on"})
     hh = Harness()
@@ -72,7 +72,7 @@ def test_concurrent_writers_lose_no_update_and_readers_never_see_a_partial_file(
     assert rc == 0, out + err
     assert max_event(h, job) is not None
     final = json.loads(bpath(job).read_text())
-    assert final["x_omo_grok"]["generation"] == max_event(h, job)  # nothing lost
+    assert final["x_omg"]["generation"] == max_event(h, job)  # nothing lost
     assert len(final["session_ids"]) == 2  # both concurrent claims survived (rows, not read-modify-write)
     rec = h.e._one("SELECT * FROM boulder_projection WHERE job_id=?", (job,))
     assert rec["status"] == "ok" and rec["pending_sha256"] is None
@@ -86,21 +86,21 @@ def test_kill_minus_nine_at_every_writer_step_leaves_a_parseable_file_and_conver
     job = h.submit()["job_id"]
     pkt = h.claim(job, "explore")
     before = json.loads(bpath(job).read_text())
-    w = spawn("_proj_worker.py", "checkpoint", job, pkt["task_id"], pkt["attempt_id"], 1, OMO_FAULT_INJECT=point)
+    w = spawn("_proj_worker.py", "checkpoint", job, pkt["task_id"], pkt["attempt_id"], 1, OMG_FAULT_INJECT=point)
     rc, out, err = finish(w)
     assert rc == 137, (rc, out, err)
     mid = json.loads(bpath(job).read_text())  # complete old file or complete new file, never partial
-    assert mid["x_omo_grok"]["generation"] in (before["x_omo_grok"]["generation"], max_event(h, job))
+    assert mid["x_omg"]["generation"] in (before["x_omg"]["generation"], max_event(h, job))
     h.e.checkpoint(job, pkt["task_id"], pkt["attempt_id"], "after the crash")  # next flush converges
     final = json.loads(bpath(job).read_text())
-    assert final["x_omo_grok"]["generation"] == max_event(h, job)
+    assert final["x_omg"]["generation"] == max_event(h, job)
     assert not h.e._one("SELECT 1 FROM events WHERE job_id=? AND kind='boulder_tamper'", (job,)), point
     assert h.e._one("SELECT status FROM boulder_projection WHERE job_id=?", (job,))["status"] == "ok"
     assert not list(bpath(job).parent.rglob(".*.tmp"))
 
 
 @pytest.fixture
-def quick_lock(omo_home):
+def quick_lock(omg_home):
     from helpers import Harness
     _policy(features={"boulder": "on"}, projection_lock_seconds=0.2)
     hh = Harness()
@@ -128,7 +128,7 @@ def test_lock_timeout_marks_stale_without_failing_the_job(quick_lock):
         os.close(fd)
     h.e.checkpoint(job, pkt["task_id"], pkt["attempt_id"], "lock released")
     assert h.e._one("SELECT status FROM boulder_projection WHERE job_id=?", (job,))["status"] == "ok"
-    assert json.loads(bpath(job).read_text())["x_omo_grok"]["generation"] == max_event(h, job)
+    assert json.loads(bpath(job).read_text())["x_omg"]["generation"] == max_event(h, job)
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
@@ -144,5 +144,5 @@ def test_unwritable_directory_marks_stale_and_recovers(h):
         d.chmod(0o700)
     h.e.checkpoint(job, pkt["task_id"], pkt["attempt_id"], "dir restored")
     assert h.e._one("SELECT status FROM boulder_projection WHERE job_id=?", (job,))["status"] == "ok"
-    assert json.loads(bpath(job).read_text())["x_omo_grok"]["generation"] == max_event(h, job)
+    assert json.loads(bpath(job).read_text())["x_omg"]["generation"] == max_event(h, job)
     assert not h.e._one("SELECT 1 FROM events WHERE job_id=? AND kind='boulder_tamper'", (job,))

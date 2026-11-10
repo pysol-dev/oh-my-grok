@@ -1,4 +1,4 @@
-"""Stage 0: nothing shipped may depend on the host location /workspace/omo (spec/ADAPTIVE.md SUP-8)."""
+"""Stage 0: nothing shipped may depend on the host location /workspace/omg (spec/ADAPTIVE.md SUP-8)."""
 import json
 import subprocess
 import sys
@@ -6,10 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from omo_grok import config
-from omo_grok.paths import CODE_ROOT
+from oh_my_grok import config
+from oh_my_grok.paths import CODE_ROOT
 
-HOST_PATH = "/workspace" + "/omo"
+HOST_PATHS = ("/workspace" + "/omo", "/workspace" + "/omg")
 SCANNED_SUFFIXES = {".py", ".json", ".txt", ".sh", ".lock", ".in", ""}
 
 
@@ -30,7 +30,7 @@ def test_no_shipped_code_or_config_hardcodes_the_host_location():
         if f.suffix not in SCANNED_SUFFIXES or f.name == "test_relocation.py":
             continue
         try:
-            if HOST_PATH in f.read_text():
+            if any(host in f.read_text() for host in HOST_PATHS):
                 offenders.append(str(rel))
         except (UnicodeDecodeError, OSError):
             continue
@@ -39,13 +39,33 @@ def test_no_shipped_code_or_config_hardcodes_the_host_location():
 
 def test_placeholders_expand_from_code_root_and_env(tmp_path, monkeypatch):
     (tmp_path / "verifiers.json").write_text(json.dumps({"profiles": {"p": {
-        "argv": ["${OMO_PYTHON}", "-I", "${OMO_CODE_ROOT}/x.py"], "cwd": ".", "env_allow": [],
+        "argv": ["${OMG_PYTHON}", "-I", "${OMG_CODE_ROOT}/x.py"], "cwd": ".", "env_allow": [],
         "timeout_seconds": 5}}}))
-    monkeypatch.delenv("OMO_PYTHON", raising=False)
+    monkeypatch.delenv("OMG_PYTHON", raising=False)
     argv = config.load_verifier_profiles(tmp_path)["p"]["argv"]
     assert argv == [str(CODE_ROOT / ".venv" / "bin" / "python"), "-I", f"{CODE_ROOT}/x.py"]
-    monkeypatch.setenv("OMO_PYTHON", "/opt/py/bin/python")
+    monkeypatch.setenv("OMG_PYTHON", "/opt/py/bin/python")
     assert config.load_verifier_profiles(tmp_path)["p"]["argv"][0] == "/opt/py/bin/python"
+
+
+def test_legacy_omo_placeholders_and_home_still_work(tmp_path, monkeypatch):
+    from oh_my_grok.paths import get_paths
+    (tmp_path / "verifiers.json").write_text(json.dumps({"profiles": {"p": {
+        "argv": ["${OMO_PYTHON}", "-I", "${OMO_CODE_ROOT}/x.py"], "cwd": ".", "env_allow": [],
+        "timeout_seconds": 5}}}))
+    monkeypatch.delenv("OMG_PYTHON", raising=False)
+    monkeypatch.setenv("OMO_PYTHON", "/opt/legacy/bin/python")
+    argv = config.load_verifier_profiles(tmp_path)["p"]["argv"]
+    assert argv == ["/opt/legacy/bin/python", "-I", f"{CODE_ROOT}/x.py"]
+    monkeypatch.setenv("OMG_PYTHON", "/opt/new/bin/python")
+    assert config.load_verifier_profiles(tmp_path)["p"]["argv"][0] == "/opt/new/bin/python"
+    monkeypatch.delenv("OMG_HOME", raising=False)
+    monkeypatch.delenv("OMG_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("OMO_HOME", str(tmp_path / "oldhome"))
+    monkeypatch.setenv("OMO_CONFIG_DIR", str(tmp_path / "oldcfg"))
+    paths = get_paths()
+    assert paths.root == (tmp_path / "oldhome").resolve()
+    assert paths.config_dir == (tmp_path / "oldcfg").resolve()
 
 
 def test_unknown_placeholder_is_refused(tmp_path):
@@ -62,10 +82,10 @@ def test_shipped_fixture_profile_validates_in_this_checkout():
 
 
 def test_mcp_command_is_computed_not_stored():
-    out = subprocess.run([sys.executable, "-m", "omo_grok.cli", "mcp-command"], cwd=CODE_ROOT, capture_output=True,
+    out = subprocess.run([sys.executable, "-m", "oh_my_grok.cli", "mcp-command"], cwd=CODE_ROOT, capture_output=True,
                          text=True, env={"PYTHONPATH": str(CODE_ROOT), "PATH": "/usr/bin:/bin"})
     assert out.returncode == 0, out.stderr
     cmd = out.stdout.strip()
-    assert cmd.endswith(str(CODE_ROOT / "omo_grok" / "mcp_server.py"))
+    assert cmd.endswith(str(CODE_ROOT / "oh_my_grok" / "mcp_server.py"))
     assert cmd.startswith("/")
     assert Path(cmd.split()[0]).name.startswith("python")

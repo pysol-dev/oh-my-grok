@@ -25,8 +25,8 @@ from pathlib import Path
 from . import gitops, integrity, sandbox
 from .candidate_scan import pure_module_problems, scan_source
 from . import oracle_child, oracles
-from .config import (RUNNER_NAME, UNITTEST_CHILD, TEMPLATE_MARKER, canonical_json, profile_assurance, profile_hash,
-                     validate_profile)
+from .config import (ACCEPTED_RUNNERS, UNITTEST_CHILD, TEMPLATE_MARKERS, canonical_json, profile_assurance,
+                     profile_hash, validate_profile)
 from .paths import CODE_ROOT
 from .redact import redact
 
@@ -264,7 +264,7 @@ class _Ctx:
     sb: sandbox.Probe
     exe: str              # interpreter/command inside the read-only runtime
     work: Path            # per-run COPY of the checkout (writable scratch, bound at /work)
-    harness: Path | None  # per-run read-only copy of the child scripts (bound at /omo-harness)
+    harness: Path | None  # per-run read-only copy of the child scripts (bound at /omg-harness)
     cwd_rel: str
     env: dict
     timeout: float
@@ -310,8 +310,10 @@ def run(repo: Path, revision: str, name: str | None, prof: dict | None, work_roo
         for a in prof["argv"][1:]:
             cand = (dest / prof["cwd"] / a)
             if cand.is_file() and not cand.is_symlink():
-                if TEMPLATE_MARKER.encode() in cand.read_bytes()[:200_000]:
-                    return _err("error", f"{a} contains {TEMPLATE_MARKER}; fail closed", ph, eid, prof)
+                blob = cand.read_bytes()[:200_000]
+                for marker in TEMPLATE_MARKERS:
+                    if marker.encode() in blob:
+                        return _err("error", f"{a} contains {marker}; fail closed", ph, eid, prof)
         scope = scope_problems(repo, revision, prof, dest)
         if scope:
             return _err("failed", "candidate rejected before running: " + "; ".join(scope), ph, eid, prof)
@@ -321,7 +323,7 @@ def run(repo: Path, revision: str, name: str | None, prof: dict | None, work_roo
             if k in os.environ:
                 env[k] = os.environ[k]
         env.update({k: str(v) for k, v in prof.get("env_set", {}).items()})
-        python = prof.get("runner") == RUNNER_NAME
+        python = prof.get("runner") in ACCEPTED_RUNNERS
         before = integrity.snapshot()
         # staged under the system temp dir with a neutral name: host paths are visible inside the sandbox via
         # /proc/1/cmdline and /proc/self/mountinfo, so they must not carry harness/job markers
@@ -560,10 +562,10 @@ def _run_exit_code_only(prof, ctx: _Ctx, ph, eid) -> VerifyOutcome:
 
 def _py_argv(ctx: _Ctx, script: Path) -> list[str]:
     """System interpreter inside the sandbox: -I (isolated) -S (no site-packages at all) -B, throwaway pycache."""
-    return [ctx.exe, "-I", "-S", "-B", "-X", "pycache_prefix=/tmp/omo-pyc", f"{sandbox.SANDBOX_HARNESS}/{script.name}"]
+    return [ctx.exe, "-I", "-S", "-B", "-X", "pycache_prefix=/tmp/omg-pyc", f"{sandbox.SANDBOX_HARNESS}/{script.name}"]
 
 
-REPORT_PREFIX = "OMO-UNITTEST-REPORT "
+REPORT_PREFIX = "OMG-UNITTEST-REPORT "
 
 
 def evaluate_report(rep: dict | None, returncode: int | None, prof: dict) -> list[str]:

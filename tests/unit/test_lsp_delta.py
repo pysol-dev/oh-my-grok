@@ -3,10 +3,10 @@ import json
 
 import pytest
 
-from omo_grok.config import expand_placeholders
-from omo_grok.errors import ValidationError
-from omo_grok.lsp import delta, profiles
-from omo_grok.paths import CODE_ROOT
+from oh_my_grok.config import expand_placeholders
+from oh_my_grok.errors import ValidationError
+from oh_my_grok.lsp import delta, profiles
+from oh_my_grok.paths import CODE_ROOT
 
 
 def d(path="a.py", sev=1, code="X", msg="boom", line=3):

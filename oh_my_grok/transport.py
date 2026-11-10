@@ -22,7 +22,7 @@ def post_json(url: str, key: str, body: dict, connect_timeout: float, read_timeo
     u = urlparse(url)
     data = json.dumps(body, separators=(",", ":")).encode()
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
-               "User-Agent": "omo-grok-dispatcher/1"}
+               "User-Agent": "oh-my-grok-dispatcher/1"}
     path = (u.path or "/") + (f"?{u.query}" if u.query else "")
     try:
         if u.scheme == "https":

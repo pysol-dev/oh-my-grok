@@ -13,9 +13,9 @@ from pathlib import Path
 
 import pytest
 
-from omo_grok import fixture as fx
-from omo_grok import oracle_child, sandbox, verifier
-from omo_grok.config import load_verifier_profiles
+from oh_my_grok import fixture as fx
+from oh_my_grok import oracle_child, sandbox, verifier
+from oh_my_grok.config import load_verifier_profiles
 
 ROOT = Path(__file__).resolve().parents[2]
 PROF = load_verifier_profiles(ROOT / "config")["fixture-calc-unittest"]
@@ -122,7 +122,7 @@ def test_harness_has_no_markers_and_runs_really_vary():
 
 
 def test_pure_rule_is_required_for_fixture_profiles_and_bounded():
-    from omo_grok.config import validate_profile
+    from oh_my_grok.config import validate_profile
     p = dict(PROF)
     p.pop("pure_modules")
     assert any("pure_modules" in x for x in validate_profile("fixture-x", p))
@@ -132,7 +132,7 @@ def test_pure_rule_is_required_for_fixture_profiles_and_bounded():
 
 
 def test_pure_rule_allowlist_examples():
-    from omo_grok.candidate_scan import pure_module_problems as pure
+    from oh_my_grok.candidate_scan import pure_module_problems as pure
     # round 7: classes (and so `self.x` attribute access) are no longer allowed; plain functions are
     ok = '"""m"""\nimport math\nK = (1, 2)\n\n\ndef f(x):\n    return math.sqrt(x) + K[0]\n'
     assert pure(ok, "m.py", ["math"]) == []

@@ -1,6 +1,6 @@
 """Orchestration engine: the ONLY place that decides workflow transitions.
 
-Shared by the MCP server and omoctl. Every mutation runs in a short BEGIN IMMEDIATE transaction with
+Shared by the MCP server and omg. Every mutation runs in a short BEGIN IMMEDIATE transaction with
 compare-and-swap checks; HTTP and subprocess work happens strictly outside transactions."""
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from . import context7, db, features, gitops, projection, receipts, roster, sand
 from . import fixture as fx
 from .config import (canonical_json, load_policy, load_verifier_profiles, profile_assurance, profile_hash,
                      sha256_text)
-from .errors import Conflict, GateRefused, IntegrityError_, NotFound, OmoError, ValidationError
+from .errors import Conflict, GateRefused, IntegrityError_, NotFound, OmgError, ValidationError
 from .hooks import hook_status, load_hooks
 from .lsp import profiles as lsp_profiles
 from .lsp import runner as lsp_runner
@@ -42,7 +42,7 @@ STOPPED_PHASES = {J_BLOCKED, J_FAILED, J_CANCELLED, J_DONE}
 
 ROLE_POLICY = {
     "hephaestus": ("Plan, integrate findings and report. Cannot satisfy approval or verification gates.",
-                   ["read artifacts", "write plan/integration artifacts", "call omo.checkpoint/omo.complete"],
+                   ["read artifacts", "write plan/integration artifacts", "call omg.checkpoint/omg.complete"],
                    ["approve plans", "mark jobs done", "edit product code outside an authorized task",
                     "self-webhook", "message other Bots to bypass the bus"]),
     "explorer": ("Read-only internal codebase analysis with file/line evidence.",
@@ -154,7 +154,7 @@ class Engine:
                 projection.project(self.conn, self.paths, jid, float(self.policy["projection_lock_seconds"]))
 
     def project_job(self, job_id: str) -> dict:
-        """Explicit refresh (omoctl boulder --refresh). Works for any job, whatever its frozen feature set."""
+        """Explicit refresh (omg boulder --refresh). Works for any job, whatever its frozen feature set."""
         self._job(job_id)
         return projection.project(self.conn, self.paths, job_id, float(self.policy["projection_lock_seconds"]))
 
@@ -553,7 +553,7 @@ class Engine:
                                db.utcnow(), db.utcnow()))
             self._set_task(t, AWAITING_RESUME, current_dispatch_id=did, block_reason=None)
             self._ev("awaiting_resume", t["job_id"], t["id"], "engine", dispatch_id=did,
-                     hint="Hephaestus: call omo.claim(job_id, task_id, dispatch_id) in your next turn")
+                     hint="Hephaestus: call omg.claim(job_id, task_id, dispatch_id) in your next turn")
             return 1
         if not b or not b["enabled"]:
             self._set_block_reason(t, f"no enabled role binding for {role}")
@@ -562,7 +562,7 @@ class Engine:
             self._set_block_reason(t, f"binding for {role} not verified (routine missing/unverified)")
             return 0
         if not self._hook_ok(role):
-            self._set_block_reason(t, f"webhook for {role} not configured (omoctl hook set {role})")
+            self._set_block_reason(t, f"webhook for {role} not configured (omg hook set {role})")
             return 0
         if self._bot_busy(b["bot_id"], b["max_concurrent"]):
             self._set_block_reason(t, f"bot_busy:{b['bot_name'] or b['bot_id']} (per-Bot serialization)")
@@ -629,7 +629,7 @@ class Engine:
             try:
                 hook = load_hooks(self.paths).get(row["role"])
                 err = None if hook else "webhook URL/key missing for role"
-            except OmoError as e:
+            except OmgError as e:
                 hook, err = None, e.message
             if hook:
                 res = self.transport(hook["url"], hook["key"], body, self.policy["http_connect_timeout_seconds"],
@@ -660,7 +660,7 @@ class Engine:
             retryable = (not permanent) and (code is None or code in (408, 425, 429) or code >= 500)
             err = res.error or f"HTTP {code}"
             if code in (401, 403):
-                err = f"HTTP {code}: webhook key rejected or changed (rotate with omoctl hook set {row['role']})"
+                err = f"HTTP {code}: webhook key rejected or changed (rotate with omg hook set {row['role']})"
             elif code in (404, 410):
                 err = f"HTTP {code}: routine missing, paused or disabled"
             elif code == 429:
@@ -773,7 +773,7 @@ class Engine:
         self.conn.execute("INSERT INTO work_sessions(id,job_id,task_id,attempt_id,session_token,role,bot_id,"
                           "started_at) VALUES (?,?,?,?,?,?,?,?)",
                           (str(uuid.uuid4()), job_id, task_id, aid,
-                           f"omo-grok:{(bound and bound['bot_id']) or t['role']}:{aid}", t["role"],
+                           f"oh-my-grok:{(bound and bound['bot_id']) or t['role']}:{aid}", t["role"],
                            bound and bound["bot_id"], db.utcnow()))
         if self._features(job)["git_discipline"] != features.OFF:
             pack = skills.pack_for(t["kind"])
@@ -832,7 +832,7 @@ class Engine:
             "constraints": req["constraints"],
             "output_schema": output_schema(t["kind"]),
             "deadline_or_lease": {"lease_expires_at": t["lease_expires_at"], "lease_seconds": pol["lease_seconds"],
-                                  "renew_with": "omo.checkpoint"},
+                                  "renew_with": "omg.checkpoint"},
             "retry_budget": {"attempts_used": t["attempt_no"], "max_attempts": t["max_attempts"],
                              "repair_cycles_used": job["repair_cycles"], "max_repair_cycles": pol["max_repair_cycles"]},
             "relevant_prior_failures": prior[-10:],
@@ -845,7 +845,7 @@ class Engine:
     def _git_packet_fields(self, job, t) -> dict:
         if self._features(job)["git_discipline"] == features.OFF or t["kind"] != "implement":
             return {}
-        return {"skill_pack": skills.pack_for("implement"), "commit_trailer": f"Omo-Job: {job['id']}",
+        return {"skill_pack": skills.pack_for("implement"), "commit_trailer": f"Omg-Job: {job['id']}",
                 "commit_budget": self._policy(job)["git_max_commits"]}
 
     def _profile_summary(self, job):
@@ -1080,7 +1080,7 @@ class Engine:
             a = self._one("SELECT * FROM artifacts WHERE id=?", (aid,))
             transcript = json.loads(art.read_text(self._art_root(job_id), a["rel_path"], a["sha256"]))
             response = transcript["calls"][-1]["response"]
-        except (OmoError, KeyError, IndexError, ValueError, TypeError):
+        except (OmgError, KeyError, IndexError, ValueError, TypeError):
             return False, "the stored receipt transcript is missing or fails its integrity check", None
         if hashlib.sha256(response.encode("utf-8")).hexdigest() != row["output_sha256"]:
             return False, "stored response does not match the receipt hash", None
@@ -1163,7 +1163,7 @@ class Engine:
                                "of text (whitespace-normalised) of at least 20 characters"}
 
     def attest(self, kind: str, who: str, statement: str) -> dict:
-        """Record a HUMAN attestation (omoctl, TTY-confirmed). Stored as an append-only event; never a secret."""
+        """Record a HUMAN attestation (omg, TTY-confirmed). Stored as an append-only event; never a secret."""
         from .operational import ATTEST_KINDS
         if kind not in ATTEST_KINDS:
             raise ValidationError(f"attestation kind must be one of {sorted(ATTEST_KINDS)}")
@@ -1280,7 +1280,7 @@ class Engine:
                               (review_id, rev["id"]))
             self._set_job(job, J_AWAITING_APPROVAL)
             self._ev("plan_accepted_by_momus", job["id"], t["id"], "momus", plan_hash=rev["content_hash"],
-                     next_step=f"user runs: omoctl approve {job['id']} --plan-hash {rev['content_hash']}")
+                     next_step=f"user runs: omg approve {job['id']} --plan-hash {rev['content_hash']}")
         else:
             self.conn.execute("UPDATE plan_revisions SET review_status='rejected', review_id=? WHERE id=?",
                               (review_id, rev["id"]))
@@ -1490,7 +1490,7 @@ class Engine:
         jd = self.paths.job_dir(job["id"]) / "lsp"
         try:
             cfg = lsp_profiles.load(self.paths.config_dir)
-        except OmoError as e:
+        except OmgError as e:
             return {"status": "unavailable", "base": job["base_revision"], "candidate": sha, "profiles": {},
                     "uncovered": {}, "new": [], "config_violations": [], "suppressions": [],
                     "reasons": [f"lsp configuration invalid: {e.message}"], "config_sha256": None}
@@ -1593,14 +1593,14 @@ class Engine:
             cur = {"revision_id": r["id"], "plan_hash": r["content_hash"], "review_status": r["review_status"],
                    "content": content,
                    "momus_review": review and {"verdict": review["verdict"], "findings": _l(review["findings_json"])},
-                   "approve_command": f"omoctl approve {job_id} --plan-hash {r['content_hash']}"
+                   "approve_command": f"omg approve {job_id} --plan-hash {r['content_hash']}"
                    if r["review_status"] == "accepted" else None}
         return redact_obj({"job_id": job_id, "phase": job["phase"], "current": cur, "revisions": revs})
 
     @_flushes
     def approve(self, job_id, plan_hash, actor: str, evidence: str, allow_edit: bool = True,
                 accept_reduced_assurance: bool = False, mode: str = "soft") -> dict:
-        """Privileged: called ONLY by omoctl after human TTY confirmation (or the synthetic fixture harness).
+        """Privileged: called ONLY by omg after human TTY confirmation (or the synthetic fixture harness).
         Not exposed over MCP. SOFT: all same-account Bots could technically run the CLI or edit the DB."""
         if mode not in ("soft", "synthetic_fixture"):
             raise ValidationError("only soft or synthetic_fixture approvals can be recorded locally")
@@ -1622,7 +1622,7 @@ class Engine:
                                   current=rev["content_hash"])
             a = self._one("SELECT * FROM artifacts WHERE id=?", (rev["artifact_id"],))
             art.verify_file(self._art_root(job_id), a["rel_path"], a["sha256"])
-            scope = {"job_id": job_id, "repo": job["repo_path"], "branch_prefix": f"omo/{job_id[:8]}",
+            scope = {"job_id": job_id, "repo": job["repo_path"], "branch_prefix": f"omg/{job_id[:8]}",
                      "allow_edit": bool(allow_edit) and job["mode"] in ("implement", "fixture"),
                      "accept_reduced_assurance": bool(accept_reduced_assurance),
                      "production_merge_or_deploy": False}
@@ -1642,7 +1642,7 @@ class Engine:
             self._set_job(job, J_RUNNING)
         try:
             self._start_implementation(job_id)
-        except OmoError as e:
+        except OmgError as e:
             with db.tx(self.conn):
                 self._block_job(self._job(job_id), f"worktree setup failed: {e.message}")
             raise
@@ -1676,7 +1676,7 @@ class Engine:
         if job["mode"] == "fixture" and not repo.exists():
             fx.make_repo(repo)
         base = job["base_revision"] or gitops.head(repo)
-        branch = job["branch"] or f"omo/{job_id[:8]}-{job_id[9:13]}"
+        branch = job["branch"] or f"omg/{job_id[:8]}-{job_id[9:13]}"
         wt = Path(job["worktree_path"]) if job["worktree_path"] else self.paths.job_dir(job_id) / "worktree"
         others = self._all("SELECT id FROM jobs WHERE repo_path=? AND id!=? AND phase='running'", (str(repo), job_id))
         gitops.create_worktree(repo, wt, branch, base)
@@ -1719,7 +1719,7 @@ class Engine:
         self._after()
         return {"ok": True, "phase": self._job(job_id)["phase"]}
 
-    def record_synthetic_approval(self, job_id, plan_hash, actor="omoctl test live --fixture-only",
+    def record_synthetic_approval(self, job_id, plan_hash, actor="omg test live --fixture-only",
                                   accept_reduced_assurance: bool = False) -> dict:
         """Explicit synthetic approval for a synthetic FIXTURE job only. Never valid for real repositories.
         Reduced (non-independent) assurance must be opted into per job here too; it is never a default."""
@@ -1798,7 +1798,7 @@ class Engine:
         for a in self._all("SELECT rel_path, sha256 FROM artifacts WHERE job_id=?", (job_id,)):
             try:
                 art.verify_file(self._art_root(job_id), a["rel_path"], a["sha256"])
-            except OmoError as e:
+            except OmgError as e:
                 bad.append(f"{a['rel_path']}: {e.message}")
         chk("artifact_integrity", not bad, "; ".join(bad[:5]))
         if self._features(job)["lsp"] == features.ENFORCE:
@@ -1852,7 +1852,7 @@ class Engine:
                                          int(self._policy(job)["git_max_commits"]),
                                          priors=self._prior_candidate_revisions(job["id"], sha))
             status = "ok" if shape["ok"] else "violations"
-        except OmoError as e:
+        except OmgError as e:
             shape, status = {"error": e.message[:200], "ok": False}, "error"
         receipts.record(self.conn, job_id=job["id"], task_id=task_id, kind="git_history", level="engine_executed",
                         status=status, revision=sha, tool="git", input_sha256=f"{job['base_revision']}..{sha}",
@@ -2022,7 +2022,7 @@ class Engine:
             if has_real_work and not confirmed:
                 return {"ok": False, "requires_human_confirmation": True,
                         "message": f"job has approved/real implementation work; ask the user to run: "
-                                   f"omoctl cancel {job_id}"}
+                                   f"omg cancel {job_id}"}
             for t in self._all("SELECT * FROM tasks WHERE job_id=? AND status NOT IN ('passed','rejected','failed',"
                                "'cancelled')", (job_id,)):
                 if t["current_attempt_id"]:
@@ -2133,7 +2133,7 @@ class Engine:
                 else:
                     self.run_final_gate(t["job_id"], t["id"])
                     rep["rerun_gates"] += 1
-            except OmoError as e:
+            except OmgError as e:
                 with db.tx(self.conn):
                     self._ev("reconcile_error", t["job_id"], t["id"], "reconciler", error=e.message)
         if flush:
@@ -2227,7 +2227,7 @@ class Engine:
                         "phase": j["phase"], "intent": j["intent"], "roster_class": j["roster_class"],
                         "next_action": self._next_action(j, tasks), "sessions": sessions,
                         "boulder_path": str(projection.omo_dir(self.paths, j["id"]) / "boulder.json") if on else None,
-                        "resume": {"tool": "omo.status", "job_id": j["id"]}})
+                        "resume": {"tool": "omg.status", "job_id": j["id"]}})
         return out
 
     def export(self, job_id: str, out_dir: Path) -> dict:
@@ -2247,9 +2247,9 @@ class Engine:
             try:
                 art.verify_file(self._art_root(job_id), a["rel_path"], a["sha256"])
                 integrity.append({"rel_path": a["rel_path"], "ok": True})
-            except OmoError as e:
+            except OmgError as e:
                 integrity.append({"rel_path": a["rel_path"], "ok": False, "error": e.message})
         data["artifact_integrity"] = integrity
-        p = out_dir / f"omo-job-{job_id}.json"
+        p = out_dir / f"omg-job-{job_id}.json"
         p.write_text(json.dumps(redact_obj(data), indent=2, sort_keys=True, default=str))
         return {"path": str(p), "artifacts": len(integrity), "integrity_ok": all(i["ok"] for i in integrity)}

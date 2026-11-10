@@ -101,7 +101,7 @@ def history_shape(repo: Path, base: str, sha: str, job_id: str, max_commits: int
     and (when priors are given) that sha descends from each prior candidate of this job."""
     rows = [r.split() for r in git(["rev-list", "--parents", f"{base}..{sha}"], repo).stdout.splitlines() if r.strip()]
     merges = [r[0] for r in rows if len(r) > 2]
-    trailer = re.compile(rf"^Omo-Job: {re.escape(job_id)}[ \t]*$", re.MULTILINE)
+    trailer = re.compile(rf"^(?:Omg-Job|Omo-Job): {re.escape(job_id)}[ \t]*$", re.MULTILINE)
     missing = []
     raw = git(["log", "--format=%H%x1f%B%x1e", f"{base}..{sha}"], repo).stdout
     for rec in raw.split("\x1e"):

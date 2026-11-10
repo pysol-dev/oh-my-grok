@@ -9,13 +9,14 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 ROOT = Path(__file__).resolve().parents[2]
 PY = str(ROOT / ".venv" / "bin" / "python")
-SERVER = str(ROOT / "omo_grok" / "mcp_server.py")
+SERVER = str(ROOT / "oh_my_grok" / "mcp_server.py")
 EXPECTED = {"submit", "claim", "context", "checkpoint", "complete", "status", "reconcile", "cancel", "escalate",
             "docs"}
 
 
 def _params():
-    env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "OMO_HOME", "OMO_CONFIG_DIR")}
+    env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "OMG_HOME", "OMO_HOME",
+                                                        "OMG_CONFIG_DIR", "OMO_CONFIG_DIR")}
     return StdioServerParameters(command=PY, args=[SERVER], env=env)
 
 
@@ -28,7 +29,7 @@ async def _session_flow(errlog):
     async with stdio_client(_params(), errlog=errlog) as (r, w):
         async with ClientSession(r, w) as s:
             init = await s.initialize()
-            assert init.server_info.name == "omo"
+            assert init.server_info.name == "omg"
             tools = await s.list_tools()
             names = {t.name for t in tools.tools}
             sub = await s.call_tool("submit", {"goal": "Fix calc.add in the synthetic fixture",
@@ -48,7 +49,7 @@ async def _session_flow(errlog):
             return names, tools, job, again, st, bad, inval, missing
 
 
-def test_sdk_stdio_initialize_list_submit_status(omo_home, tmp_path):
+def test_sdk_stdio_initialize_list_submit_status(omg_home, tmp_path):
     log = tmp_path / "stderr.log"
     with open(log, "w") as errlog:
         names, tools, job, again, st, bad, inval, missing = asyncio.run(_session_flow(errlog))
@@ -65,7 +66,7 @@ def test_sdk_stdio_initialize_list_submit_status(omo_home, tmp_path):
     # secrets lives in test_planted_secrets_never_leak_via_mcp_status_log_or_export below
 
 
-def test_item10_server_stdout_is_protocol_only(omo_home):
+def test_item10_server_stdout_is_protocol_only(omg_home):
     """Drive the raw server with one JSON-RPC message; every stdout line must parse as JSON-RPC."""
     import subprocess
     init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -119,40 +120,41 @@ async def _leak_flow(errlog, env):
             return job, text
 
 
-def test_planted_secrets_never_leak_via_mcp_status_log_or_export(omo_home, tmp_path, monkeypatch):
+def test_planted_secrets_never_leak_via_mcp_status_log_or_export(omg_home, tmp_path, monkeypatch):
     """Real secrets planted in the hooks file (key + URL path token), the server's environment and tool-call inputs
-    must never appear in MCP results, the server's stderr log, `omoctl status/export`, or the export file."""
+    must never appear in MCP results, the server's stderr log, `omg status/export`, or the export file."""
     import subprocess
     import sys
     sys.path.insert(0, str(ROOT / "tests"))
     from helpers import Harness
-    from omo_grok.hooks import set_hook
-    from omo_grok.paths import get_paths
-    monkeypatch.setenv("OMO_ALLOW_INSECURE_HOOKS", "1")
+    from oh_my_grok.hooks import set_hook
+    from oh_my_grok.paths import get_paths
+    monkeypatch.setenv("OMG_ALLOW_INSECURE_HOOKS", "1")
     h = Harness()  # binds every role (verified) and writes hooks; then plant a real secret-bearing hook
     for role in ("explorer", "librarian"):  # closed loopback port: connection refused, error may echo the URL
         set_hook(get_paths(), role, f"http://127.0.0.1:9/routines/{URL_TOKEN}/fire?sig={URL_TOKEN}", HOOK_KEY)
     h.close()
-    env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "OMO_HOME", "OMO_CONFIG_DIR",
-                                                        "OMO_ALLOW_INSECURE_HOOKS")}
+    env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "OMG_HOME", "OMO_HOME",
+                                                        "OMG_CONFIG_DIR", "OMO_CONFIG_DIR",
+                                                        "OMG_ALLOW_INSECURE_HOOKS", "OMO_ALLOW_INSECURE_HOOKS")}
     env["OPENAI_API_KEY"] = ENV_SECRET
-    env["OMO_DEBUG_SECRET"] = ENV_SECRET
+    env["OMG_DEBUG_SECRET"] = ENV_SECRET
     log = tmp_path / "stderr.log"
     with open(log, "w") as errlog:
         job, mcp_text = asyncio.run(_leak_flow(errlog, env))
     # the dispatch really happened and really failed (otherwise this test proves nothing)
-    from omo_grok.engine import Engine
+    from oh_my_grok.engine import Engine
     e = Engine()
     try:
         rows = e._all("SELECT status, last_error FROM dispatch_outbox WHERE job_id=?", (job,))
     finally:
         e.close()
     assert rows and all(r["status"] in ("retry_wait", "failed") and r["last_error"] for r in rows), rows
-    omoctl = str(ROOT / "omoctl")
-    st = subprocess.run([omoctl, "status", job, "--json"], capture_output=True, text=True, env=env, timeout=60)
-    allst = subprocess.run([omoctl, "status", "--json"], capture_output=True, text=True, env=env, timeout=60)
-    hk = subprocess.run([omoctl, "hook", "list"], capture_output=True, text=True, env=env, timeout=60)
-    ex = subprocess.run([omoctl, "export", job, "--out", str(tmp_path / "exp")], capture_output=True, text=True,
+    omg = str(ROOT / "omg")
+    st = subprocess.run([omg, "status", job, "--json"], capture_output=True, text=True, env=env, timeout=60)
+    allst = subprocess.run([omg, "status", "--json"], capture_output=True, text=True, env=env, timeout=60)
+    hk = subprocess.run([omg, "hook", "list"], capture_output=True, text=True, env=env, timeout=60)
+    ex = subprocess.run([omg, "export", job, "--out", str(tmp_path / "exp")], capture_output=True, text=True,
                         env=env, timeout=60)
     assert st.returncode == 0 and allst.returncode == 0 and hk.returncode == 0 and ex.returncode == 0, \
         (st.stderr, allst.stderr, hk.stderr, ex.stderr)
@@ -193,7 +195,7 @@ async def _adaptive_flow(errlog):
             return expl, inv, bad_scope, low, docs_off, down, down_bad
 
 
-def test_adaptive_submit_escalate_and_docs_over_real_mcp(omo_home, tmp_path):
+def test_adaptive_submit_escalate_and_docs_over_real_mcp(omg_home, tmp_path):
     with open(tmp_path / "stderr.log", "w") as errlog:
         expl, inv, bad_scope, low, docs_off, esc, esc_bad = asyncio.run(_adaptive_flow(errlog))
     assert expl == {"created": False, "roster_class": "none", "action": "answer_directly"}

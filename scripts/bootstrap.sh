@@ -6,13 +6,23 @@
 #   scripts/bootstrap.sh --check    verify only, install nothing (exit 8 when something is missing)
 #
 # Everything is installed from hash-pinned lock files:
-#   requirements.lock                  -> .venv          (omo-grok runtime: mcp SDK, pytest, pyflakes)
+#   requirements.lock                  -> .venv          (oh-my-grok runtime: mcp SDK, pytest, pyflakes)
 #   tooling/requirements-tools.lock    -> tools/venv     (ruff, basedpyright, nodejs-wheel-binaries)
 #   tooling/node/package-lock.json     -> tools/node     (typescript, typescript-language-server)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
-TOOLS="${OMO_TOOLS_DIR:-$ROOT/tools}"
+if [ -n "${OMG_TOOLS_DIR:-}" ]; then
+  TOOLS="$OMG_TOOLS_DIR"
+elif [ -n "${OMG_TOOLS:-}" ]; then
+  TOOLS="$OMG_TOOLS"
+elif [ -n "${OMO_TOOLS_DIR:-}" ]; then
+  TOOLS="$OMO_TOOLS_DIR"
+elif [ -n "${OMO_TOOLS:-}" ]; then
+  TOOLS="$OMO_TOOLS"
+else
+  TOOLS="$ROOT/tools"
+fi
 WANT_TOOLS=1
 CHECK=0
 for a in "$@"; do
@@ -29,7 +39,7 @@ say() { printf '%s\n' "$*"; }
 bad() { printf 'MISSING: %s\n' "$*" >&2; problems=$((problems + 1)); }
 
 pick_python() {
-  for c in "${OMO_BOOTSTRAP_PYTHON:-}" python3.13 python3.12 python3; do
+  for c in "${OMG_BOOTSTRAP_PYTHON:-${OMO_BOOTSTRAP_PYTHON:-}}" python3.13 python3.12 python3; do
     [ -n "$c" ] && command -v "$c" >/dev/null 2>&1 || continue
     if "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null; then
       command -v "$c"; return 0
@@ -38,7 +48,7 @@ pick_python() {
   return 1
 }
 
-SYS_PY="$(pick_python)" || { echo "need Python >= 3.12 (set OMO_BOOTSTRAP_PYTHON)" >&2; exit 8; }
+SYS_PY="$(pick_python)" || { echo "need Python >= 3.12 (set OMG_BOOTSTRAP_PYTHON or OMO_BOOTSTRAP_PYTHON)" >&2; exit 8; }
 
 # --- runtime venv ---------------------------------------------------------------------------------------------
 if [ "$CHECK" = 0 ]; then
@@ -80,4 +90,4 @@ if [ "$problems" -ne 0 ]; then
   exit 8
 fi
 say "bootstrap ok: runtime=$ROOT/.venv tools=$([ "$WANT_TOOLS" = 1 ] && echo "$TOOLS" || echo skipped)"
-say "next: $ROOT/omoctl doctor    and    $ROOT/omoctl mcp-command   (register that command as the 'omo' MCP app)"
+say "next: $ROOT/omg doctor    and    $ROOT/omg mcp-command   (register that command as the 'omg' MCP app; omoctl is a shim)"

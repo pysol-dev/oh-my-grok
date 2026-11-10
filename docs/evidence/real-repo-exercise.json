@@ -1,6 +1,6 @@
 {
   "job_id": "4f1f7c9b-e6d2-459e-8e80-7dd464db6018",
-  "base_defect": "bearer pattern removed from omo_grok/redact.py",
+  "base_defect": "bearer pattern removed from oh_my_grok/redact.py",
   "attempt2_sha": "ca796cf3fbfdf8bf17850917004af72040e301f4",
   "rejected_sha": "e2dfc4d0c069211a2329f70bfe24f8bf7ee9fe3c",
   "final_sha": "2e11bd1a0a87b3bfbcfeee5af5bb7b271bbfd70c",

@@ -5,11 +5,11 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 
-from omo_grok import fixture as fx
-from omo_grok.engine import Engine
-from omo_grok.hooks import set_hook
-from omo_grok.paths import get_paths
-from omo_grok.transport import HttpResult
+from oh_my_grok import fixture as fx
+from oh_my_grok.engine import Engine
+from oh_my_grok.hooks import set_hook
+from oh_my_grok.paths import get_paths
+from oh_my_grok.transport import HttpResult
 
 BOTS = {
     "hephaestus": ("f497e4a7-5d7d-46e4-829f-b0da987cbac4", "Hephaestus", "g-hephaestus"),
@@ -65,7 +65,7 @@ class Harness:
                 continue  # no resume routine: Hephaestus work goes to awaiting_resume
             if role == "executor" and executor_bot:
                 bid, name, grp = executor_bot
-            self.e.bind_role(role, bid, name, routine_id=f"routine-{role}", routine_name=f"omo-bus-{role}",
+            self.e.bind_role(role, bid, name, routine_id=f"routine-{role}", routine_name=f"omg-bus-{role}",
                              independence_group=grp, max_concurrent=4, verified=True, provenance="test")
             set_hook(paths, role, f"https://hooks.invalid/{role}", SECRET_KEY)
             self.e.mark_hook_configured(role, True)

@@ -1,6 +1,10 @@
-# omo-grok runbook
+# oh-my-grok runbook
 
-All paths are absolute. `OMO=/workspace/omo`. Everyday use is talking to Hephaestus (`agents/hephaestus-omo.md`).
+The documented checkout is `/workspace/omg`. The live host checkout is still `/workspace/omo` until cutover moves it. Commands below are `omg` (`omoctl` execs the same CLI). The MCP server name in this tree is `omg`; the live connector is still `user-omo` and has not been re-registered. Routine files in this repo are `omg-bus-<role>` and `omg-reconcile`; live Grok Bot routines still use the old names until they are renamed in place. Do not delete bots or routines as part of this rename, and do not regenerate webhook secrets.
+
+`spec/IMPLEMENTATION.md` is frozen and still uses the old names. Newer docs use oh-my-grok.
+
+Everyday use is talking to Hephaestus (`agents/hephaestus-omg.md`).
 The commands below are operator controls. Exit codes:
 
 | Code | Meaning |
@@ -18,13 +22,13 @@ The commands below are operator controls. Exit codes:
 
 ## 1. Install (already done on this box)
 ```bash
-cd /workspace/omo
+cd /workspace/omg
 python3 -m venv .venv
 .venv/bin/pip install --require-hashes -r requirements.lock
-./omoctl migrate
-./omoctl doctor
-./omoctl test unit
-./omoctl test integration
+./omg migrate
+./omg doctor
+./omg test unit
+./omg test integration
 ```
 
 ## 1b. Fresh clone (relocation-safe)
@@ -33,28 +37,29 @@ python3 -m venv .venv
 ```bash
 # host packages this script does not install: Python >= 3.12, git, bubblewrap (bwrap)
 git clone https://github.com/pysol-dev/omo-grok.git
+# intended name pysol-dev/oh-my-grok is not live yet; the old URL will redirect after the repository is renamed
 cd omo-grok
 scripts/bootstrap.sh          # .venv from requirements.lock, tools/ from tooling locks
-./omoctl migrate
-./omoctl doctor               # live status is derived; NOT OPERATIONAL until evidence exists
-./omoctl lsp status           # which language servers are present, which languages fail closed
-./omoctl lsp canary           # each present server must find a planted defect
-./omoctl mcp-command          # exact stdio command for this checkout
+./omg migrate
+./omg doctor               # live status is derived; NOT OPERATIONAL until evidence exists
+./omg lsp status           # which language servers are present, which languages fail closed
+./omg lsp canary           # each present server must find a planted defect
+./omg mcp-command          # exact stdio command for this checkout
 ```
 
-`scripts/bootstrap.sh --check` exits 8 when a piece is missing. Placeholders in shipped config are only `${OMO_CODE_ROOT}`, `${OMO_PYTHON}`, `${OMO_TOOLS}`, `${OMO_NODE}` and `${OMO_SITE}`. Nothing in code or config hardcodes `/workspace/omo`.
+`scripts/bootstrap.sh --check` exits 8 when a piece is missing. Placeholders in shipped config are `${OMG_CODE_ROOT}`, `${OMG_PYTHON}`, `${OMG_TOOLS}`, `${OMG_NODE}` and `${OMG_SITE}`. The legacy `${OMO_*}` spellings expand to the same values. Nothing in code or config hardcodes `/workspace/omo` or `/workspace/omg`. `OMG_PYTHON` wins over `OMO_PYTHON` when both are set.
 
-Host-side needs this script cannot do: the `bubblewrap` package, unprivileged user namespaces (otherwise the sandbox fails closed), registering the MCP command in Grok Bot, binding roles, webhook secrets via `omoctl hook set` or `hook serve` (never paste keys into chat), and pasting routine instructions. See `docs/MIGRATION.md` for the cutover order. Do not delete Bots or routines as part of install.
+Host-side needs this script cannot do: the `bubblewrap` package, unprivileged user namespaces (otherwise the sandbox fails closed), registering the MCP command in Grok Bot, binding roles, webhook secrets via `omg hook set` or `hook serve` (never paste keys into chat), and pasting routine instructions. See `docs/MIGRATION.md` for the cutover order. Do not delete Bots or routines as part of install.
 
 ## 2. Register the MCP server in Grok Bot (command server; user/parent step)
-Register a custom **command** (stdio) MCP server named `omo`:
+Register a custom **command** (stdio) MCP server named `omg` (the live connector is still `user-omo` until you re-register it; this runbook does not do that):
 
 ```
-<CODE_ROOT>/.venv/bin/python <CODE_ROOT>/omo_grok/mcp_server.py
+<CODE_ROOT>/.venv/bin/python <CODE_ROOT>/oh_my_grok/mcp_server.py
 ```
 
-Print the exact command for this checkout with `./omoctl mcp-command` (it is computed from the checkout location
-and `OMO_PYTHON`, so a relocated checkout never carries a stale path). Install the runtime first with
+Print the exact command for this checkout with `./omg mcp-command` (it is computed from the checkout location
+and `OMG_PYTHON` (or legacy `OMO_PYTHON`), so a relocated checkout never carries a stale path). Install the runtime first with
 `scripts/bootstrap.sh`. The command needs no environment variables or secrets. Registration applies account-wide.
 
 Confirm it from **at least two Bots**, for example Hephaestus and Explorer: the tool list should contain exactly
@@ -62,24 +67,24 @@ Confirm it from **at least two Bots**, for example Hephaestus and Explorer: the 
 `python -m` test does not count as registration.
 
 ## 3. Bind roles to Bots and routines
-1. `./omoctl roles import config/roles.example.json` imports all 8 bindings as **unverified**, with no routine. The
+1. `./omg roles import config/roles.example.json` imports all 8 bindings as **unverified**, with no routine. The
    Bot ids come from the task brief and are unverified until read back.
-2. On each Bot, create a webhook-triggered routine named `omo-bus-<role>`. Paste the instructions from
+2. On each Bot, create a webhook-triggered routine named `omg-bus-<role>`. Paste the instructions from
    `routines/<role>.md`. One Bot may host several role routines; the defaults are code-reviewer on Momus and
    qa-executor on Metis. The Hephaestus routine (`routines/hephaestus.md`) is optional.
 3. Record the routine id and verify:
-   `./omoctl roles bind ROLE --bot-id ID --bot-name NAME --routine-id RID --routine-name omo-bus-ROLE --group g-NAME --verified --provenance "read back <date>"`
+   `./omg roles bind ROLE --bot-id ID --bot-name NAME --routine-id RID --routine-name omg-bus-ROLE --group g-NAME --verified --provenance "read back <date>"`
    Use `--max-concurrent 1` for Bots that host several roles. Re-binding creates a new version; the old one is kept.
-4. Optional: `routines/omo-reconcile.md` is a Hephaestus scheduled routine (every 15 min). Create it only if the
+4. Optional: `routines/omg-reconcile.md` is a Hephaestus scheduled routine (every 15 min). Create it only if the
    user approves the ongoing usage.
 
 ## 4. Webhook secrets (user-only step)
 For each async role, open the routine in the Grok Bot UI (desktop) and copy its webhook URL and key. Then run:
 
 ```bash
-/workspace/omo/omoctl hook set ROLE   # hidden prompts for URL and key; nothing echoed
-/workspace/omo/omoctl hook list       # role: configured true/false only
-/workspace/omo/omoctl hook check ROLE --probe   # TLS handshake only, no POST
+/workspace/omg/omg hook set ROLE   # hidden prompts for URL and key; nothing echoed
+/workspace/omg/omg hook list       # role: configured true/false only
+/workspace/omg/omg hook check ROLE --probe   # TLS handshake only, no POST
 ```
 
 Never paste keys into chat, argv or files.
@@ -89,14 +94,14 @@ every control or non-printable character (CR, LF, TAB, ESC, zero-width), surroun
 pair of surrounding quotes or `<...>`. Each prompt allows 3 tries. A rejection prints only a diagnostic (length,
 empty, scheme http/https/empty/other, host present, whether characters were removed), never the value.
 Metis serves two roles (`metis`, then `qa-executor`) and Momus two (`momus`, then `code-reviewer`); each has its
-own routine (`omo-bus-<role>`) with its own URL and key, so run `hook set` once per role.
+own routine (`omg-bus-<role>`) with its own URL and key, so run `hook set` once per role.
 
 **Browser form (when terminal paste delivers nothing):** some GUI paste tools cannot type into a terminal
 (`hook set` then sees length=0). Use the local-only masked form instead:
 
 ```bash
-cd /workspace/omo && (umask 077; ./omoctl hook serve > state/logs/hook_serve.log 2>&1; rm -f state/logs/hook_serve.log) &
-cat /tmp/omo_hook_form_url     # http://127.0.0.1:<random port>/setup/<per-run session token>  (file mode 0600)
+cd /workspace/omg && (umask 077; ./omg hook serve > state/logs/hook_serve.log 2>&1; rm -f state/logs/hook_serve.log) &
+cat /tmp/omg_hook_form_url     # http://127.0.0.1:<random port>/setup/<per-run session token>  (file mode 0600)
 ```
 
 The tokenized URL is written only to the 0600 URL file, never to stdout (`--print-url` overrides this; don't use
@@ -121,29 +126,29 @@ How it is protected:
   in `state/secrets/hooks.json` (0600).
 
 **Rotation (recommended now for all 7 roles; see SECURITY.md "2026-11-04 disclosure"):** for each async role,
-open that role's Bot, then its `omo-bus-<role>` routine panel, and regenerate the webhook key (and URL if offered).
+open that role's Bot, then its `omg-bus-<role>` routine panel, and regenerate the webhook key (and URL if offered).
 Then enter the new pair through `hook serve` (above) or `hook set ROLE`, never via chat. Check with `hook list`, then
 `hook check ROLE --probe` (TLS only, no POST). The old key stops working at regeneration, so a job in flight shows
 `HTTP 401/403: webhook key rejected` until the new pair is stored; then `resume JOB`.
 
 ## 5. Start a job
 - Normally you say "plan this: <goal> in <repo>" to Hephaestus.
-- Fallback: `./omoctl submit --goal-file goal.md --repo /path/to/repo [--plan-only|--implement|--fixture] [--criteria-file c.txt] [--verifier-profile NAME] [--idempotency-key K]`
+- Fallback: `./omg submit --goal-file goal.md --repo /path/to/repo [--plan-only|--implement|--fixture] [--criteria-file c.txt] [--verifier-profile NAME] [--idempotency-key K]`
 - Real repos default to plan-only and must be clean git repos (optionally restricted by `repo_allowlist`).
 
 ## 6. Plan review and approval
-- `./omoctl plan show JOB` prints the revision, hash, Momus verdict and full plan.
-- `./omoctl approve JOB --plan-hash <64-hex> [--no-edit] [--accept-reduced-assurance]` needs an interactive TTY. You
+- `./omg plan show JOB` prints the revision, hash, Momus verdict and full plan.
+- `./omg approve JOB --plan-hash <64-hex> [--no-edit] [--accept-reduced-assurance]` needs an interactive TTY. You
   type the first 12 characters of the hash. It records a SOFT receipt.
-- `./omoctl deny JOB --reason "..."` creates a new plan revision. The number of rounds is capped.
+- `./omg deny JOB --reason "..."` creates a new plan revision. The number of rounds is capped.
 
 ## 7. Pending work and status
-- `./omoctl status [JOB] [--json]` shows the phase, `next_action`, task states, `block_reason`, dispatch state,
+- `./omg status [JOB] [--json]` shows the phase, `next_action`, task states, `block_reason`, dispatch state,
   verifications, gates and the `awaiting_resume` list.
 - `awaiting_resume` tasks are Hephaestus tasks. Hephaestus claims them in its next chat turn.
 
 ## 8. Interrupted runs and reconciliation
-`./omoctl reconcile [JOB]` (also the MCP tool `reconcile`) does the following:
+`./omg reconcile [JOB]` (also the MCP tool `reconcile`) does the following:
 
 - expires leases (requeue, or block when out of attempts)
 - recovers interrupted sends as uncertain retries
@@ -164,16 +169,16 @@ These live in `config/verifiers.json`. Each profile has these fields:
 | `timeout_seconds` | run time limit |
 | `protected_paths` | paths the Executor must not change relative to base |
 | `editable_paths` | allowlist: the ONLY paths the Executor may add, change, delete or rename |
-| `runner` | `"omo-unittest-child"`, required for Python profiles; argv must then end with the absolute path of `omo_grok/unittest_child.py` (no `-m`) |
+| `runner` | `"omg-unittest-child"`, required for Python profiles; argv must then end with the absolute path of `oh_my_grok/unittest_child.py` (no `-m`) |
 | `start_dir` | relative test discovery dir for the advisory unittest child (e.g. `tests`) |
 | `expected_tests` | non-empty unique list of test ids that must ALL run and pass (no extras, skips or failures) |
-| `oracle` | `{"name": "<key in omo_grok/oracles.py ORACLES>", "cases_per_function": 8..2000, "modules": [...]}`. **Required** for every profile named `fixture-*`. Without it a profile is `cooperative` (see below). `type_checks` was removed in T07 round 3 and is refused |
+| `oracle` | `{"name": "<key in oh_my_grok/oracles.py ORACLES>", "cases_per_function": 8..2000, "modules": [...]}`. **Required** for every profile named `fixture-*`. Without it a profile is `cooperative` (see below). `type_checks` was removed in T07 round 3 and is refused |
 | `source_extensions` | allowlist of file extensions the candidate may add or change (default `[".py"]`) |
 | `pure_modules` | `{"allow_imports": [...]}`. **Required** for every `fixture-*` profile: every changed `.py` under `editable_paths` must pass the pure-function rule (no environment/context observation, no state between calls; imports only from this list, at most `math`, `operator`, `cmath`, `numbers`). `fixture-calc-unittest` allows none |
 | `static_scan` | AST-scan rule overrides (`allow_imports`, `allow_attrs`, `allow_calls`, `forbid_imports`, `allow_dunder_overrides`, `allow_builtin_subclass`); cannot be disabled |
 | `exit_code_only` | required `true` for non-Python argv; the pass then rests on exit code alone (REDUCED assurance) |
 
-A profile whose argv or referenced script contains `OMO_VERIFY_TEMPLATE` is refused. So are:
+A profile whose argv or referenced script contains `OMG_VERIFY_TEMPLATE` or the legacy marker `OMO_VERIFY_TEMPLATE` is refused. So are:
 - a missing profile
 - a Python profile without `-I` or without the unittest child and `expected_tests`, or a `fixture-*` profile without an `oracle` or `pure_modules`
 - a non-Python profile without `exit_code_only: true`
@@ -212,37 +217,36 @@ bwrap is unavailable verification fails closed (`no sandbox available`); `doctor
 files (code, config, venv) are hashed before and after; any change fails the run with `TAMPER` and a `tamper` event.
 Migration v3 adds `verifications.assurance`, v4 adds `verifications.sandbox` and `tamper_json` (auto-applied with a
 backup on the next open). A missing base revision fails closed.
-`./omoctl doctor` lists the usable profiles.
+`./omg doctor` lists the usable profiles.
 
 ## 10. Backups and migrations
-- `./omoctl backup --out /path/file.sqlite3` uses the SQLite backup API and an integrity check.
-- `./omoctl migrate --dry-run`, then `./omoctl migrate`. Migrate takes an automatic backup first when the DB is not
+- `./omg backup --out /path/file.sqlite3` uses the SQLite backup API and an integrity check.
+- `./omg migrate --dry-run`, then `./omg migrate`. Migrate takes an automatic backup first when the DB is not
   empty. Migrations are versioned and checksummed.
-- `./omoctl restore FILE` needs a TTY. Stop all omo activity first. It verifies the backup's integrity before
+- `./omg restore FILE` needs a TTY. Stop all omo activity first. It verifies the backup's integrity before
   swapping it in, and keeps the old DB.
 
 ## 11. Failed / dead-letter dispatches
 - `status` shows the dispatch `status`, `http_status` and `last_error` (redacted).
 - `failed` rows are permanent: 401/403/404/410, or retries exhausted.
-- Fix the cause, then run `./omoctl resume JOB` (add `--grant-repair-cycles N` when the repair budget is exhausted).
-  Then run `./omoctl reconcile JOB`.
+- Fix the cause, then run `./omg resume JOB` (add `--grant-repair-cycles N` when the repair budget is exhausted).
+  Then run `./omg reconcile JOB`.
 
 ## 11b. Cutover and rollback
-See `docs/MIGRATION.md` (Cutover and rollback). This build **is** the installation (nothing older under `/workspace/omo`
-to retire). To roll code/DB back: stop omo activity, `./omoctl restore state/backups/pre-migrate-vN-<ts>.sqlite3`, keep
-`state/secrets/hooks.json` at 0600, restart the `user-omo` MCP after a code rollback, and **do not delete** Bots or
-`omo-bus-*` routines. Filesystem backups do not restore Grok Bot conversations or agent memory. Uninstall (§12) is a
+See `docs/MIGRATION.md` (Cutover and rollback). The live install is still `/workspace/omo` with connector `user-omo` and `omo-bus-*` routines. Moving that checkout, re-registering MCP, and renaming those routines are cutover steps and are not done here. To roll code/DB back: stop omg/omo activity, `./omg restore state/backups/pre-migrate-vN-<ts>.sqlite3` (`omoctl restore` is the same command), keep
+`state/secrets/hooks.json` at 0600, restart the MCP server process after a code rollback, and **do not delete** Bots or
+routines. Filesystem backups do not restore Grok Bot conversations or agent memory. Uninstall (§12) is a
 separate destructive path.
 
 ## 12. Cancel and uninstall
-- `./omoctl cancel JOB --reason "..."` asks for TTY confirmation. Nothing is deleted. Worktrees and branches in user
+- `./omg cancel JOB --reason "..."` asks for TTY confirmation. Nothing is deleted. Worktrees and branches in user
   repos are kept for inspection. Remove them yourself with
-  `git worktree remove <path>` and `git branch -D omo/<id>` only when you want to.
-- Uninstall:
-  1. Remove the `omo` MCP registration.
-  2. Disable or delete the `omo-bus-*` and `omo-reconcile` routines in the Grok Bot UI.
-  3. Optionally run `omoctl export` for jobs you want to keep.
-  4. Delete `/workspace/omo`.
+  `git worktree remove <path>` and `git branch -D omg/<id>` (older jobs may still be `omo/<id>`) only when you want to.
+- Uninstall (destructive; not part of the rename):
+  1. Remove the MCP registration. On the live host today that registration is `user-omo`.
+  2. Disable or delete the webhook routines in the Grok Bot UI. Live routines may still be named `omo-bus-*` / `omo-reconcile`; this repo's files are `omg-bus-*` / `omg-reconcile`.
+  3. Optionally run `omg export` for jobs you want to keep.
+  4. Delete the checkout (`/workspace/omo` until it is moved, `/workspace/omg` after).
 
   User repositories are never touched by the uninstall. Check that no worktree you need lives under `jobs/`
   (fixtures only).
@@ -250,13 +254,13 @@ separate destructive path.
 ## Troubleshooting
 | Symptom | Cause / action |
 |---|---|
-| Webhook returned `200` but the task was never claimed | 200 only means accepted. Check that the routine run started and that the Bot has the `omo` MCP. `reconcile` re-wakes after `rewake_after_seconds`, at most `max_rewakes` times, then blocks with "never claimed". Check the routine instructions, then `resume` |
-| Missing MCP (`omo.claim` unknown in the routine) | Register the command server (§2) and confirm it in that Bot. `./omoctl doctor` checks the server locally |
+| Webhook returned `200` but the task was never claimed | 200 only means accepted. Check that the routine run started and that the Bot has the `omg` MCP (live connector may still be `user-omo` until re-registered). `reconcile` re-wakes after `rewake_after_seconds`, at most `max_rewakes` times, then blocks with "never claimed". Check the routine instructions, then `resume` |
+| Missing MCP (`omg.claim` unknown in the routine) | Register the command server (§2) and confirm it in that Bot. `./omg doctor` checks the server locally |
 | Paused or deleted routine | HTTP 404/410 means "routine missing, paused or disabled". The task blocks with no retries. Re-enable the routine, re-bind if its id changed, then `resume` |
 | Changed or wrong key | HTTP 401/403 means "webhook key rejected". Run `hook set ROLE`, then `resume` |
 | Exhausted retry budget | The dispatch becomes `failed` after `dispatch_max_retries`. Repeated 429 means the platform rate limit: wait, then `resume`. Lower `per_bot_hourly_dispatch_limit` if needed |
 | Repair budget exhausted (3 cycles) | The job is `blocked` with each cycle's diagnostics. `resume JOB --grant-repair-cycles 1` only after reading why |
 | `dispatch deferred: no enabled role binding` / `bot_busy` | Bind or verify the role, or wait for the shared Bot to finish (per-Bot serialization) |
 | Doctor shows "NOT OPERATIONAL" | Expected while status is PARTIALLY INSTALLED / NOT OPERATIONAL. Live §10.20–§10.22 passed on DB evidence; routine receipts and other gaps remain (README, `docs/MIGRATION.md`). Doctor OK is not OPERATIONAL |
-| MCP tool returns `stale_server` | The omo code or config on disk changed after this MCP server process started (it fingerprints `omo_grok/**/*.py` and the config dir). Restart the omo MCP server (reload the connector) and retry. This exists because a stale server once ran old verifier code against a new child script |
+| MCP tool returns `stale_server` | The omo code or config on disk changed after this MCP server process started (it fingerprints `oh_my_grok/**/*.py` and the config dir). Restart the omo MCP server (reload the connector) and retry. This exists because a stale server once ran old verifier code against a new child script |
 | `webhook for ROLE not configured` while `hook list` says configured | Can no longer happen: dispatch, `roles list` and `hook list` all read `state/secrets/hooks.json`. `hooks_meta` is only an audit trail |

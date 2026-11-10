@@ -5,7 +5,7 @@ can forge. The verifier treats the report as ADVISORY (a negative report fails t
 nothing on its own). For oracle profiles the trusted decision comes from the separate oracle probe; for
 non-oracle profiles the assurance level is 'cooperative'.
 
-The report is one line on the original stdout: `OMO-UNITTEST-REPORT {json}`. The tamper snapshot (identities of
+The report is one line on the original stdout: `OMG-UNITTEST-REPORT {json}`. The tamper snapshot (identities of
 unittest machinery, builtins, key stdlib functions, import hooks; compared after import and after the run) is a cheap
 tripwire for accidental or naive patching, not a security boundary."""
 import builtins
@@ -19,7 +19,7 @@ import unittest.result
 import unittest.suite
 
 _dumps, _exit, _isinstance, _type = json.dumps, os._exit, isinstance, type
-REPORT_PREFIX = "OMO-UNITTEST-REPORT "
+REPORT_PREFIX = "OMG-UNITTEST-REPORT "
 
 
 class Recorder(unittest.TextTestResult):

@@ -1,4 +1,8 @@
-"""Filesystem layout. OMO_HOME overrides the runtime root (tests use temp dirs)."""
+"""Filesystem layout. OMG_HOME overrides the runtime root (tests use temp dirs).
+
+Legacy OMO_* environment variables are still read when the OMG_* name is unset or empty,
+so a host mid-cutover keeps working.
+"""
 from __future__ import annotations
 
 import os
@@ -9,14 +13,27 @@ from pathlib import Path
 CODE_ROOT = Path(__file__).resolve().parent.parent
 
 
+def env_get(suffix: str, default: str | None = None) -> str | None:
+    """Prefer OMG_<suffix>. Fall back to legacy OMO_<suffix>. Empty values are skipped."""
+    for prefix in ("OMG_", "OMO_"):
+        val = os.environ.get(prefix + suffix)
+        if val:
+            return val
+    return default
+
+
 def python_path() -> str:
-    """Interpreter used by verifier profiles and the MCP command: OMO_PYTHON, else the code root's own venv."""
-    return os.environ.get("OMO_PYTHON") or str(CODE_ROOT / ".venv" / "bin" / "python")
+    """Interpreter used by verifier profiles and the MCP command: OMG_PYTHON, else OMO_PYTHON, else the venv."""
+    return env_get("PYTHON") or str(CODE_ROOT / ".venv" / "bin" / "python")
 
 
 def tools_dir() -> Path:
     """Where scripts/bootstrap.sh installs language servers (never the runtime venv)."""
-    return Path(os.environ.get("OMO_TOOLS_DIR") or CODE_ROOT / "tools")
+    for key in ("OMG_TOOLS_DIR", "OMG_TOOLS", "OMO_TOOLS_DIR", "OMO_TOOLS"):
+        val = os.environ.get(key)
+        if val:
+            return Path(val)
+    return CODE_ROOT / "tools"
 
 
 def _tool_glob(pattern: str, missing: str) -> str:
@@ -38,7 +55,7 @@ def mcp_command() -> str:
     py = python_path()
     if not os.path.exists(py):
         py = sys.executable
-    return f"{py} {CODE_ROOT / 'omo_grok' / 'mcp_server.py'}"
+    return f"{py} {CODE_ROOT / 'oh_my_grok' / 'mcp_server.py'}"
 
 
 @dataclass(frozen=True)
@@ -52,7 +69,12 @@ class Paths:
 
     @property
     def db_path(self) -> Path:
-        return self.state_dir / "omo.sqlite3"
+        """New homes use omg.sqlite3. An existing omo.sqlite3 is opened when the new file is absent."""
+        preferred = self.state_dir / "omg.sqlite3"
+        legacy = self.state_dir / "omo.sqlite3"
+        if preferred.exists() or not legacy.exists():
+            return preferred
+        return legacy
 
     @property
     def secrets_dir(self) -> Path:
@@ -89,6 +111,6 @@ class Paths:
 
 
 def get_paths() -> Paths:
-    root = Path(os.environ.get("OMO_HOME", str(CODE_ROOT))).resolve()
-    cfg = Path(os.environ.get("OMO_CONFIG_DIR", str(CODE_ROOT / "config"))).resolve()
+    root = Path(env_get("HOME") or str(CODE_ROOT)).resolve()
+    cfg = Path(env_get("CONFIG_DIR") or str(CODE_ROOT / "config")).resolve()
     return Paths(root=root, config_dir=cfg)

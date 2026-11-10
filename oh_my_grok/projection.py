@@ -26,18 +26,29 @@ from pathlib import Path
 
 from . import artifacts as art
 from . import db
-from .errors import OmoError
-from .paths import Paths
+from .errors import OmgError
+from .paths import Paths, env_get
 
 SCHEMA_VERSION = 2
-AGENT = "omo-grok"
+AGENT = "oh-my-grok"
 TERMINAL = ("done", "failed", "cancelled")
-_FAULT_ENV = "OMO_FAULT_INJECT"  # test-only: die abruptly (like kill -9) at a named point of the writer
 
 
 def _fault(point: str) -> None:
-    if os.environ.get(_FAULT_ENV) == point:
+    """Test-only: die abruptly (like kill -9) at a named point of the writer. OMG_FAULT_INJECT, else OMO_FAULT_INJECT."""
+    if env_get("FAULT_INJECT") == point:
         os._exit(137)
+
+
+def boulder_extension(obj: dict) -> dict:
+    """Product extension on a boulder file. Writers emit x_omg. Older files may still have x_omo_grok."""
+    if not isinstance(obj, dict):
+        return {}
+    for key in ("x_omg", "x_omo_grok"):
+        ext = obj.get(key)
+        if isinstance(ext, dict):
+            return ext
+    return {}
 
 
 def omo_dir(paths: Paths, job_id: str) -> Path:
@@ -45,7 +56,7 @@ def omo_dir(paths: Paths, job_id: str) -> Path:
 
 
 def plan_name(job_id: str) -> str:
-    return f"omo-{job_id[:8]}"
+    return f"omg-{job_id[:8]}"
 
 
 def work_status(phase: str) -> str:
@@ -59,9 +70,9 @@ def session_status(attempt_status: str | None) -> str:
 def next_action(job, tasks) -> str:
     ph = job["phase"]
     if ph == "awaiting_approval":
-        return "user: omoctl plan show {0} then omoctl approve {0} --plan-hash <hash> (or deny)".format(job["id"])
+        return "user: omg plan show {0} then omg approve {0} --plan-hash <hash> (or deny)".format(job["id"])
     if ph == "blocked":
-        return f"inspect blocked reason, fix the cause, then omoctl resume {job['id']}"
+        return f"inspect blocked reason, fix the cause, then omg resume {job['id']}"
     if ph in TERMINAL:
         return "none (terminal)"
     if any(t["status"] == "awaiting_resume" for t in tasks):
@@ -69,7 +80,7 @@ def next_action(job, tasks) -> str:
     deferred = [t["block_reason"] for t in tasks if t["status"] == "queued" and t["block_reason"]]
     if deferred:
         return "dispatch deferred: " + deferred[0]
-    return "waiting for agents / run omoctl reconcile"
+    return "waiting for agents / run omg reconcile"
 
 
 def task_key(t) -> str:
@@ -125,7 +136,7 @@ def render_plan_md(snap: dict, plan_text: str | None, plan_note: str | None) -> 
     L = [f"# {plan_name(job['id'])}", "",
          f"Job: {job['id']}", f"Goal: {' '.join(job['goal'].split())[:300]}",
          f"Intent: {job['intent'] or 'unspecified'}   Class: {job['roster_class'] or 'legacy'}   Phase: {job['phase']}",
-         "", "Generated from the omo-grok database. Editing this file changes nothing; the engine never reads it.", "",
+         "", "Generated from the oh-my-grok database. Editing this file changes nothing; the engine never reads it.", "",
          "## TODOs", ""]
     for i, t in enumerate(tasks, 1):
         box = {"passed": "x", "blocked": "~", "rejected": "~", "cancelled": "~"}.get(t["status"], " ")
@@ -172,7 +183,7 @@ def render_boulder(snap: dict, paths: Paths, plan_md_path: Path) -> dict:
     tokens = [s["session_token"] for s in sessions]
     work = {"work_id": jid, "active_plan": str(plan_md_path), "plan_name": plan_name(jid), "status": status,
             "started_at": job["created_at"], "updated_at": job["updated_at"], "session_ids": tokens,
-            "session_origins": {tok: "omo-grok-claim" for tok in tokens}, "agent": AGENT,
+            "session_origins": {tok: "oh-my-grok-claim" for tok in tokens}, "agent": AGENT,
             "worktree_path": job["worktree_path"], "task_sessions": task_sessions}
     if work["worktree_path"] is None:
         del work["worktree_path"]
@@ -185,8 +196,8 @@ def render_boulder(snap: dict, paths: Paths, plan_md_path: Path) -> dict:
            "active_plan": work["active_plan"], "started_at": work["started_at"], "status": status,
            "session_ids": tokens, "plan_name": work["plan_name"], "agent": AGENT,
            "task_sessions": task_sessions,
-           "x_omo_grok": {"job_id": jid, "generation": snap["generation"], "projection": "derived-from-sqlite",
-                          "resume": {"tool": "omo.status", "job_id": jid}, "roster_class": job["roster_class"],
+           "x_omg": {"job_id": jid, "generation": snap["generation"], "projection": "derived-from-sqlite",
+                          "resume": {"tool": "omg.status", "job_id": jid}, "roster_class": job["roster_class"],
                           "intent": job["intent"], "phase": job["phase"],
                           "plan_hash": plan["content_hash"] if plan else None,
                           "candidate_revision": job["candidate_revision"],
@@ -512,15 +523,15 @@ def _project(conn, paths: Paths, job_id: str, lock_seconds: float) -> dict:
         if snap["plan"]:
             try:
                 plan_text = art.read_text(paths.artifacts_dir(job_id), snap["plan"]["rel_path"], snap["plan"]["art_sha"])
-            except OmoError as e:
+            except OmgError as e:
                 plan_note = f"artifact integrity check failed ({e.message})"
         new_md = render_plan_md(snap, plan_text, plan_note).encode()
         new_b = encode(render_boulder(snap, paths, md_path))
         gen = snap["generation"]
         if not tamper and cur_b is not None:
             try:
-                existing_gen = json.loads(cur_b)["x_omo_grok"]["generation"]
-            except (ValueError, KeyError, TypeError):
+                existing_gen = boulder_extension(json.loads(cur_b)).get("generation", -1)
+            except (ValueError, TypeError):
                 existing_gen = -1
             if isinstance(existing_gen, int) and existing_gen > gen:
                 return {"status": "skipped_newer", "tamper": False, "generation": existing_gen,

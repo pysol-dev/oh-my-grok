@@ -4,10 +4,10 @@ Mechanism: bubblewrap (`bwrap`, unprivileged user + mount + pid + net + ipc + ut
 sudo, no extra OS users. The sandboxed process sees ONLY:
   /usr (+ /bin, /lib, /lib64, /sbin symlinks)  read-only bind of the system runtime (system python + its stdlib);
                                                /usr/local is hidden behind an empty read-only tmpfs
-  /omo-harness                                 read-only, a private per-run COPY of the child scripts
+  /omg-harness                                 read-only, a private per-run COPY of the child scripts
   /work                                        writable, a private per-run COPY of the candidate checkout (no .git)
   /tmp                                         private tmpfs;   /proc (own pid namespace), minimal /dev
-It has no view of OMO_HOME/state (DB, secrets), omo_grok/, the venv, /home, or any other /workspace content, and no
+It has no view of OMG_HOME/state (DB, secrets), oh_my_grok/, the venv, /home, or any other /workspace content, and no
 network (empty net namespace). The unittest child runs as `<system python> -I -S -B` (no site-packages). Oracle runs
 use `wrap_neutral`: the checkout copy is bound at a random ordinary project path with an ordinary HOME, a synthetic
 read-only /etc and hostname, and no harness markers (user decision H1; see docs/SECURITY.md).
@@ -29,7 +29,7 @@ BWRAP_CANDIDATES = ("/usr/bin/bwrap", "/bin/bwrap")
 BWRAP_VERSION_RE = re.compile(r"bubblewrap (\d{1,3}\.\d{1,3}(?:\.\d{1,3})?)")
 RUNTIME_ROOT = "/usr"
 SANDBOX_WORK = "/work"
-SANDBOX_HARNESS = "/omo-harness"
+SANDBOX_HARNESS = "/omg-harness"
 RLIMITS = {resource.RLIMIT_AS: 4 << 30, resource.RLIMIT_FSIZE: 256 << 20, resource.RLIMIT_CORE: 0}
 
 
@@ -209,7 +209,7 @@ def preexec_with(address_space: int | None):
 NEUTRAL_USERS = ("alex", "sam", "jordan", "casey", "robin", "dana", "kim", "lee")
 NEUTRAL_PROJECTS = ("calc", "calculator", "mathlib", "project", "src", "code", "lib", "app")
 NEUTRAL_HOSTS = ("laptop", "devbox", "workstation", "desktop", "ubuntu", "dev", "home-pc", "thinkpad")
-HARNESS_MARKERS = ("omo", "verif", "harness", "oracle", "sandbox", "bwrap", "grok", "probe")
+HARNESS_MARKERS = ("omo", "omg", "verif", "harness", "oracle", "sandbox", "bwrap", "grok", "probe")
 
 
 @dataclass(frozen=True)

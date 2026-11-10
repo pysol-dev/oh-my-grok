@@ -9,10 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from omo_grok import fixture as fx
-from omo_grok import oracles, sandbox, verifier
-from omo_grok.candidate_scan import pure_module_problems as pure
-from omo_grok.config import load_verifier_profiles
+from oh_my_grok import fixture as fx
+from oh_my_grok import oracles, sandbox, verifier
+from oh_my_grok.candidate_scan import pure_module_problems as pure
+from oh_my_grok.config import load_verifier_profiles
 
 ROOT = Path(__file__).resolve().parents[2]
 PROF = load_verifier_profiles(ROOT / "config")["fixture-calc-unittest"]

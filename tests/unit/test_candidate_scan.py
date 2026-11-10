@@ -1,7 +1,7 @@
 """Static AST tripwire over candidate-editable files (Momus re-review #2, item E/F)."""
 import pytest
 
-from omo_grok.candidate_scan import scan_source
+from oh_my_grok.candidate_scan import scan_source
 
 BAD = {
     "os_exit": "import os\nos._exit(0)\n",
@@ -106,6 +106,6 @@ def test_literal_getattr_of_ordinary_attribute_allowed():
 ], ids=["unicode_escape", "latin1", "rot13_line2", "bom_mismatch", "invalid_utf8", "utf8_cookie", "utf8_alias",
         "bom", "plain_utf8"])
 def test_source_decoded_exactly_as_the_importer_does(data, ok):
-    from omo_grok.verifier import decode_source
+    from oh_my_grok.verifier import decode_source
     text, why = decode_source(data)
     assert (why is None) == ok, why

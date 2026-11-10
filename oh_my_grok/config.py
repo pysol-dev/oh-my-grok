@@ -35,8 +35,20 @@ DEFAULT_POLICY = {
 }
 
 REMOVED_POLICY_KEYS = {"require_independent_assurance", "fixture_allow_reduced_assurance"}
-TEMPLATE_MARKER = "OMO_VERIFY_TEMPLATE"
-RUNNER_NAME = "omo-unittest-child"
+TEMPLATE_MARKERS = ("OMG_VERIFY_TEMPLATE", "OMO_VERIFY_TEMPLATE")
+TEMPLATE_MARKER = TEMPLATE_MARKERS[0]
+RUNNER_NAME = "omg-unittest-child"
+ACCEPTED_RUNNERS = frozenset({RUNNER_NAME, "omo-unittest-child"})
+
+
+def template_marker_in(text: str) -> str | None:
+    """Return the first fail-closed template marker found, or None. Both spellings count."""
+    for marker in TEMPLATE_MARKERS:
+        if marker in text:
+            return marker
+    return None
+
+
 UNITTEST_CHILD = Path(__file__).resolve().parent / "unittest_child.py"   # untrusted child: advisory self-report
 ORACLE_CHILD = Path(__file__).resolve().parent / "oracle_child.py"       # untrusted child: raw values only
 
@@ -73,9 +85,14 @@ _PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 def placeholder_values() -> dict[str, str]:
-    """The only variables shipped config may reference, so no file needs to hardcode an install location."""
-    return {"OMO_CODE_ROOT": str(CODE_ROOT), "OMO_PYTHON": python_path(), "OMO_TOOLS": str(tools_dir()),
-            "OMO_NODE": node_path(), "OMO_SITE": site_packages()}
+    """Shipped config uses ${OMG_*}. The legacy ${OMO_*} spellings expand to the same values."""
+    current = {"CODE_ROOT": str(CODE_ROOT), "PYTHON": python_path(), "TOOLS": str(tools_dir()),
+               "NODE": node_path(), "SITE": site_packages()}
+    out: dict[str, str] = {}
+    for prefix in ("OMG_", "OMO_"):
+        for suffix, value in current.items():
+            out[prefix + suffix] = value
+    return out
 
 
 def expand_placeholders(obj, values: dict[str, str] | None = None):
@@ -152,8 +169,9 @@ def profile_assurance(prof: dict) -> str:
 def validate_profile(name: str, prof: dict) -> list[str]:
     """Return a list of problems; empty means structurally valid. Template marker fails closed."""
     problems = []
-    if TEMPLATE_MARKER in canonical_json(prof) or TEMPLATE_MARKER in name:
-        problems.append(f"profile contains template marker {TEMPLATE_MARKER}; not a working verifier")
+    hit = template_marker_in(canonical_json(prof)) or template_marker_in(name)
+    if hit:
+        problems.append(f"profile contains template marker {hit}; not a working verifier")
     for k, t in REQUIRED_PROFILE_KEYS.items():
         if k not in prof or not isinstance(prof[k], t):
             problems.append(f"profile key {k!r} missing or wrong type")
@@ -173,8 +191,9 @@ def validate_profile(name: str, prof: dict) -> list[str]:
                             "on sys.path)")
     if prof.get("runner") is not None or is_python:
         # exit status alone is not trusted for Python: the unittest child must report per-test results
-        if prof.get("runner") != RUNNER_NAME:
-            problems.append(f"python verifiers must use runner {RUNNER_NAME!r} (exit code alone is not trusted)")
+        if prof.get("runner") not in ACCEPTED_RUNNERS:
+            problems.append(f"python verifiers must use runner {RUNNER_NAME!r} "
+                            f"(legacy 'omo-unittest-child' is still accepted; exit code alone is not trusted)")
         elif not argv or argv[-1] != str(UNITTEST_CHILD) or "-m" in argv:
             problems.append(f"python profiles must end argv with {UNITTEST_CHILD} and must not use -m")
         tests = prof.get("expected_tests")

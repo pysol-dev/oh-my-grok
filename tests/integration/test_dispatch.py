@@ -6,10 +6,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from omo_grok.engine import Engine
-from omo_grok.hooks import set_hook
-from omo_grok.paths import get_paths
-from omo_grok.transport import HttpResult, post_json
+from oh_my_grok.engine import Engine
+from oh_my_grok.hooks import set_hook
+from oh_my_grok.paths import get_paths
+from oh_my_grok.transport import HttpResult, post_json
 
 KEY = "whsec_LOCALTEST_0123456789abcdef"
 
@@ -48,8 +48,8 @@ class Hook:
 
 
 @pytest.fixture
-def live_hook(omo_home, monkeypatch):
-    monkeypatch.setenv("OMO_ALLOW_INSECURE_HOOKS", "1")
+def live_hook(omg_home, monkeypatch):
+    monkeypatch.setenv("OMG_ALLOW_INSECURE_HOOKS", "1")
     h = Hook()
     yield h
     h.close()
@@ -126,7 +126,7 @@ def test_paused_routine_404_and_bad_key_401_block_with_diagnostics(h):
     assert "routine missing, paused or disabled" in errs and "webhook key rejected" in errs
 
 
-def test_network_failure_is_uncertain_and_retried(h, omo_home):
+def test_network_failure_is_uncertain_and_retried(h, omg_home):
     set_hook(get_paths(), "explorer", "http://127.0.0.1:9/explorer", KEY)  # closed port
     job = h.submit()["job_id"]
     t = h.task(job, "explore")
@@ -159,7 +159,7 @@ def test_item8_reconcile_rewakes_unclaimed_and_is_bounded(h):
     assert t["current_dispatch_id"] != first and t["status"] == "dispatched"
     bodies = [q["body"] for q in h.hook.requests if q["path"] == "/explorer"]
     assert len(bodies) == 2 and bodies[1]["attempt"] == 1 and bodies[1]["dispatch_id"] != first
-    from omo_grok.errors import Conflict
+    from oh_my_grok.errors import Conflict
     with pytest.raises(Conflict):  # old dispatch id can no longer claim
         e.claim(job, t["id"], first)
     for _ in range(10):  # bounded: no flooding
@@ -203,7 +203,7 @@ def test_interrupted_send_is_recovered_as_uncertain(h):
     e = h.e
     e.policy["inline_dispatch"] = False
     job = h.submit()["job_id"]
-    from omo_grok import db
+    from oh_my_grok import db
     with db.tx(e.conn):  # simulate crash after marking 'sending' but before recording the result
         e.conn.execute("UPDATE dispatch_outbox SET status='sending', lease_until=? WHERE job_id=?",
                        (h.clock() - 1, job))
@@ -240,7 +240,7 @@ def test_per_bot_serialization(h):
     assert h.task(b, "explore")["status"] == "dispatched"
 
 
-def test_unbound_or_unverified_role_waits_with_reason(omo_home):
+def test_unbound_or_unverified_role_waits_with_reason(omg_home):
     from helpers import Harness
     hn = Harness(bind=False)
     job = hn.submit()["job_id"]
@@ -272,7 +272,7 @@ def test_post_json_maps_real_http_responses(live_hook):
 def test_duplicate_wakeup_claim_is_refused_and_logged_without_secrets(h):
     """§10.22 duplicate webhook: a second claim with the already-used dispatch_id is refused, leaves exactly one
     attempt, and writes a structured claim_refused event (ids + reason only) so live runs can prove the refusal."""
-    from omo_grok.errors import Conflict
+    from oh_my_grok.errors import Conflict
     e = h.e
     job = h.submit()["job_id"]
     t = h.task(job, "explore")
@@ -292,7 +292,7 @@ def test_duplicate_wakeup_claim_is_refused_and_logged_without_secrets(h):
 def test_claim_at_attempt_budget_blocks_and_persists(h):
     """Regression (Momus r12): `_block_task(..., attempt budget exhausted)` must COMMIT before Conflict is
     raised. Raising Conflict inside the same tx used to roll the block back, leaving the task claimable forever."""
-    from omo_grok.errors import Conflict
+    from oh_my_grok.errors import Conflict
     e = h.e
     job = h.submit()["job_id"]
     t = h.task(job, "explore")
@@ -320,8 +320,8 @@ def test_claim_at_attempt_budget_blocks_and_persists(h):
 
 def test_mcp_claim_path_records_task_role_as_actor_on_refusal(h):
     """Momus r12 N4: MCP claim must pass actor=role so claim_refused events are not actor=NULL."""
-    from omo_grok.errors import Conflict
-    from omo_grok.mcp_server import claim_with_task_role
+    from oh_my_grok.errors import Conflict
+    from oh_my_grok.mcp_server import claim_with_task_role
     e = h.e
     job = h.submit()["job_id"]
     t = h.task(job, "explore")

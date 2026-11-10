@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from .errors import IntegrityError_, ValidationError
-from .paths import Paths
+from .paths import Paths, env_get
 from .redact import register_secret
 from .states import ROLES
 
@@ -80,7 +80,7 @@ def validate_url(url: str) -> None:
         u.port  # noqa: B018 - raises ValueError on a malformed port
     except ValueError:
         raise ValidationError("webhook URL is malformed (unparseable host or port; value not shown)") from None
-    insecure_ok = os.environ.get("OMO_ALLOW_INSECURE_HOOKS") == "1" and host in ("127.0.0.1", "localhost")
+    insecure_ok = env_get("ALLOW_INSECURE_HOOKS") == "1" and host in ("127.0.0.1", "localhost")
     if u.scheme != "https" and not (u.scheme == "http" and insecure_ok):
         raise ValidationError("webhook URL must be https")
     if not host:

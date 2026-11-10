@@ -1,4 +1,4 @@
-"""`omoctl hook serve`: a local-only, per-run session token web form for entering webhook URLs and keys.
+"""`omg hook serve`: a local-only, per-run session token web form for entering webhook URLs and keys.
 
 For GUIs whose paste tool cannot type into a terminal. Security properties:
   - stdlib http.server bound to 127.0.0.1 on a random free port; every path except /setup/<token> is 404, where
@@ -24,18 +24,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs
 
-from .errors import OmoError
+from .errors import OmgError
 from .hooks import hook_status, sanitize_input, set_hook, url_diagnostic, validate_key, validate_url
 from .paths import CODE_ROOT, Paths
 
 FORM_ROLES = ("explorer", "librarian", "metis", "qa-executor", "momus", "code-reviewer", "executor")
 MAX_BODY = 64 * 1024
-URL_FILE = Path("/tmp/omo_hook_form_url")
+URL_FILE = Path("/tmp/omg_hook_form_url")
 
 
 def role_labels(engine_factory) -> dict[str, tuple[str, str]]:
     """role -> (bot name, routine name), from the active role bindings; falls back to config/roles.example.json,
-    then to the omo-bus-<role> convention."""
+    then to the omg-bus-<role> convention."""
     out: dict[str, tuple[str, str]] = {}
     example = {}
     try:
@@ -55,7 +55,7 @@ def role_labels(engine_factory) -> dict[str, tuple[str, str]]:
     for r in FORM_ROLES:
         b, x = bound.get(r) or {}, example.get(r) or {}
         bot = b.get("bot_name") or x.get("bot_name") or "?"
-        routine = b.get("routine_name") or b.get("routine_id") or x.get("routine_name") or f"omo-bus-{r}"
+        routine = b.get("routine_name") or b.get("routine_id") or x.get("routine_name") or f"omg-bus-{r}"
         out[r] = (bot, str(routine).split(" ")[0])
     return out
 
@@ -70,7 +70,7 @@ def store_pair(paths: Paths, engine_factory, role: str, raw_url: str, raw_key: s
         return "error", "both the URL and the key are needed (one was blank after cleanup)"
     try:
         validate_url(url)
-    except OmoError as e:
+    except OmgError as e:
         return "error", f"{e.message} ({url_diagnostic(url, url_removed)})"
     p = validate_key(key)
     if p:
@@ -82,7 +82,7 @@ def store_pair(paths: Paths, engine_factory, role: str, raw_url: str, raw_key: s
             e.mark_hook_configured(role, True)
         finally:
             e.close()
-    except OmoError as e:
+    except OmgError as e:
         return "error", f"could not store: {e.message}"
     return "configured", "stored (0600); value not shown"
 
@@ -95,8 +95,8 @@ _CSS = ("body{font-family:sans-serif;max-width:46em;margin:1em auto;padding:0 1e
 def render(token: str, labels: dict, status: dict, results: dict | None = None, finished: bool = False) -> bytes:
     esc = html.escape
     parts = ["<!doctype html><html><head><meta charset='utf-8'><meta name='referrer' content='same-origin'>",
-             f"<title>omo webhook setup</title><style>{_CSS}</style></head><body>",
-             "<h1>omo webhook setup</h1>"]
+             f"<title>omg webhook setup</title><style>{_CSS}</style></head><body>",
+             "<h1>omg webhook setup</h1>"]
     if finished:
         parts.append("<p><b>Finished. The setup server has stopped; you can close this tab.</b></p></body></html>")
         return "".join(parts).encode()
@@ -140,7 +140,7 @@ class HookFormServer:
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
-            server_version = "omo-setup"
+            server_version = "omg-setup"
             sys_version = ""
             timeout = 30
 

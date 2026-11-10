@@ -2,11 +2,11 @@
 loaded the hooks file (so no secrets are registered with the redactor)."""
 import json
 
-from omo_grok import redact as red
-from omo_grok.engine import Engine
-from omo_grok.hooks import set_hook
-from omo_grok.paths import get_paths
-from omo_grok.transport import HttpResult
+from oh_my_grok import redact as red
+from oh_my_grok.engine import Engine
+from oh_my_grok.hooks import set_hook
+from oh_my_grok.paths import get_paths
+from oh_my_grok.transport import HttpResult
 from tests.helpers import SECRET_KEY
 
 HOOK_URL = "https://hooks.invalid/routines/trigger/ZZsecretPATHtoken0123456789?sig=QQsecretQUERY987"
@@ -59,7 +59,7 @@ def test_legacy_unredacted_last_error_is_still_hidden_in_status(harness):
 
 
 def test_hook_status_is_booleans_only(harness):
-    from omo_grok.hooks import hook_status
+    from oh_my_grok.hooks import hook_status
     hs = hook_status(get_paths())
     assert hs and all(isinstance(v, bool) for v in hs.values())
 

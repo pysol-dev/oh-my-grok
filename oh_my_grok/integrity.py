@@ -1,9 +1,9 @@
 """Tamper tripwire around every verification (defence in depth behind the sandbox).
 
 Before and after each run the verifier hashes the trusted surfaces a candidate must never change: the venv
-site-packages (including .pth files and __pycache__), omo_grok/ (including __pycache__), the code-root config and the
-active config dir, and omoctl. Any added, removed or modified file fails the verification and raises a `tamper`
-event. False positives (e.g. an operator editing code during a run) fail closed, by design."""
+site-packages (including .pth files and __pycache__), oh_my_grok/ (including __pycache__), the code-root config and the
+active config dir, the omg CLI, and the omoctl shim. Any added, removed or modified file fails the verification and
+raises a `tamper` event. False positives (e.g. an operator editing code during a run) fail closed, by design."""
 from __future__ import annotations
 
 import hashlib
@@ -15,7 +15,8 @@ from .paths import CODE_ROOT, get_paths
 
 def surfaces() -> list[Path]:
     venv = CODE_ROOT / ".venv"
-    out = [CODE_ROOT / "omo_grok", CODE_ROOT / "config", CODE_ROOT / "omoctl", get_paths().config_dir,
+    out = [CODE_ROOT / "oh_my_grok", CODE_ROOT / "config", CODE_ROOT / "omg", CODE_ROOT / "omoctl",
+           get_paths().config_dir,
            venv / "bin", venv / "pyvenv.cfg"]
     out += sorted((CODE_ROOT / ".venv" / "lib").glob("python*/site-packages"))
     seen, uniq = set(), []

@@ -1,4 +1,4 @@
-"""omoctl: operator CLI. Shares the Engine with the MCP server (no duplicated workflow logic).
+"""omg: operator CLI. Shares the Engine with the MCP server (no duplicated workflow logic).
 
 Exit codes (stable): 0 ok | 1 internal error | 2 invalid input | 3 not found | 4 conflict | 5 gate refused |
 6 integrity failure | 7 aborted (no human confirmation / no TTY) | 8 doctor found problems | 9 test not run / failed
@@ -16,8 +16,8 @@ import time
 from pathlib import Path
 
 from . import __version__, db, sandbox
-from .config import TEMPLATE_MARKER, load_policy, load_verifier_profiles
-from .errors import OmoError
+from .config import TEMPLATE_MARKERS, load_policy, load_verifier_profiles
+from .errors import OmgError
 from .hooks import _check_perms, hook_status, load_hooks, set_hook, validate_url
 from .paths import CODE_ROOT, get_paths
 from .redact import redact, redact_obj
@@ -52,7 +52,7 @@ def _confirm(prompt: str, expect: str) -> bool:
 
 
 def cmd_mcp_command(args) -> int:
-    """The exact, absolute command to register as the command-based `omo` MCP app (computed, never stored)."""
+    """The exact, absolute command to register as the command-based `omg` MCP app (computed, never stored)."""
     from .paths import mcp_command
     print(mcp_command())
     return 0
@@ -96,7 +96,7 @@ def cmd_doctor(args) -> int:
         add("db_foreign_keys", conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1)
         add("db_integrity", conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok")
         add("db_migrations_current", not pend, f"version={db.current_version(conn)} latest={db.LATEST_VERSION}"
-            + (" (run omoctl migrate)" if pend else ""))
+            + (" (run omg migrate)" if pend else ""))
         conn.close()
     except Exception as e:
         add("db_reachable", False, redact(str(e)))
@@ -109,12 +109,12 @@ def cmd_doctor(args) -> int:
         try:
             _check_perms(paths)
             add("hooks_file_0600", True)
-        except OmoError as e:
+        except OmgError as e:
             add("hooks_file_0600", False, e.message)
     try:
         load_policy(paths.config_dir)
         add("policy_valid", True)
-    except OmoError as e:
+    except OmgError as e:
         add("policy_valid", False, e.message)
     profs = load_verifier_profiles(paths.config_dir)
     usable = []
@@ -122,7 +122,7 @@ def cmd_doctor(args) -> int:
         probs = verifier.preflight(name, prof)
         if not probs:
             usable.append(name)
-        elif TEMPLATE_MARKER not in json.dumps(prof):
+        elif not any(marker in json.dumps(prof) for marker in TEMPLATE_MARKERS):
             add(f"verifier_profile:{name}", False, "; ".join(probs))
     add("verifier_profiles_usable", bool(usable), ",".join(usable) or "none (template profiles fail closed)")
     add("git_available", shutil.which("git") is not None)
@@ -141,7 +141,7 @@ def cmd_doctor(args) -> int:
         if needed:
             add("lsp_tools_present", not missing, "; ".join(f"{n}: {m}" for n, m in missing.items())
                 + (" (run scripts/bootstrap.sh)" if missing else ""))
-    except OmoError as e:
+    except OmgError as e:
         add("lsp_config_valid", False, e.message)
     # informational (do not fail doctor): live wiring is the operator's job
     info = {"hooks_configured": hook_status(paths), "lsp_tools": lsp_info,
@@ -198,7 +198,7 @@ def cmd_backup(args) -> int:
 
 def cmd_restore(args) -> int:
     paths = get_paths()
-    if not _confirm(f"Restore {args.src} over {paths.db_path}? Stop all omo processes first. Type 'restore': ",
+    if not _confirm(f"Restore {args.src} over {paths.db_path}? Stop all omg processes first. Type 'restore': ",
                     "restore"):
         return EXIT_ABORTED
     if paths.db_path.exists():
@@ -259,7 +259,7 @@ def cmd_submit(args) -> int:
     e = _engine()
     r = e.submit(goal, key, repo=args.repo, mode=mode, constraints=meta.get("constraints"),
                  acceptance_criteria=meta.get("acceptance_criteria"), verifier_profile=args.verifier_profile,
-                 actor="omoctl")
+                 actor="omg")
     _out(args, r, f"job {r['job_id']} {'created' if r['created'] else 'already exists'} phase={r['phase']} "
                   f"mode={r['mode']}")
     return EXIT_OK
@@ -296,7 +296,7 @@ def cmd_approve(args) -> int:
         print("approval NOT recorded", file=sys.stderr)
         return EXIT_ABORTED
     actor = f"human@tty:{os.environ.get('USER', 'unknown')}"
-    r = e.approve(args.job, args.plan_hash, actor=actor, evidence=f"interactive TTY confirmation via omoctl on "
+    r = e.approve(args.job, args.plan_hash, actor=actor, evidence=f"interactive TTY confirmation via omg on "
                   f"{os.ttyname(sys.stdin.fileno())}", allow_edit=not args.no_edit,
                   accept_reduced_assurance=args.accept_reduced_assurance)
     _out(args, r, f"SOFT approval {r['approval_id']} recorded; implementation_started={r['implementation_started']}")
@@ -321,7 +321,7 @@ def cmd_cancel(args) -> int:
 
 def cmd_resume(args) -> int:
     e = _engine()
-    r = e.resume(args.job, actor="omoctl", grant_repair_cycles=args.grant_repair_cycles)
+    r = e.resume(args.job, actor="omg", grant_repair_cycles=args.grant_repair_cycles)
     _out(args, r, f"resumed; phase={r['phase']} requeued={r['requeued_tasks']}")
     return EXIT_OK
 
@@ -349,7 +349,7 @@ def _url_problem(clean: str, removed: bool) -> str | None:
     try:
         validate_url(clean)
         return None
-    except OmoError as e:
+    except OmgError as e:
         return f"{e.message} ({url_diagnostic(clean, removed)}; the value itself is not shown)"
 
 
@@ -402,15 +402,16 @@ def cmd_hook_serve(args) -> int:
     from .hook_form import URL_FILE, HookFormServer
     paths = get_paths()
     # Known redirect-log locations (RUNBOOK recipe + legacy /tmp path from earlier drafts).
-    cleanup = [paths.logs_dir / "hook_serve.log", Path("/tmp/omo_hook_serve.log")]
+    cleanup = [paths.logs_dir / "hook_serve.log", Path("/tmp/omg_hook_serve.log"),
+               Path("/tmp/omo_hook_serve.log"), Path("/tmp/omo_hook_form_url")]
     srv = HookFormServer(paths, _engine, idle_seconds=args.idle_minutes * 60, port=args.port,
                          url_file=Path(args.url_file) if args.url_file else URL_FILE,
                          cleanup_paths=cleanup)
     srv.arm_signal_handlers()  # before publishing the URL file, so SIGTERM during startup still cleans up
     srv.write_url_file()  # before announcing it, so a reader of the file never races the server start
     if args.print_url:
-        print(f"omo webhook setup form (local only, per-run session token): {srv.url}", flush=True)
-    print(f"omo webhook setup form URL written to {srv.url_file} (0600; not printed, use --print-url to show it). Stops on 'Finish', idle timeout, Ctrl-C or SIGTERM "
+        print(f"omg webhook setup form (local only, per-run session token): {srv.url}", flush=True)
+    print(f"omg webhook setup form URL written to {srv.url_file} (0600; not printed, use --print-url to show it). Stops on 'Finish', idle timeout, Ctrl-C or SIGTERM "
           f"(after {args.idle_minutes:g} idle minutes max). Values are never echoed or logged.", flush=True)
     reason = srv.serve()
     print(f"setup server stopped ({reason})", flush=True)
@@ -423,7 +424,7 @@ def cmd_hook_check(args) -> int:
     try:
         data = load_hooks(paths)
         res["file_permissions_ok"] = True
-    except OmoError as e:
+    except OmgError as e:
         _out(args, {"file_permissions_ok": False, "error": e.message}, f"FAIL: {e.message}")
         return 6
     roles = [args.role] if args.role else list(ROLES)
@@ -435,7 +436,7 @@ def cmd_hook_check(args) -> int:
             try:
                 validate_url(h["url"])
                 entry["url_valid"] = True
-            except OmoError:
+            except OmgError:
                 entry["url_valid"] = False
                 ok = False
             entry["key_present"] = bool(h.get("key"))
@@ -490,7 +491,7 @@ def cmd_roles_bind(args) -> int:
     e = _engine()
     r = e.bind_role(args.role, args.bot_id, args.bot_name, routine_id=args.routine_id,
                     routine_name=args.routine_name, enabled=not args.disabled, max_concurrent=args.max_concurrent,
-                    independence_group=args.group, provenance=args.provenance or "omoctl roles bind",
+                    independence_group=args.group, provenance=args.provenance or "omg roles bind",
                     verified=args.verified, force=args.force)
     _out(args, r, f"{r['role']} -> {r['bot_name']} v{r['version']} verified={bool(r['verified_at'])}")
     return EXIT_OK
@@ -595,7 +596,7 @@ def cmd_lsp_status(args) -> int:
             "code_extensions_without_profile": sorted(
                 e for e, lang in cfg["code_extensions"].items()
                 if not any(e in p["extensions"] for p in cfg["profiles"].values() if p["enabled"])),
-            "note": "presence only; run `omoctl lsp canary` to prove each server finds a planted defect here"}
+            "note": "presence only; run `omg lsp canary` to prove each server finds a planted defect here"}
     _out(args, data, "\n".join([f"sandbox: {'ok' if sb.ok else 'UNAVAILABLE'} {sb.detail}"]
                                + [f"{n}: {'present' if v['present'] else 'MISSING ' + str(v['missing'])}"
                                   for n, v in ts.items()]
@@ -608,7 +609,7 @@ def cmd_lsp_canary(args) -> int:
     import tempfile
     from .lsp import runner
     cfg = _lsp_cfg()
-    with tempfile.TemporaryDirectory(prefix="omo-lsp-canary-") as d:
+    with tempfile.TemporaryDirectory(prefix="omg-lsp-canary-") as d:
         res = runner.canary_all(cfg, sandbox.probe(), Path(d), args.profile or None)
     ok = bool(res) and all(r["status"] == "ok" for r in res.values())
     _out(args, {"ok": ok, "profiles": res},
@@ -622,7 +623,7 @@ def cmd_lsp_check(args) -> int:
     import tempfile
     from .lsp import runner
     cfg = _lsp_cfg()
-    with tempfile.TemporaryDirectory(prefix="omo-lsp-check-") as d:
+    with tempfile.TemporaryDirectory(prefix="omg-lsp-check-") as d:
         res = runner.evaluate(Path(args.repo), args.base, args.candidate, cfg, sandbox.probe(), Path(d))
     _out(args, res, f"{res['status']}: new={len(res['new'])} config_violations={res['config_violations']} "
                     f"suppressions={len(res['suppressions'])} reasons={res['reasons']}")
@@ -631,10 +632,10 @@ def cmd_lsp_check(args) -> int:
 
 # ---------------------------------------------------------------- parser
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="omoctl", description="omo-grok operator CLI (fallback controls; everyday use is "
+    p = argparse.ArgumentParser(prog="omg", description="oh-my-grok operator CLI (fallback controls; everyday use is "
                                 "talking to Hephaestus). Exit codes: 0 ok, 1 internal, 2 invalid, 3 not found, "
                                 "4 conflict, 5 gate refused, 6 integrity, 7 aborted, 8 doctor problems, 9 test failed.")
-    p.add_argument("--version", action="version", version=f"omoctl {__version__}")
+    p.add_argument("--version", action="version", version=f"omg {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add(name, fn, help_, json_=True, parent=sub):
@@ -686,7 +687,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--out", required=True)
     sp = add("backup", cmd_backup, "consistent SQLite backup (backup API + integrity check)")
     sp.add_argument("--out", required=True)
-    sp = add("restore", cmd_restore, "restore a backup (interactive TTY; stop omo processes first)")
+    sp = add("restore", cmd_restore, "restore a backup (interactive TTY; stop omg processes first)")
     sp.add_argument("src")
     hook = sub.add_parser("hook", help="webhook secrets").add_subparsers(dest="hook_cmd", required=True)
     sp = add("set", cmd_hook_set, "store URL+key for ROLE via hidden prompts (never echoed)", parent=hook)
@@ -700,7 +701,7 @@ def build_parser() -> argparse.ArgumentParser:
              parent=hook)
     sp.add_argument("--port", type=int, default=0, help="default: random free port")
     sp.add_argument("--idle-minutes", type=float, default=30.0)
-    sp.add_argument("--url-file", default=None, help="default: /tmp/omo_hook_form_url")
+    sp.add_argument("--url-file", default=None, help="default: /tmp/omg_hook_form_url")
     sp.add_argument("--print-url", action="store_true", help="also print the tokenized URL to stdout (off by default)")
     roles = sub.add_parser("roles", help="role -> Bot -> routine bindings").add_subparsers(dest="roles_cmd",
                                                                                            required=True)
@@ -757,7 +758,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.fn(args)
-    except OmoError as e:
+    except OmgError as e:
         if getattr(args, "json", False):
             print(json.dumps(redact_obj(e.to_dict()), sort_keys=True))
         else:

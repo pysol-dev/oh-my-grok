@@ -10,7 +10,7 @@ that anything is installed on the host, and it is not OPERATIONAL.
 difference is listed in section 1 and nowhere else.
 
 **Operational state while this document is in force: NOT OPERATIONAL.** Implementing a feature is not installing it.
-`omoctl doctor` derives its verdict from recorded evidence (section 12), never from a constant, and the original
+`omg doctor` derives its verdict from recorded evidence (section 12), never from a constant, and the original
 section 13 stop conditions (real cross-Bot webhook/MCP run on the host) still apply in full.
 
 ## 1. Relationship to the original spec and register of supersessions
@@ -28,9 +28,9 @@ rule all remain in force. Every deviation is one of: **I** (interpretation the o
 | SUP-4 | s4 "Required job outcomes ... `done`" | E | A job with `intent=investigation` may reach `done` from the `analysis` phase with a read-only investigation result. It never has a plan, approval, worktree, executor task, or candidate revision. It is the only path to `done` that skips the final gate, and it is allowed only because no code can change (section 4.2, enforced in four places). |
 | SUP-5 | s9 "Never call `npx tsc --noEmit` an LSP verification for every language" | I (strengthens) | Diagnostics gating is performed by an engine-side Language Server Protocol client talking JSON-RPC to a real language server. A command-line checker run is never labelled LSP. |
 | SUP-6 | s1 "minimal dependencies only as justified"; s0 "do not solicit blanket permission to install packages" | E | Language servers and Node are installed only by `scripts/bootstrap.sh`, from hash-pinned lock files, into `tools/` (git-ignored), never into the runtime `.venv`. `bootstrap.sh` installs nothing else and never uses sudo. |
-| SUP-7 | s0 "Context7 when available" | E | The engine contains a Context7 MCP client (`omo_grok/context7.py`). Bots keep their own Context7 access (whose use is unobservable and only ever an `agent_claimed` fact). |
-| SUP-8 | s2 repository layout "illustrative"; every path `/workspace/omo` | I | No code, test, or shipped config may contain `/workspace/omo`. Paths derive from the code root (`${OMO_CODE_ROOT}`), the interpreter (`${OMO_PYTHON}`), and the tools directory (`${OMO_TOOLS}`). The documented host location remains `/workspace/omo`, but nothing depends on it. |
-| SUP-9 | s6 CLI list | E | Adds `omoctl lsp`, `omoctl boulder`, `omoctl features`, `omoctl mcp-command`, `omoctl docs` and `omoctl receipts`. No existing command changes meaning. |
+| SUP-7 | s0 "Context7 when available" | E | The engine contains a Context7 MCP client (`oh_my_grok/context7.py`). Bots keep their own Context7 access (whose use is unobservable and only ever an `agent_claimed` fact). |
+| SUP-8 | s2 repository layout "illustrative"; every path `/workspace/omo` | I | No code, test, or shipped config may contain `/workspace/omo` or `/workspace/omg`. Paths derive from the code root (`${OMG_CODE_ROOT}`), the interpreter (`${OMG_PYTHON}`), and the tools directory (`${OMG_TOOLS}`); the legacy `${OMO_*}` spellings expand to the same values. The documented host location is `/workspace/omg` (the live checkout is still `/workspace/omo` until cutover), but nothing depends on either path. |
+| SUP-9 | s6 CLI list | E | Adds `omg lsp`, `omg boulder`, `omg features`, `omg mcp-command`, `omg docs` and `omg receipts`. No existing command changes meaning. |
 
 Nothing in section 1 weakens: approval, Momus review of the exact plan hash, the revision-bound final gate, reviewer
 independence, fail-closed verifier behaviour, or secret handling.
@@ -49,7 +49,7 @@ Each row says how it was verified. Anything not in this table is an assumption a
 | The Context7 remote MCP server `https://mcp.context7.com/mcp` answers `initialize` and `tools/call` (`resolve-library-id`, `query-docs`) from this VM **without an API key** using the pinned Python `mcp` client (`streamable_http_client`, two-value context) | manual run during design; stored live receipt `docs/evidence/context7-live-*.json` |
 | Context7 accepts `Authorization: Bearer <key>` for authenticated use | Context7 documentation retrieved through the Context7 MCP (`/upstash/context7`, all-clients.mdx) |
 | bubblewrap works unprivileged on the development VM; `config/verifiers.json` as committed pointed at `/workspace/omo/...`, which made 67 unit tests fail in a relocated checkout | `pytest tests/unit` before stage 0: 67 failed, 222 passed |
-| The committed MCP tool surface is exactly 8 tools | `omo_grok/mcp_server.py` `TOOL_NAMES`, `tests/integration/test_mcp_stdio.py` |
+| The committed MCP tool surface is exactly 8 tools | `oh_my_grok/mcp_server.py` `TOOL_NAMES`, `tests/integration/test_mcp_stdio.py` |
 | Grok Bot hosting limits (one shared computer and account, no native hooks, no `spawn_agent`, no per-role models, routines are the only wake-up) | original spec s0, s2; `docs/SECURITY.md` |
 
 ## 3. Requirements
@@ -57,7 +57,7 @@ Each row says how it was verified. Anything not in this table is an assumption a
 Each requirement has an identifier used by the acceptance matrix (section 11) and by the tests.
 
 - **R1 Intent gating.** Hephaestus classifies every request as `explanation`, `investigation`, or `implementation`
-  and passes it to `omo.submit`. The engine enforces the consequences. `explanation` creates no job and no task.
+  and passes it to `omg.submit`. The engine enforces the consequences. `explanation` creates no job and no task.
   `investigation` is read-only: it can never produce an executor task, a worktree, an approval with `allow_edit`, or
   a candidate revision. Only `implementation` can edit. The engine, not the prompt, refuses edits for read-only intents.
 - **R2 Smallest adequate team.** For `implementation` the engine computes a minimum class (`quick`, `standard`,
@@ -69,7 +69,7 @@ Each requirement has an identifier used by the acceptance matrix (section 11) an
 - **R4 Continuity.** Every job has an active-plan markdown file and a `.omo/boulder.json` projection (upstream
   shape, section 6) containing work, session, and task tracking. A restart (new process, same database) resumes the
   same job and plan; an identical active request returns the existing job instead of creating a duplicate.
-- **R5 Single authority.** The database is the only source of transitions. The boulder file is write-only for omo-grok:
+- **R5 Single authority.** The database is the only source of transitions. The boulder file is write-only for oh-my-grok:
   it is regenerated from the database, never read to decide anything.
 - **R6 Projection integrity.** The projection is written under an exclusive file lock, rendered from a consistent
   database snapshot inside the lock, replaced atomically, and never regresses. Concurrent writers cannot lose an
@@ -95,7 +95,7 @@ Each requirement has an identifier used by the acceptance matrix (section 11) an
   exact candidate revision, the revision-bound final gate, bounded repair cycles, and invalidation of reviews on a new
   revision all behave exactly as before for every class that can edit.
 - **R13 Relocation and bootstrap.** A fresh clone can be made runnable from nothing by `scripts/bootstrap.sh`. No path
-  to `/workspace/omo` is baked in. `omoctl doctor` reports precisely what is missing.
+  to `/workspace/omo` or `/workspace/omg` is baked in. `omg doctor` reports precisely what is missing.
 - **R14 Conservative flags.** Every new behaviour sits behind a per-feature mode (`off`, `shadow`, `enforce`) that
   defaults to `off`. The mode is frozen into the job at submit, so changing configuration cannot alter a running job.
 
@@ -103,7 +103,7 @@ Each requirement has an identifier used by the acceptance matrix (section 11) an
 
 ### 4.1 Where classification happens
 
-Natural-language classification is done by the Hephaestus model, guided by `agents/hephaestus-omo.md`. It is a
+Natural-language classification is done by the Hephaestus model, guided by `agents/hephaestus-omg.md`. It is a
 prompt-level routine and is not claimed to be deterministic. What is deterministic is what the engine does with the
 value, so a wrong "explanation" can only cause too little work, never an edit.
 
@@ -172,7 +172,7 @@ This path never edits or deletes the candidate commit.
 Per job, under `jobs/<job_id>/.omo/` (outside the product repository so a candidate commit can never contain it, and
 so no candidate-controlled path can overwrite it): `boulder.json`, `boulder.lock`, `plans/<plan_name>.md`, and a
 self-ignoring `.gitignore` as upstream writes. The deliberate difference from upstream (worktree-local boulder) is
-that omo-grok jobs may have no worktree (investigation, planning) and that the worktree is the executor's
+that oh-my-grok jobs may have no worktree (investigation, planning) and that the worktree is the executor's
 writable surface.
 
 ### 6.2 Boulder schema (upstream-shaped, superset)
@@ -180,12 +180,12 @@ writable surface.
 `schema_version: 2`, `active_work_id`, `works{work_id: {work_id, active_plan, plan_name, status, started_at,
 ended_at?, updated_at, session_ids[], session_origins{}, agent, worktree_path?, task_sessions{task_key: {task_key,
 task_label, task_title, session_id, agent, category, started_at, ended_at?, status, updated_at}}}}` plus the mirrored
-root fields exactly as upstream, plus an extension object `x_omo_grok`:
-`{"job_id", "generation", "projection": "derived-from-sqlite", "resume": {"tool": "omo.status", "job_id": ...},
+root fields exactly as upstream, plus an extension object `x_omg` (readers also accept a legacy `x_omo_grok` object):
+`{"job_id", "generation", "projection": "derived-from-sqlite", "resume": {"tool": "omg.status", "job_id": ...},
 "roster_class", "intent", "phase", "plan_hash", "candidate_revision", "next_action"}`.
 
 Status mapping: phases `research`..`running` and `awaiting_approval` -> `active`; `blocked` -> `paused`; `done` ->
-`completed`; `cancelled` and `failed` -> `abandoned`. Session ids are `omo-grok:<bot_id|role>:<attempt_id>`. The
+`completed`; `cancelled` and `failed` -> `abandoned`. Session ids are `oh-my-grok:<bot_id|role>:<attempt_id>`. The
 format is intentionally not an upstream platform prefix because no Grok Bot platform session id is observable.
 The file is shape-compatible with the verified upstream type; it is not claimed to be consumed by upstream tools.
 
@@ -224,11 +224,11 @@ review), `F3` (QA), `F4` (final gate). The approved plan text is appended under 
 ### 6.5 Restart and resume
 
 `Engine.status()` with no argument returns `active_work`: every non-terminal job with `job_id`, `work_id`,
-`plan_name`, `phase`, `next_action`, `boulder_path`, and per-task sessions. `omo.reconcile` (and the
-`omo-reconcile` routine) re-dispatches queued and expired work idempotently. `submit` with the same
+`plan_name`, `phase`, `next_action`, `boulder_path`, and per-task sessions. `omg.reconcile` (and the
+`omg-reconcile` routine) re-dispatches queued and expired work idempotently. `submit` with the same
 `requirements_hash` as a non-terminal job returns that job (`created=false`, `resumed=true`) even under a different
-idempotency key. A blocked job resumes only through `omoctl resume`. The `agents/hephaestus-omo.md` instruction
-requires `omo.status` at the start of every turn and before any `submit`. Grok Bot has no stop hook, so there is no
+idempotency key. A blocked job resumes only through `omg resume`. The `agents/hephaestus-omg.md` instruction
+requires `omg.status` at the start of every turn and before any `submit`. Grok Bot has no stop hook, so there is no
 automatic continuation: resume is driven by (a) that status-first rule, (b) the optional reconcile routine, and (c)
 `awaiting_resume` claims.
 
@@ -236,7 +236,7 @@ automatic continuation: resume is driven by (a) that status-first rule, (b) the 
 
 ### 7.1 Client
 
-`omo_grok/lsp/client.py` implements Content-Length framed JSON-RPC over the server's stdio, with request
+`oh_my_grok/lsp/client.py` implements Content-Length framed JSON-RPC over the server's stdio, with request
 correlation, a reader thread, bounded message sizes, and handlers for server-to-client requests
 (`workspace/configuration` answered from the profile `settings`, `client/registerCapability`,
 `window/workDoneProgress/create` answered with null; any other request answered with MethodNotFound so a server never
@@ -298,7 +298,7 @@ This spec never claims general language coverage. The list above is the entire v
 | `agent_claimed` | A bot's assertion of tool use | no |
 
 Stored in `tool_receipts` (append-only by convention; same-account bots can still edit the database, as in the original
-s4/s11 caveat). The only code that inserts receipts is in `omo_grok/engine.py` helpers called by engine-run tools; the
+s4/s11 caveat). The only code that inserts receipts is in `oh_my_grok/engine.py` helpers called by engine-run tools; the
 MCP `complete` argument schema has no receipt field and unknown keys are rejected.
 
 Honest limits: (a) a re-fetch proves what a source says now, not that a bot called a tool, so it is only used to bind
@@ -313,7 +313,7 @@ co-author footer, and a footer string, informed the trailer rule). The executor 
 `[{name, sha256, text}]`. On claim the engine records an `engine_delivered` receipt with the pack hash and the
 attempt id. When `git_discipline` is not `off`, the engine records the history shape: `base..candidate` is linear
 (no merge commits), has at most `max_commits` (default 50) commits, every commit message carries the trailer
-`Omo-Job: <job_id>`, and whether the candidate descends from every earlier candidate of the same job. Commits are
+`Omg-Job: <job_id>` (a legacy `Omo-Job: <job_id>` trailer still counts), and whether the candidate descends from every earlier candidate of the same job. Commits are
 on the job branch only. `shadow` records that shape, including a rewrite (`not_descendant_of` in the receipt, status
 `violations`), and does not refuse the candidate or fail the gate. `enforce` refuses a rewrite at submit with
 `git_history_not_descendant` and the final gate fails that check, along with a merge commit, a missing trailer, or
@@ -325,7 +325,7 @@ too many commits.
 `policy.json` key `features`, each `off | shadow | enforce`: `adaptive_roster`, `boulder` (`off | on`), `lsp`,
 `git_discipline`, `docs_evidence`, `repo_lease`. All default `off`. `shadow` computes and records the decision as an
 event without changing behaviour. `enforce` changes behaviour. `roster_class` is accepted only when `adaptive_roster=enforce`; with `off` or `shadow` an implementation job always gets the original (heavy) DAG, and `shadow` records an `roster_shadow` event naming what `enforce` would have created. A new job always freezes the feature set, including all-off. The effective set is copied into the job's
-`policies_json.features` at submit; running jobs ignore later configuration changes. `omoctl features` prints the
+`policies_json.features` at submit; running jobs ignore later configuration changes. `omg features` prints the
 effective and per-job values. Intent-based refusals for read-only intents (section 4.2 rules 2 to 5) apply whenever
 an `intent` is supplied, independent of flags, because they only remove capability.
 
@@ -346,9 +346,9 @@ an `intent` is supplied, independent of flags, because they only remove capabili
 
 ## 12. Operational state and doctor
 
-`omoctl doctor` reports `NOT OPERATIONAL` unless the database holds (a) a `gate_results` row with `passed=1` for an
+`omg doctor` reports `NOT OPERATIONAL` unless the database holds (a) a `gate_results` row with `passed=1` for an
 `implement`-mode job on a non-fixture repository that has engine-executed LSP and git receipts, (b) the recorded
-host cutover attestation (`omoctl attest`, human TTY, stores who/when/what, never a secret), and (c) the original
+host cutover attestation (`omg attest`, human TTY, stores who/when/what, never a secret), and (c) the original
 section 10 items 20 and 21 live-evidence records. The synthetic fixture and the disposable-repository exercise in this
 branch satisfy none of these on their own, so this branch can only produce `NOT OPERATIONAL` or `PARTIALLY INSTALLED`.
 

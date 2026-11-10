@@ -5,24 +5,24 @@ from pathlib import Path
 
 import pytest
 
-from omo_grok import fixture as fx
-from omo_grok import gitops
-from omo_grok.errors import GateRefused
-from omo_grok.paths import get_paths
+from oh_my_grok import fixture as fx
+from oh_my_grok import gitops
+from oh_my_grok.errors import GateRefused
+from oh_my_grok.paths import get_paths
 
 BASE = {"files_estimate": 1, "new_dependency": False, "external_api": False, "security_sensitive": False,
         "cross_cutting": False}
 
 
 def _policy(**extra):
-    cfg = Path(os.environ["OMO_CONFIG_DIR"])
+    cfg = Path(os.environ["OMG_CONFIG_DIR"])
     pol = json.loads((cfg / "policy.json").read_text())
     pol.update(extra)
     (cfg / "policy.json").write_text(json.dumps(pol))
 
 
 @pytest.fixture
-def h(omo_home):
+def h(omg_home):
     from helpers import Harness
     _policy(features={"boulder": "on"})
     hh = Harness()
@@ -35,7 +35,7 @@ def boulder(job):
 
 
 def test_restart_resumes_the_same_job_and_plan(h):
-    from omo_grok.engine import Engine
+    from oh_my_grok.engine import Engine
     from helpers import FakeTransport, Clock
     job = h.submit()["job_id"]
     h.research(job)
@@ -47,7 +47,7 @@ def test_restart_resumes_the_same_job_and_plan(h):
     h.e = e2
     s = e2.status()
     (aw,) = [w for w in s["active_work"] if w["job_id"] == job]
-    assert aw["phase"] == phase == "plan_review" and aw["plan_name"] == f"omo-{job[:8]}"
+    assert aw["phase"] == phase == "plan_review" and aw["plan_name"] == f"omg-{job[:8]}"
     assert aw["boulder_path"] == str(get_paths().job_dir(job) / ".omo" / "boulder.json")
     assert aw["next_action"]
     assert "THE PLAN BEFORE RESTART" in Path(boulder(job)["active_plan"]).read_text()
@@ -80,15 +80,15 @@ def test_duplicate_of_a_blocked_job_returns_it_but_does_not_unblock(h):
     h.e.complete(a, pkt["task_id"], pkt["attempt_id"], {"status": "blocked", "reason": "no access"})
     b = h.submit(key="second-key-0022")
     assert b["job_id"] == a and b["resumed"] is True and b["phase"] == "blocked"
-    assert "omoctl resume" in b["next_action"]
+    assert "omg resume" in b["next_action"]
     assert h.e._job(a)["phase"] == "blocked"
     (aw,) = [w for w in h.e.status()["active_work"] if w["job_id"] == a]
-    assert aw["phase"] == "blocked" and "omoctl resume" in aw["next_action"]
+    assert aw["phase"] == "blocked" and "omg resume" in aw["next_action"]
     h.e.resume(a, actor="t")
     assert h.e._job(a)["phase"] != "blocked"
 
 
-def test_without_the_boulder_feature_duplicates_are_still_created(omo_home):
+def test_without_the_boulder_feature_duplicates_are_still_created(omg_home):
     from helpers import Harness
     hh = Harness()
     try:
@@ -109,7 +109,7 @@ def test_deleting_or_editing_the_files_never_alters_the_database(h):
     for k in ("phase", "counts", "next_action", "plan"):
         assert before[k] == after[k]
     h.analyze(job)  # engine works without the files and re-creates them
-    assert boulder(job)["x_omo_grok"]["phase"] == "planning"
+    assert boulder(job)["x_omg"]["phase"] == "planning"
 
 
 def test_completed_work_is_not_active_work(h):
@@ -127,14 +127,14 @@ def test_active_work_lists_per_task_sessions(h):
 
 # --------------------------------------------------------------------------- repo lease
 @pytest.fixture
-def two_jobs(omo_home, tmp_path):
+def two_jobs(omg_home, tmp_path):
     repo = tmp_path / "shared-repo"
     fx.make_repo(repo)
     top = str(gitops.toplevel(repo))
     return top
 
 
-def _mk(mode, omo_home, top):
+def _mk(mode, omg_home, top):
     from helpers import Harness
     _policy(features={"repo_lease": mode}, repo_allowlist=[top])
     return Harness()
@@ -147,8 +147,8 @@ def _approved_job(hh, top, key):
     return job
 
 
-def test_repo_lease_enforce_refuses_a_second_editing_job_without_side_effects(omo_home, two_jobs):
-    hh = _mk("enforce", omo_home, two_jobs)
+def test_repo_lease_enforce_refuses_a_second_editing_job_without_side_effects(omg_home, two_jobs):
+    hh = _mk("enforce", omg_home, two_jobs)
     try:
         a = _approved_job(hh, two_jobs, "lease-job-0001")
         b = _approved_job(hh, two_jobs, "lease-job-0002-other")
@@ -167,8 +167,8 @@ def test_repo_lease_enforce_refuses_a_second_editing_job_without_side_effects(om
         hh.close()
 
 
-def test_repo_lease_shadow_records_the_conflict_and_allows(omo_home, two_jobs):
-    hh = _mk("shadow", omo_home, two_jobs)
+def test_repo_lease_shadow_records_the_conflict_and_allows(omg_home, two_jobs):
+    hh = _mk("shadow", omg_home, two_jobs)
     try:
         a = _approved_job(hh, two_jobs, "lease-job-0011")
         b = _approved_job(hh, two_jobs, "lease-job-0012-other")
@@ -180,8 +180,8 @@ def test_repo_lease_shadow_records_the_conflict_and_allows(omo_home, two_jobs):
         hh.close()
 
 
-def test_repo_lease_is_released_when_the_job_finishes(omo_home, two_jobs):
-    hh = _mk("enforce", omo_home, two_jobs)
+def test_repo_lease_is_released_when_the_job_finishes(omg_home, two_jobs):
+    hh = _mk("enforce", omg_home, two_jobs)
     try:
         a = _approved_job(hh, two_jobs, "lease-job-0021")
         hh.approve(a)
@@ -195,8 +195,8 @@ def test_repo_lease_is_released_when_the_job_finishes(omo_home, two_jobs):
         hh.close()
 
 
-def test_repo_lease_off_does_not_touch_the_table(omo_home, two_jobs):
-    hh = _mk("off", omo_home, two_jobs)
+def test_repo_lease_off_does_not_touch_the_table(omg_home, two_jobs):
+    hh = _mk("off", omg_home, two_jobs)
     try:
         a = _approved_job(hh, two_jobs, "lease-job-0031")
         hh.approve(a)

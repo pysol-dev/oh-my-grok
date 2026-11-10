@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from omo_grok import fixture as fx
-from omo_grok import gitops
-from omo_grok.errors import Conflict, GateRefused, ValidationError
+from oh_my_grok import fixture as fx
+from oh_my_grok import gitops
+from oh_my_grok.errors import Conflict, GateRefused, ValidationError
 
 BASE = {"files_estimate": 1, "new_dependency": False, "external_api": False, "security_sensitive": False,
         "cross_cutting": False}
@@ -19,14 +19,14 @@ def S(**kw):
 
 
 def _enable(mode_map):
-    cfg = Path(os.environ["OMO_CONFIG_DIR"])
+    cfg = Path(os.environ["OMG_CONFIG_DIR"])
     pol = json.loads((cfg / "policy.json").read_text())
     pol["features"] = mode_map
     (cfg / "policy.json").write_text(json.dumps(pol))
 
 
 @pytest.fixture
-def h(omo_home):
+def h(omg_home):
     from helpers import Harness
     _enable({"adaptive_roster": "enforce"})
     hh = Harness()
@@ -35,7 +35,7 @@ def h(omo_home):
 
 
 @pytest.fixture
-def legacy(omo_home):
+def legacy(omg_home):
     from helpers import Harness
     hh = Harness()
     yield hh
@@ -107,7 +107,7 @@ def test_read_only_points_2_3_4_new_task_approve_and_start(h):
     job = h.e.submit("look", "investigate-0011", intent="investigation", scope=S())["job_id"]
     for kind in ("plan", "plan_review", "implement", "code_review", "qa", "integrate"):
         with pytest.raises(GateRefused):
-            with __import__("omo_grok.db", fromlist=["tx"]).tx(h.e.conn):
+            with __import__("oh_my_grok.db", fromlist=["tx"]).tx(h.e.conn):
                 h.e._new_task(job, kind, plan_revision_id="x")
     with pytest.raises(GateRefused, match="read-only"):
         h.e.approve(job, "0" * 64, actor="t", evidence="e", allow_edit=True)
@@ -172,7 +172,7 @@ def test_standard_task_set_without_and_with_external_api(h):
                                                        ("plan", "analyze")]
 
 
-def test_heavy_equals_legacy_dag(h, omo_home):
+def test_heavy_equals_legacy_dag(h, omg_home):
     r = sub(h, scope=S(new_dependency=True))
     job = r["job_id"]
     assert set(r["task_ids"]) == {"explore", "research", "analyze", "plan"} and r["phase"] == "research"
@@ -245,7 +245,7 @@ def test_flags_off_without_intent_is_the_pre_existing_behaviour(legacy):
     assert "roster_class" not in r
 
 
-def test_shadow_mode_records_the_decision_without_changing_behaviour(omo_home):
+def test_shadow_mode_records_the_decision_without_changing_behaviour(omg_home):
     from helpers import Harness
     _enable({"adaptive_roster": "shadow"})
     hh = Harness()
@@ -462,7 +462,7 @@ def test_heavy_job_with_contradicting_diff_is_flagged_but_not_blocked(h):
 
 
 def test_only_an_investigation_can_finish_from_the_analysis_phase(h):
-    from omo_grok import db
+    from oh_my_grok import db
     job = sub(h, scope=S(files_estimate=5))["job_id"]
     row = h.e._job(job)
     with db.tx(h.e.conn):

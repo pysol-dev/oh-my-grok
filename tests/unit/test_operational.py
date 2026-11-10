@@ -1,7 +1,7 @@
 import json
 
-from omo_grok import db
-from omo_grok.operational import evaluate
+from oh_my_grok import db
+from oh_my_grok.operational import evaluate
 
 
 def conn(tmp_path):

@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from omo_grok import context7
-from omo_grok.context7 import Context7Error
+from oh_my_grok import context7
+from oh_my_grok.context7 import Context7Error
 
 SERVER = str(Path(__file__).parent / "fake_context7.py")
 

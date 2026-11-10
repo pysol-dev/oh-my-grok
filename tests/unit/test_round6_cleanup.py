@@ -2,7 +2,7 @@
 directories chmodded to 000 / 0o100 and trees far deeper than any recursion cap, without following symlinks."""
 import os
 
-from omo_grok import verifier
+from oh_my_grok import verifier
 
 
 def _deep(root, n):

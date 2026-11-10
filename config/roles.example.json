@@ -1,13 +1,13 @@
 {
-  "_comment": "EXAMPLE role->Bot bindings. All entries UNVERIFIED: routine_id is null until the operator creates each routine and runs `omoctl roles bind ROLE ... --routine-id ID --verified`. code-reviewer->Momus and qa-executor->Metis is a deliberate default so reviewers are in a different independence group from Executor; change it if you prefer dedicated reviewer Bots. Import with: omoctl roles import config/roles.example.json",
+  "_comment": "EXAMPLE role->Bot bindings. All entries UNVERIFIED: routine_id is null until the operator creates each routine and runs `omg roles bind ROLE ... --routine-id ID --verified`. code-reviewer->Momus and qa-executor->Metis is a deliberate default so reviewers are in a different independence group from Executor; change it if you prefer dedicated reviewer Bots. Import with: omg roles import config/roles.example.json",
   "bindings": [
-    {"role": "hephaestus",    "bot_id": "f497e4a7-5d7d-46e4-829f-b0da987cbac4", "bot_name": "Hephaestus", "routine_id": null, "routine_name": "omo-bus-hephaestus (optional resume)", "independence_group": "g-hephaestus"},
-    {"role": "explorer",      "bot_id": "dbbe6828-c2fb-4474-8fe3-a0e6df942fc6", "bot_name": "Explorer",   "routine_id": null, "routine_name": "omo-bus-explorer", "independence_group": "g-explorer"},
-    {"role": "librarian",     "bot_id": "78a94f3f-cb51-473f-b9d4-9a06fc025f59", "bot_name": "Librarian",  "routine_id": null, "routine_name": "omo-bus-librarian", "independence_group": "g-librarian"},
-    {"role": "metis",         "bot_id": "41b28a72-3ece-45b9-9008-000f3fce4da7", "bot_name": "Metis",      "routine_id": null, "routine_name": "omo-bus-metis", "independence_group": "g-metis"},
-    {"role": "momus",         "bot_id": "42b0d03a-d1fb-4fdc-87b1-35d9123f6f74", "bot_name": "Momus",      "routine_id": null, "routine_name": "omo-bus-momus", "independence_group": "g-momus"},
-    {"role": "executor",      "bot_id": "e3dfae0e-9d90-4358-8e90-2e4c6734b092", "bot_name": "Executor",   "routine_id": null, "routine_name": "omo-bus-executor", "independence_group": "g-executor"},
-    {"role": "code-reviewer", "bot_id": "42b0d03a-d1fb-4fdc-87b1-35d9123f6f74", "bot_name": "Momus",      "routine_id": null, "routine_name": "omo-bus-code-reviewer", "independence_group": "g-momus"},
-    {"role": "qa-executor",   "bot_id": "41b28a72-3ece-45b9-9008-000f3fce4da7", "bot_name": "Metis",      "routine_id": null, "routine_name": "omo-bus-qa-executor", "independence_group": "g-metis"}
+    {"role": "hephaestus",    "bot_id": "f497e4a7-5d7d-46e4-829f-b0da987cbac4", "bot_name": "Hephaestus", "routine_id": null, "routine_name": "omg-bus-hephaestus (optional resume)", "independence_group": "g-hephaestus"},
+    {"role": "explorer",      "bot_id": "dbbe6828-c2fb-4474-8fe3-a0e6df942fc6", "bot_name": "Explorer",   "routine_id": null, "routine_name": "omg-bus-explorer", "independence_group": "g-explorer"},
+    {"role": "librarian",     "bot_id": "78a94f3f-cb51-473f-b9d4-9a06fc025f59", "bot_name": "Librarian",  "routine_id": null, "routine_name": "omg-bus-librarian", "independence_group": "g-librarian"},
+    {"role": "metis",         "bot_id": "41b28a72-3ece-45b9-9008-000f3fce4da7", "bot_name": "Metis",      "routine_id": null, "routine_name": "omg-bus-metis", "independence_group": "g-metis"},
+    {"role": "momus",         "bot_id": "42b0d03a-d1fb-4fdc-87b1-35d9123f6f74", "bot_name": "Momus",      "routine_id": null, "routine_name": "omg-bus-momus", "independence_group": "g-momus"},
+    {"role": "executor",      "bot_id": "e3dfae0e-9d90-4358-8e90-2e4c6734b092", "bot_name": "Executor",   "routine_id": null, "routine_name": "omg-bus-executor", "independence_group": "g-executor"},
+    {"role": "code-reviewer", "bot_id": "42b0d03a-d1fb-4fdc-87b1-35d9123f6f74", "bot_name": "Momus",      "routine_id": null, "routine_name": "omg-bus-code-reviewer", "independence_group": "g-momus"},
+    {"role": "qa-executor",   "bot_id": "41b28a72-3ece-45b9-9008-000f3fce4da7", "bot_name": "Metis",      "routine_id": null, "routine_name": "omg-bus-qa-executor", "independence_group": "g-metis"}
   ]
 }

@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from omo_grok import sandbox
-from omo_grok.lsp import profiles, runner
-from omo_grok.lsp.client import LspClient, LspError, MethodNotFound
+from oh_my_grok import sandbox
+from oh_my_grok.lsp import profiles, runner
+from oh_my_grok.lsp.client import LspClient, LspError, MethodNotFound
 
 FAKE = str(Path(__file__).parent / "fake_lsp_server.py")
 

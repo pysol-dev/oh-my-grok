@@ -1,9 +1,9 @@
 ---
 name: git-master
-description: Commit discipline for omo-grok executor work. Written for this repository; it is guidance delivered to the executor, and the engine checks only the structural consequences listed at the end.
+description: Commit discipline for oh-my-grok executor work. Written for this repository; it is guidance delivered to the executor, and the engine checks only the structural consequences listed at the end.
 ---
 
-# git-master (omo-grok executor)
+# git-master (oh-my-grok executor)
 
 You are changing code in a job worktree on a job branch. Leave a history a reviewer can read and a gate can check.
 
@@ -16,7 +16,7 @@ You are changing code in a job worktree on a job branch. Leave a history a revie
 3. Keep history linear. Do not create merge commits. If you need a newer base, stop and report it as blocked;
    do not merge or rebase onto something the plan did not name.
 4. Every commit message ends with a trailer line giving the job id, exactly as the packet's `commit_trailer` field
-   says, for example `Omo-Job: <job id>`. The first line is an imperative summary of at most 72 characters; the body
+   says, for example `Omg-Job: <job id>`. The first line is an imperative summary of at most 72 characters; the body
    (optional) explains why.
 5. Never rewrite history that a previous attempt already produced: no `reset --hard` of earlier commits, no
    `commit --amend` of a commit that was already reported as a candidate, no force pushes, no deleting branches.

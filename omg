@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# omg: operator CLI for oh-my-grok. All logic lives in oh_my_grok (shared with the MCP server).
+# omoctl is a compatibility shim that execs this script.
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+if [ -n "${OMG_PYTHON:-}" ]; then
+  PY="$OMG_PYTHON"
+elif [ -n "${OMO_PYTHON:-}" ]; then
+  PY="$OMO_PYTHON"
+else
+  PY="$HERE/.venv/bin/python"
+fi
+if [ ! -x "$PY" ]; then
+  echo "omg: interpreter not found: $PY" >&2
+  echo "omg: run $HERE/scripts/bootstrap.sh (creates .venv from requirements.lock and installs the pinned tools)" >&2
+  exit 8
+fi
+export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
+exec "$PY" -m oh_my_grok.cli "$@"

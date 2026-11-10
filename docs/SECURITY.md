@@ -1,14 +1,16 @@
-# omo-grok security model
+# oh-my-grok security model
+
+Names in this document are the names in this tree (`omg`, `oh_my_grok`, `OMG_*`). `OMO_*` environment variables are still accepted. `spec/IMPLEMENTATION.md` is frozen and still uses the old names. The live connector has not been re-registered, and the live checkout has not been moved.
 
 ## Threat model (be honest about the boundary)
 Every Grok Bot on this account shares one Linux computer. A same-account Bot can:
 
-- use the shell and read every file it can write, including `state/omo.sqlite3`, `state/secrets/hooks.json`, the
+- use the shell and read every file it can write, including `state/omg.sqlite3` (or a legacy `state/omo.sqlite3`), `state/secrets/hooks.json`, the
   code and the config
-- spoof an advisory role, run `omoctl` (including `approve` if it fakes a TTY), edit the DB, or change the verifier
+- spoof an advisory role, run `omg` (including `approve` if it fakes a TTY), edit the DB, or change the verifier
 - use any credential stored on the box
 
-So the `omo` MCP server is a **robust cooperative state machine, not a sandbox**. Its role policy, schemas and
+So the `omg` MCP server is a **robust cooperative state machine, not a sandbox**. Its role policy, schemas and
 transition checks prevent *accidental* miscoordination: stale or duplicate wakeups, crossed jobs, unreviewed plans,
 fabricated "PASS" text, and runaway retries. They do **not** stop a deliberately non-compliant Bot.
 
@@ -17,13 +19,13 @@ A second, separate adversary is the **code under test**: the candidate revision 
 written to subvert verification. Momus round 4 showed that when the children ran as the box user without a
 filesystem sandbox, candidate code could
 P1 drop a `.pth` into the venv's site-packages (persisting into every later run),
-P2 patch `omo_grok/verifier.py` (found via `/proc/self/cmdline`), and
+P2 patch `oh_my_grok/verifier.py` (found via `/proc/self/cmdline`), and
 S1 open `state/omo.sqlite3` via `../../..`, set `jobs.phase='done'` and read `state/secrets/`.
 
 **What runs candidate code:** the unittest child, every oracle run, and every `exit_code_only` command. All of them
 run inside the sandbox below; nothing else imports or executes candidate code (the verifier parent never does).
 
-### Sandbox (`omo_grok/sandbox.py`)
+### Sandbox (`oh_my_grok/sandbox.py`)
 - Mechanism: **bubblewrap** (`/usr/bin/bwrap`, 0.12.0 on this box, unprivileged user namespaces; kernel 6.12.94+).
   No root, sudo or extra OS users. `--unshare-all` (user, mount, pid, net, ipc, uts, cgroup namespaces),
   `--die-with-parent`, `--new-session`, `--cap-drop ALL`, `--clearenv`; rlimits AS 4 GiB, FSIZE 256 MiB, no core.
@@ -35,11 +37,11 @@ run inside the sandbox below; nothing else imports or executes candidate code (t
   (own pid namespace) and a minimal `/dev`. Oracle runs additionally get a synthetic read-only `/etc`
   (passwd/group/hostname/hosts) and a private tmpfs home. Python is the system interpreter (`/usr/bin/python3.13`),
   not the venv.
-- It has **no view** of `OMO_HOME/state` (DB, secrets, artifacts), `omo_grok/`, `config/`, the venv, `/home/box`,
+- It has **no view** of `OMG_HOME/state` (DB, secrets, artifacts), `oh_my_grok/`, `config/`, the venv, `/home/box`,
   any other `/workspace` content, and **no network** (empty net namespace).
 - **Fail closed:** if bwrap is missing or cannot create namespaces, verification returns
   `no sandbox available ...; refusing to run candidate code without a sandbox (fail closed)` and never runs the
-  candidate. There is no configuration switch that disables the sandbox. `omoctl doctor` reports
+  candidate. There is no configuration switch that disables the sandbox. `omg doctor` reports
   `candidate_sandbox`. The probe also requires `bwrap --version` to exit 0 and print exactly
   `bubblewrap <major>.<minor>[.<patch>]`; anything else fails closed. Every verification record stores the mechanism
   and version in `verifications.sandbox` (e.g. `bwrap 0.12.0`, or `none` when no candidate code ran).
@@ -47,7 +49,7 @@ run inside the sandbox below; nothing else imports or executes candidate code (t
   version and execs the command passed the round-5 probe). `sandbox.namespace_self_check` now runs a tiny Python
   probe through the real `bwrap` argument set with a random nonce and requires: pid 1 inside is the bwrap init
   (`/proc/1/comm == "bwrap"`, own pid != 1 and != the host pid), the only network interface is `lo`, a fresh sentinel
-  file in the host `/tmp` and the `omo_grok/` package directory are **not** visible, `/proc/self/uid_map` is a single
+  file in the host `/tmp` and the `oh_my_grok/` package directory are **not** visible, `/proc/self/uid_map` is a single
   one-id mapping with our uid inside (not the host's `0 0 4294967295`), and the nonce comes back. Any mismatch, a
   missing report or a missing nonce fails closed (tests: an exec-through shim and a canned-JSON shim are rejected).
   **Limit:** a hostile replacement binary written against this check can fake these answers. The check catches a
@@ -66,7 +68,7 @@ run inside the sandbox below; nothing else imports or executes candidate code (t
   the verification's stderr says `scratch cleanup incomplete: N entries left in <dir>` (pass/fail is unaffected).
   Round 5 claimed cleanup without saying that 000-mode and >200-deep trees leaked; that was wrong. Tests:
   000/0o100 dirs, a 2500-deep tree, symlinks to a read-only outside directory (untouched), and the bound.
-- **Integrity tripwire:** sha256 of every file under `omo_grok/`, `config/` (and the active config dir), `omoctl`,
+- **Integrity tripwire:** sha256 of every file under `oh_my_grok/`, `config/` (and the active config dir), `omg`,
   `.venv/bin`, `.venv/pyvenv.cfg` and the venv `site-packages` is taken before and after each verification. Any
   change fails the run (`TAMPER: ...`), is stored in `verifications.tamper_json` and raises a `tamper` event. Child
   runs use a fresh per-run copy of the checkout.
@@ -95,7 +97,7 @@ Momus's H1: a candidate whose `add` returns `a+b` only when `PYTHONSAFEPATH` is 
 accepted residual. Mitigations:
 - **(a) Neutral harness.** Oracle runs bind the checkout at a random ordinary path (`/home/<user>/[code|projects/]<proj>`,
   `/srv/<proj>`, `/opt/<proj>`), with HOME=`/home/<user>`, a matching `/etc/passwd` entry and a random ordinary
-  hostname; no path, variable, file or argument contains `omo`, `verif`, `oracle`, `harness`, `sandbox`, `bwrap`,
+  hostname; no path, variable, file or argument contains `omo`, `omg`, `verif`, `oracle`, `harness`, `sandbox`, `bwrap`,
   `grok` or `probe` (asserted by tests). The candidate is imported exactly as `python3 -c 'import calc'` would:
   the program is passed with `-c` (no script path), its first statement is `import calc` (plus, in the isolated
   run only, an `sys.path.insert(0, '')` that `-P` requires), `__main__` holds only standard dunders at import time,
@@ -333,7 +335,7 @@ verifier):
 What the design does guarantee for cooperating agents:
 
 - MCP exposes only `submit, claim, context, checkpoint, complete, status, reconcile, cancel`. There is no approve,
-  waive, mark-done, verifier-off, shell or secret tool. `omoctl doctor` and the tests assert this.
+  waive, mark-done, verifier-off, shell or secret tool. `omg doctor` and the tests assert this.
 - Webhook bodies are identifier packets with a fixed schema. They are never executed or interpreted as
   instructions. Claims need the exact current `dispatch_id`. Completions need the exact live `attempt_id` within
   its lease.
@@ -341,7 +343,7 @@ What the design does guarantee for cooperating agents:
   content-addressed and confined to the job's artifact directory: traversal and symlinks are rejected, and sha256 is
   re-verified on every read.
 - The deterministic verifier runs argv lists without a shell, with an env allowlist, a timeout and protected test
-  paths. Missing or template (`OMO_VERIFY_TEMPLATE`) profiles fail closed. Every process that runs candidate code
+  paths. Missing or template (`OMG_VERIFY_TEMPLATE`, and the legacy marker `OMO_VERIFY_TEMPLATE`) profiles fail closed. Every process that runs candidate code
   is sandboxed (section above). Candidates are rejected before execution when they touch paths outside the
   profile's `editable_paths`, protected paths, interpreter/test hooks (`sitecustomize`, `usercustomize`, `.pth`,
   `conftest.py`, runner config) or add a top-level module that shadows a stdlib/verifier/site-packages name
@@ -366,18 +368,18 @@ What the design does guarantee for cooperating agents:
     `/proc/self/environ`. The design was replaced, not patched:
     - **The parent verifier never imports candidate code.** Every candidate import happens in a sandboxed child
       with a scrubbed environment (the unittest child: `-I -S -B` with PATH, LC_ALL, HOME and the profile's
-      `env_allow`/`env_set`; oracle runs: the neutral, varied environments of H1; never any `OMO_*`). No nonce, result path or other secret is passed
+      `env_allow`/`env_set`; oracle runs: the neutral, varied environments of H1; never any `OMG_*` or `OMO_*`). No nonce, result path or other secret is passed
       in env, argv or fds, so there is nothing for N1/N2/N4 to steal. Everything a child says is untrusted.
-    - **ORACLE mode (assurance `oracle`).** `omo_grok/oracles.py` (trusted tree) builds an exhaustive small grid,
-      boundary pairs and fresh SystemRandom inputs for every verification (see "Oracle coverage" above; shuffled). `omo_grok/oracle_child.py` builds the `-c` program that imports the
+    - **ORACLE mode (assurance `oracle`).** `oh_my_grok/oracles.py` (trusted tree) builds an exhaustive small grid,
+      boundary pairs and fresh SystemRandom inputs for every verification (see "Oracle coverage" above; shuffled). `oh_my_grok/oracle_child.py` builds the `-c` program that imports the
       candidate and must print `{"ready":true}`; the parent then sends **one** request at a time over stdin and generates the next only
       after the answer arrives. Each answer must be a raw JSON value; the parent checks `type(v) is int` (bool and
       float never pass) and equality with its own oracle value. The child must answer every case and exit 0. Exiting
       early, printing `VERIFIED`, forging stdout, always-equal objects and constant answers all fail, with or
       without the static scan (regression tests). An oracle is **required** for every `fixture-*` profile, at config
       load and at submit.
-    - **Advisory unittest child.** `omo_grok/unittest_child.py` runs the `expected_tests` manifest in a separate
-      child and prints one `OMO-UNITTEST-REPORT` line. It still snapshots test machinery, builtins and key stdlib
+    - **Advisory unittest child.** `oh_my_grok/unittest_child.py` runs the `expected_tests` manifest in a separate
+      child and prints one `OMG-UNITTEST-REPORT` line. It still snapshots test machinery, builtins and key stdlib
       functions as a tripwire (round-2 E). For oracle profiles the report is advisory: a missing or negative report
       fails the run, and a positive report alone does not make it pass (the oracle decides).
     - **Cooperative assurance.** A Python profile without an oracle, and every `exit_code_only` profile, is
@@ -422,7 +424,7 @@ differ from the executor's (the code reviewer and the QA Bot may be the same Bot
 Reduced assurance (non-independent review/QA) is accepted **only** when the approval for that job carries
 `accept_reduced_assurance=true`. It is never a config default (the old policy keys `require_independent_assurance`
 and `fixture_allow_reduced_assurance` were removed; a config that still sets them is rejected). Such a job's gate
-assurance starts with `REDUCED_ASSURANCE_ACCEPTED_BY_APPROVAL+`, `omoctl status` prints `!!! WARNING !!!` and
+assurance starts with `REDUCED_ASSURANCE_ACCEPTED_BY_APPROVAL+`, `omg status` prints `!!! WARNING !!!` and
 `!!! REDUCED ASSURANCE !!!` on the gate line, and the export carries an `ASSURANCE_LABEL` of `REDUCED ASSURANCE`.
 "Independent" here means separate Bots on the same account: they share this computer, so this is separation of
 duties between cooperating agents, not protection against a malicious same-account Bot.
@@ -439,13 +441,13 @@ duties between cooperating agents, not protection against a malicious same-accou
 
 ## Secrets
 - Webhook URL and key pairs live only in `state/secrets/hooks.json` (mode 0600, directory 0700). They are entered
-  through `omoctl hook set ROLE` using a hidden `getpass` prompt. They never go in argv, shell history, chat (one exception: see the 2026-11-04 disclosure below), README,
+  through `omg hook set ROLE` using a hidden `getpass` prompt. They never go in argv, shell history, chat (one exception: see the 2026-11-04 disclosure below), README,
   commits or test logs.
 - This file mode prevents **accidental disclosure** only. Any same-account Bot can still read it.
 - `hook check --probe` performs a TLS handshake only. It never POSTs and never prints the URL path or the key.
 - Never put login tokens, OAuth or session material, or webhook secrets in agent prompts, routine instructions,
   repository commits or routine outputs.
-- Rotation: run `omoctl hook set ROLE` again with the new value. Rotate the key in the routine UI first. A changed key
+- Rotation: run `omg hook set ROLE` again with the new value. Rotate the key in the routine UI first. A changed key
   shows up as `HTTP 401/403: webhook key rejected` and blocks the task until resumed.
 - **2026-11-04 disclosure (honest record):** the terminal path (`hook set`: GUI paste delivered length=0) and the
   first form attempt (`hook serve` with `Referrer-Policy: no-referrer`, so Chrome sent `Origin: null` and got 403)
@@ -457,13 +459,13 @@ duties between cooperating agents, not protection against a malicious same-accou
   engine's dispatch_id match, and the plan gate, approvals and final gate still apply. A leaked-key POST is not limited
   to those ids.
 
-### `omoctl hook serve` (local masked form)
+### `omg hook serve` (local masked form)
 - Binds `127.0.0.1` only, random port by default. Only `/setup/<token>` is served (404 otherwise, constant-time compare).
 - Token: **per-run session token**, 256 bits (`secrets.token_urlsafe(32)`). Valid for the whole server lifetime
   (reusable across requests in that run), new each run, not single-use.
 - The tokenized URL goes only to a 0600 URL file (written atomically). It is deleted on Finish, idle timeout,
   Ctrl-C (SIGINT), or SIGTERM (the serve loop installs handlers so cleanup runs). It is not printed unless
-  `--print-url` is given. The RUNBOOK redirect log (`state/logs/hook_serve.log`, or the legacy `/tmp/omo_hook_serve.log`)
+  `--print-url` is given. The RUNBOOK redirect log (`state/logs/hook_serve.log`, or the legacy `/tmp/omg_hook_serve.log`)
   is removed by the same cleanup paths when present.
 - Host must be exactly `127.0.0.1:<port>`, and Origin is either absent or exactly `http://127.0.0.1:<port>`
   (`null` refused), as a DNS-rebinding/CSRF guard.
@@ -480,7 +482,7 @@ duties between cooperating agents, not protection against a malicious same-accou
 ## Approvals: SOFT (implemented) vs STRICT (protocol only, not implemented)
 
 ### Soft/local (what this build provides)
-`omoctl approve JOB --plan-hash H` checks all of the following:
+`omg approve JOB --plan-hash H` checks all of the following:
 
 - the exact job
 - that `H` equals the canonical sha256 of the current plan revision
@@ -499,7 +501,7 @@ approval as protection against mistakes and misreads, not against a malicious ag
 
 ### Strict/external (documented protocol; NOT implemented, no authority configured)
 1. The approval authority is a key held **off the shared computer**: a user device, a hardware key, or a trusted
-   external service. No private key is ever generated or stored in `/workspace/omo`.
+   external service. No private key is ever generated or stored in `/workspace/omg`.
 2. The engine emits an approval request: `{job_id, plan_hash, requirements_hash, repo, scope, nonce, expires_at}`.
 3. The user signs that canonical JSON on their own device (for example with an Ed25519 key, or a minisign or
    ssh-keygen `-Y sign` namespace `omo-approval`).
@@ -510,13 +512,13 @@ approval as protection against mistakes and misreads, not against a malicious ag
    independently trusted CI with credentials that Bots do not hold.
 
 Because no external authority is configured, the engine **fails closed** on production merge or deploy. Approval
-scope always records `production_merge_or_deploy: false`, and omo-grok never pushes, merges or deploys.
+scope always records `production_merge_or_deploy: false`, and oh-my-grok never pushes, merges or deploys.
 
 ## Auto Review recommendation (user action; not verified by this build)
 In Grok Bot settings, add a personal Auto Review **Ask first** rule covering:
 
-- edits under `/workspace/omo/config/`, `/workspace/omo/state/` and `/workspace/omo/omo_grok/`
-- running `omoctl approve`, `omoctl hook set`, `omoctl restore` and `omoctl roles bind`
+- edits under `/workspace/omg/config/`, `/workspace/omg/state/` and `/workspace/omg/oh_my_grok/`
+- running `omg approve`, `omg hook set`, `omg restore` and `omg roles bind`
 - enabling or creating routines
 - `git push`
 

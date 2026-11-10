@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 @pytest.fixture
-def omo_home(tmp_path, monkeypatch):
+def omg_home(tmp_path, monkeypatch):
     """Isolated runtime root + config dir per test (never touches the real state/)."""
     home = tmp_path / "home"
     cfg = tmp_path / "config"
@@ -20,14 +20,15 @@ def omo_home(tmp_path, monkeypatch):
     for f in ("verifiers.json", "bots.json"):
         shutil.copy(CODE_ROOT / "config" / f, cfg / f)
     (cfg / "policy.json").write_text(json.dumps({"backoff_base_seconds": 10, "backoff_cap_seconds": 120}))
-    monkeypatch.setenv("OMO_HOME", str(home))
-    monkeypatch.setenv("OMO_CONFIG_DIR", str(cfg))
+    monkeypatch.setenv("OMG_HOME", str(home))
+    monkeypatch.setenv("OMG_CONFIG_DIR", str(cfg))
+    monkeypatch.delenv("OMG_ALLOW_INSECURE_HOOKS", raising=False)
     monkeypatch.delenv("OMO_ALLOW_INSECURE_HOOKS", raising=False)
     return home
 
 
 @pytest.fixture
-def harness(omo_home):
+def harness(omg_home):
     from helpers import Harness
     h = Harness()
     yield h
