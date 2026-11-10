@@ -3,9 +3,9 @@ import sqlite3
 
 import pytest
 
-from omo_grok import db
-from omo_grok.errors import Conflict
-from omo_grok.states import (DISPATCH_STATUSES, JOB_PHASES, TASK_STATUSES, check_dispatch, check_job,
+from oh_my_grok import db
+from oh_my_grok.errors import Conflict
+from oh_my_grok.states import (DISPATCH_STATUSES, JOB_PHASES, TASK_STATUSES, check_dispatch, check_job,
                              check_task)
 
 
@@ -65,7 +65,7 @@ def test_tx_rolls_back_on_error(tmp_path):
     assert c.execute("SELECT COUNT(*) FROM hooks_meta").fetchone()[0] == 0
 
 
-# Expected allowed transitions, written out independently of omo_grok.states so that any accidental widening
+# Expected allowed transitions, written out independently of oh_my_grok.states so that any accidental widening
 # (or narrowing) of the engine's table fails this test. Every other (src, dst) pair must raise Conflict.
 _TASK_OK = {
     "queued": {"dispatched", "awaiting_resume", "blocked", "cancelled"},
@@ -147,7 +147,7 @@ def test_backup_and_restore_roundtrip(harness, tmp_path):
         e.conn.execute("DELETE FROM events")
     e.close()
     db.restore(bk, e.paths.db_path)
-    from omo_grok.engine import Engine
+    from oh_my_grok.engine import Engine
     e2 = Engine(transport=harness.transport, clock=harness.clock)
     after = e2.status(job)
     assert after["phase"] == before["phase"] and after["counts"] == before["counts"]
@@ -163,15 +163,15 @@ def test_backup_and_restore_roundtrip(harness, tmp_path):
 def test_restore_rejects_corrupt_backup(tmp_path):
     bad = tmp_path / "bad.sqlite3"
     bad.write_bytes(b"SQLite format 3\x00" + b"\xff" * 4000)
-    from omo_grok.errors import IntegrityError_
+    from oh_my_grok.errors import IntegrityError_
     with pytest.raises(IntegrityError_):
         db.restore(bad, tmp_path / "target.sqlite3")
     assert not (tmp_path / "target.sqlite3").exists() or (tmp_path / "target.sqlite3").stat().st_size == 0
 
 
-def test_auto_backup_before_migrating_nonempty_db(omo_home):
-    from omo_grok.engine import Engine
-    from omo_grok.paths import get_paths
+def test_auto_backup_before_migrating_nonempty_db(omg_home):
+    from oh_my_grok.engine import Engine
+    from oh_my_grok.paths import get_paths
     p = get_paths()
     p.ensure()
     c = db.connect(p.db_path)
@@ -201,7 +201,7 @@ def test_item18_injected_migration_failure_keeps_prior_version(tmp_path, monkeyp
 _SLOW_MIGRATOR = r"""
 import sys
 sys.path.insert(0, sys.argv[2])
-from omo_grok import db
+from oh_my_grok import db
 c = db.connect(sys.argv[1])
 slow = (db.LATEST_VERSION + 1, "slow",
         "CREATE TABLE big AS WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<300000000) "

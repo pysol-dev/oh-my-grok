@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from omo_grok import fixture as fx
-from omo_grok.errors import Conflict, GateRefused, ValidationError
+from oh_my_grok import fixture as fx
+from oh_my_grok.errors import Conflict, GateRefused, ValidationError
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -49,7 +49,7 @@ def test_item3_artifact_flow_metis_plan_executor(harness):
     rev = ipkt["plan_revision"]
     texts = [open(a["path"]).read() for a in ipkt["input_artifacts"] if a["kind"] == "plan_canonical"]
     assert texts == ["THE APPROVED PLAN\n"]
-    assert ipkt["worktree_root"] and ipkt["branch"].startswith("omo/") and ipkt["base_revision"]
+    assert ipkt["worktree_root"] and ipkt["branch"].startswith("omg/") and ipkt["base_revision"]
     for f in ["schema_version", "job_id", "task_id", "attempt_id", "dispatch_id", "role", "goal", "task_objective",
               "allowed_actions", "prohibited_actions", "read_only", "repo_root", "worktree_root", "base_revision",
               "input_artifacts", "acceptance_criteria", "output_schema", "deadline_or_lease", "retry_budget",
@@ -200,7 +200,7 @@ def test_item11_approve_wrong_phase_and_synthetic_only_for_fixture(harness, tmp_
     job = harness.submit()["job_id"]
     with pytest.raises(GateRefused):
         e.approve(job, "a" * 64, actor="h", evidence="x")
-    from omo_grok import fixture as fx
+    from oh_my_grok import fixture as fx
     repo = tmp_path / "realrepo"
     fx.make_repo(repo)
     real = e.submit("real goal", "real-key-0001", repo=str(repo))
@@ -281,7 +281,7 @@ def test_item14_review_and_qa_can_reject_passing_build(harness):
     assert harness.task(job, "qa")["status"] == "cancelled"  # stale sibling superseded
     pkt = harness.claim(job, "implement")
     assert pkt["cycle"] == 2 and pkt["relevant_prior_failures"]
-    from omo_grok import fixture as fx
+    from oh_my_grok import fixture as fx
     from pathlib import Path
     wt = Path(pkt["worktree_root"])
     (wt / "calc" / "review_notes.py").write_text('"""addressed review"""\n')  # source-only: .md is not allowed
@@ -309,7 +309,7 @@ def test_item15_old_pass_cannot_approve_new_commit(harness):
     e.complete(job, pkt["task_id"], pkt["attempt_id"], {"verdict": "accept", "revision": sha1, "findings": []})
     harness.review(job, "qa")
     # someone moves the branch after reviews (new unreviewed commit) before the final gate
-    from omo_grok import fixture as fx
+    from oh_my_grok import fixture as fx
     from pathlib import Path
     wt = Path(e.status(job)["worktree"])
     (wt / "calc" / "__init__.py").write_text("def add(a, b):\n    return 0\n")
@@ -396,7 +396,7 @@ def _append_constant(wt):
 
 
 def _real_repo_coop(harness, tmp_path):
-    from omo_grok.config import load_verifier_profiles, validate_profile
+    from oh_my_grok.config import load_verifier_profiles, validate_profile
     e = harness.e
     repo = tmp_path / "realrepo"
     fx.make_repo(repo)
@@ -432,7 +432,7 @@ def test_real_repo_same_bot_executor_refused_unless_reduced_assurance_accepted(h
 
 
 def db_tx(e):
-    return __import__("omo_grok.db", fromlist=["tx"]).tx(e.conn)
+    return __import__("oh_my_grok.db", fromlist=["tx"]).tx(e.conn)
 
 
 def test_item19_cancelled_and_blocked_jobs_do_not_dispatch(harness):
@@ -452,7 +452,7 @@ def test_item19_cancelled_and_blocked_jobs_do_not_dispatch(harness):
     # blocked job: nothing dispatches until explicit resume
     j2 = harness.submit()["job_id"]
     t = harness.task(j2, "explore")
-    with __import__("omo_grok.db", fromlist=["tx"]).tx(e.conn):
+    with __import__("oh_my_grok.db", fromlist=["tx"]).tx(e.conn):
         e._block_task(t, "test block")
     assert e.status(j2)["phase"] == "blocked"
     research = harness.task(j2, "research")
@@ -471,7 +471,7 @@ def test_mcp_cancel_of_real_work_requires_human(harness, tmp_path):
     job = harness.submit()["job_id"]
     harness.to_approval(job)
     harness.approve(job)
-    with __import__("omo_grok.db", fromlist=["tx"]).tx(e.conn):
+    with __import__("oh_my_grok.db", fromlist=["tx"]).tx(e.conn):
         e.conn.execute("UPDATE jobs SET mode='implement' WHERE id=?", (job,))
     r = e.cancel(job, "agent wants to stop", actor="mcp")
     assert r.get("requires_human_confirmation") and e.status(job)["phase"] == "running"
@@ -514,9 +514,9 @@ def test_role_binding_rules(harness):
 
 def test_cancel_confirmation_checked_inside_write_txn_race_with_approval(harness, monkeypatch):
     """A concurrent approval landing between MCP cancel's start and its write lock must still force confirmation."""
-    from omo_grok import db as dbmod
-    from omo_grok import engine as engmod
-    from omo_grok.engine import Engine
+    from oh_my_grok import db as dbmod
+    from oh_my_grok import engine as engmod
+    from oh_my_grok.engine import Engine
     e = harness.e
     job = harness.submit()["job_id"]
     ph = harness.to_approval(job)
@@ -567,7 +567,7 @@ def test_item9_approval_of_rev_a_cannot_authorize_rev_b_implementation(harness):
         e.approve(job, ha, actor="human", evidence="x")
     assert harness.task(job, "implement") is None  # nothing to claim: no implementation without B's approval
     # forge an implement task for B (as if scheduled by mistake): the claim is refused by the approval gate
-    from omo_grok import db
+    from oh_my_grok import db
     with db.tx(e.conn):
         tid = e._new_task(job, "implement")
         e._schedule(job)
@@ -586,7 +586,7 @@ def test_item9_approval_of_rev_a_cannot_authorize_rev_b_implementation(harness):
 
 def test_item9_late_plan_submission_while_running_is_refused(harness):
     """After approval starts implementation, a late planner submission cannot swap in a new revision."""
-    from omo_grok import db
+    from oh_my_grok import db
     e = harness.e
     job = harness.submit()["job_id"]
     harness.approve(job, harness.to_approval(job, "PLAN REV A"))
@@ -605,7 +605,7 @@ def test_item9_late_plan_submission_while_running_is_refused(harness):
 def test_item9_plan_change_while_implementer_working_rejects_claim_and_submit(harness):
     """Engine plan-change revocation: even a task that slipped past cancellation (dispatched or working) is refused at
     claim AND at complete once the approval no longer matches the current plan revision."""
-    from omo_grok import db
+    from oh_my_grok import db
     e = harness.e
     job = harness.submit()["job_id"]
     harness.approve(job, harness.to_approval(job, "PLAN REV A"))
@@ -645,7 +645,7 @@ def _to_reviews(harness):
 def test_review_and_qa_claims_are_approval_gated(harness, kind, how):
     """code_review and qa claims are refused unless the approval of the CURRENT plan revision is live and the task is
     bound to that revision; a refused claim changes nothing."""
-    from omo_grok import db
+    from oh_my_grok import db
     e = harness.e
     job = _to_reviews(harness)
     t = harness.task(job, kind)
@@ -677,7 +677,7 @@ def test_plan_bound_tasks_always_carry_a_plan_revision(harness):
 
 
 def test_implement_packet_fails_closed_without_plan_revision(harness):
-    from omo_grok import db
+    from oh_my_grok import db
     e = harness.e
     job = harness.submit()["job_id"]
     harness.approve(job, harness.to_approval(job))
@@ -722,7 +722,7 @@ def test_cooperative_verifier_requires_code_review_and_qa_on_same_revision(harne
     fv = {"status": "passed", "detail": "x", "assurance": "cooperative"}
     ok, checks, assurance = e.gate_checks(job, fv)
     assert "+verifier_cooperative" in assurance and checks["cooperative_verifier_backed_by_code_review_and_qa"]["ok"]
-    from omo_grok import db
+    from oh_my_grok import db
     with db.tx(e.conn):
         e.conn.execute("UPDATE reviews SET invalidated=1 WHERE job_id=? AND type='qa'", (job,))
     ok, checks, _ = e.gate_checks(job, fv)

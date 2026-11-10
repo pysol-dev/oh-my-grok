@@ -17,7 +17,7 @@ semantics, a real LSP diagnostics gate, engine-proven tool evidence (LSP, Contex
 
 - `spec/IMPLEMENTATION.md` byte-identical (sha256 `9643ee06...0d30ae`).
 - No secrets in logs, status, receipts, artifacts, or fixtures. Never read, rotate, or print keys.
-- No `/workspace/omo` in shipped code, tests, or config (SUP-8).
+- No `/workspace/omg` in shipped code, tests, or config (SUP-8).
 - Never run candidate code outside the sandbox. Never `sudo` in bootstrap. No merge or deploy.
 - Feature modes default `off`; tests that need behaviour set `enforce` explicitly.
 - Status stays NOT OPERATIONAL until the original s13 live evidence exists.
@@ -28,29 +28,29 @@ semantics, a real LSP diagnostics gate, engine-proven tool evidence (LSP, Contex
 | Path | Responsibility |
 |---|---|
 | `spec/ADAPTIVE.md` | the sibling spec (this plan implements it) |
-| `omo_grok/features.py` | feature modes, validation, per-job freeze |
-| `omo_grok/roster.py` | intent, scope attestation, floor, task sets, escalation rules (pure functions) |
-| `omo_grok/projection.py` | boulder + active plan renderer and the locked atomic writer |
-| `omo_grok/receipts.py` | `tool_receipts` insertion helpers and evidence level constants |
-| `omo_grok/lsp/{client,profiles,runner,delta}.py` | JSON-RPC client, profile loading, sandboxed run with canary, delta |
-| `omo_grok/context7.py` | Context7 MCP client wrapper producing receipts |
-| `omo_grok/skills.py` | skill pack loading and hashing |
+| `oh_my_grok/features.py` | feature modes, validation, per-job freeze |
+| `oh_my_grok/roster.py` | intent, scope attestation, floor, task sets, escalation rules (pure functions) |
+| `oh_my_grok/projection.py` | boulder + active plan renderer and the locked atomic writer |
+| `oh_my_grok/receipts.py` | `tool_receipts` insertion helpers and evidence level constants |
+| `oh_my_grok/lsp/{client,profiles,runner,delta}.py` | JSON-RPC client, profile loading, sandboxed run with canary, delta |
+| `oh_my_grok/context7.py` | Context7 MCP client wrapper producing receipts |
+| `oh_my_grok/skills.py` | skill pack loading and hashing |
 | `skills/git-master/SKILL.md` | executor skill text |
 | `config/lsp.json` | LSP profiles (python, typescript) |
 | `scripts/bootstrap.sh`, `requirements-tools.lock`, `tools/node/package*.json` | reproducible tool install |
-| `omo_grok/db.py` | migration v5 (new tables and columns) |
-| `omo_grok/engine.py` | calls into the new modules; `escalate`, `docs`, projection flush, gate checks |
-| `omo_grok/mcp_server.py`, `omo_grok/cli.py` | new tools and commands |
-| `agents/hephaestus-omo.md`, `routines/*.md` | instruction updates |
+| `oh_my_grok/db.py` | migration v5 (new tables and columns) |
+| `oh_my_grok/engine.py` | calls into the new modules; `escalate`, `docs`, projection flush, gate checks |
+| `oh_my_grok/mcp_server.py`, `oh_my_grok/cli.py` | new tools and commands |
+| `agents/hephaestus-omg.md`, `routines/*.md` | instruction updates |
 | `tests/...` | per stage, listed below |
 
 ## Stage 0: spec, plan, relocation baseline
 
 - [x] 0.1 Write `spec/ADAPTIVE.md` and this plan; `tests/unit/test_spec_integrity.py` hashes the original spec.
-- [x] 0.2 RED: `tests/unit/test_relocation.py` asserts no shipped file contains `/workspace/omo` and that
-  `load_verifier_profiles` expands `${OMO_PYTHON}` / `${OMO_CODE_ROOT}`. Run: fails.
+- [x] 0.2 RED: `tests/unit/test_relocation.py` asserts no shipped file contains `/workspace/omg` and that
+  `load_verifier_profiles` expands `${OMG_PYTHON}` / `${OMG_CODE_ROOT}`. Run: fails.
 - [x] 0.3 GREEN: placeholder expansion in `config.py`; `config/verifiers.json`, `config/mcp-command.txt`,
-  `omoctl`, tests, docs updated; `omoctl mcp-command` prints the computed command; `scripts/bootstrap.sh`.
+  `omg`, tests, docs updated; `omg mcp-command` prints the computed command; `scripts/bootstrap.sh`.
 - [x] 0.4 Verify: `tests/unit/test_verifier.py` (previously 67 failures in a relocated checkout) passes.
 - [x] 0.5 Commit.
 
@@ -102,7 +102,7 @@ semantics, a real LSP diagnostics gate, engine-proven tool evidence (LSP, Contex
 ## Stage 4: evidence, Context7, git-master
 
 - [x] 4.1 RED `tests/unit/test_context7.py` against a local MCP server (real protocol), covering receipt contents,
-  failure to connect, key never logged; `tests/integration/test_context7_live.py` (opt-in `OMO_LIVE_CONTEXT7=1`)
+  failure to connect, key never logged; `tests/integration/test_context7_live.py` (opt-in `OMG_LIVE_CONTEXT7=1`)
   stores `docs/evidence/context7-live-*.json`.
 - [x] 4.2 RED `tests/integration/test_evidence.py`: fabricated receipt ids, fabricated quotes, agent-claimed evidence,
   `complete` payloads naming receipts, missing receipts under `enforce` all fail; skill pack hash recorded on claim;
@@ -114,7 +114,7 @@ semantics, a real LSP diagnostics gate, engine-proven tool evidence (LSP, Contex
 
 - [x] 5.1 MCP tools `escalate`, `docs`; `submit` arguments; `tests/integration/test_mcp_stdio.py` updated.
 - [x] 5.2 CLI: `lsp`, `boulder`, `features`, `mcp-command`, `docs`, `receipts`, `attest`; `doctor` derives its verdict.
-- [x] 5.3 Instructions: `agents/hephaestus-omo.md`, executor, librarian, explorer, reconcile routines (versioned).
+- [x] 5.3 Instructions: `agents/hephaestus-omg.md`, executor, librarian, explorer, reconcile routines (versioned).
 - [x] 5.4 Docs: ARCHITECTURE, SECURITY, RUNBOOK, MIGRATION, README, PROGRESS.
 - [x] 5.5 Verify and commit.
 
@@ -132,7 +132,7 @@ semantics, a real LSP diagnostics gate, engine-proven tool evidence (LSP, Contex
 ## Final verification (every stage re-run)
 
 ```
-OMO_REQUIRE_TOOLS=1 .venv/bin/python -m pytest -q
+OMG_REQUIRE_TOOLS=1 .venv/bin/python -m pytest -q
 ```
 Record counts, exit codes, durations in `docs/evidence/test-run-*.txt`.
 

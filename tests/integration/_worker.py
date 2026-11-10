@@ -8,9 +8,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from omo_grok.engine import Engine  # noqa: E402
-from omo_grok.errors import OmoError  # noqa: E402
-from omo_grok.transport import HttpResult, post_json  # noqa: E402
+from oh_my_grok.engine import Engine  # noqa: E402
+from oh_my_grok.errors import OmgError  # noqa: E402
+from oh_my_grok.transport import HttpResult, post_json  # noqa: E402
 
 RESULTS = {
     "explore": ({"repo_map": "calc", "files": [], "tests": [], "constraints": [], "questions": []},
@@ -46,7 +46,7 @@ def main():
             res, refs = RESULTS[sys.argv[7]]
             r = e.complete(job, task, pkt["attempt_id"], res, refs)
             out["completed"] = r["task_status"]
-    except OmoError as ex:
+    except OmgError as ex:
         out["error"] = type(ex).__name__
     print(json.dumps(out), flush=True)
 

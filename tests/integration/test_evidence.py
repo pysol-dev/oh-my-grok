@@ -11,9 +11,9 @@ from pathlib import Path
 
 import pytest
 
-from omo_grok import fixture as fx
-from omo_grok import gitops, skills
-from omo_grok.errors import GateRefused, ValidationError
+from oh_my_grok import fixture as fx
+from oh_my_grok import gitops, skills
+from oh_my_grok.errors import GateRefused, ValidationError
 
 FAKE = str(Path(__file__).resolve().parents[1] / "unit" / "fake_context7.py")
 QUOTE = "Widget.configure(retries=3) sets the retry count."
@@ -46,7 +46,7 @@ def c7(tmp_path):
 
 
 def configure(features, url=None):
-    cfg = Path(os.environ["OMO_CONFIG_DIR"])
+    cfg = Path(os.environ["OMG_CONFIG_DIR"])
     pol = json.loads((cfg / "policy.json").read_text())
     pol["features"] = features
     if url:
@@ -90,7 +90,7 @@ def new_job(h):
 
 
 # ----------------------------------------------------------------------------------------- Context7 receipts
-def test_docs_refused_when_feature_off(omo_home):
+def test_docs_refused_when_feature_off(omg_home):
     h = mkh({})
     try:
         job = h.submit()["job_id"]
@@ -101,7 +101,7 @@ def test_docs_refused_when_feature_off(omo_home):
         h.close()
 
 
-def test_engine_fetch_creates_executed_receipt_with_stored_transcript(omo_home, c7):
+def test_engine_fetch_creates_executed_receipt_with_stored_transcript(omg_home, c7):
     h = mkh({"docs_evidence": "enforce"}, c7())
     try:
         job = new_job(h)
@@ -118,7 +118,7 @@ def test_engine_fetch_creates_executed_receipt_with_stored_transcript(omo_home, 
         h.close()
 
 
-def test_failed_fetch_returns_error_and_a_receipt_that_cannot_be_cited(omo_home, c7):
+def test_failed_fetch_returns_error_and_a_receipt_that_cannot_be_cited(omg_home, c7):
     h = mkh({"docs_evidence": "enforce"}, c7("error_query"))
     try:
         job = new_job(h)
@@ -132,7 +132,7 @@ def test_failed_fetch_returns_error_and_a_receipt_that_cannot_be_cited(omo_home,
         h.close()
 
 
-def test_unreachable_endpoint_fails_without_evidence(omo_home):
+def test_unreachable_endpoint_fails_without_evidence(omg_home):
     h = mkh({"docs_evidence": "enforce"}, "http://127.0.0.1:9/mcp")
     try:
         job = new_job(h)
@@ -142,7 +142,7 @@ def test_unreachable_endpoint_fails_without_evidence(omo_home):
         h.close()
 
 
-def test_docs_budget_per_job(omo_home, c7):
+def test_docs_budget_per_job(omg_home, c7):
     h = mkh({"docs_evidence": "enforce"}, c7())
     try:
         job = new_job(h)
@@ -155,7 +155,7 @@ def test_docs_budget_per_job(omo_home, c7):
 
 
 # ----------------------------------------------------------------------------------------- citations
-def test_valid_citation_is_reverified_and_research_passes(omo_home, c7):
+def test_valid_citation_is_reverified_and_research_passes(omg_home, c7):
     h = mkh({"docs_evidence": "enforce"}, c7())
     try:
         job = new_job(h)
@@ -176,7 +176,7 @@ def test_valid_citation_is_reverified_and_research_passes(omo_home, c7):
     ("fabricated quote", "REAL+fake quote"),
     ("quote too short", "REAL+short"),
 ])
-def test_missing_or_fabricated_evidence_fails_under_enforce(omo_home, c7, why, citations):
+def test_missing_or_fabricated_evidence_fails_under_enforce(omg_home, c7, why, citations):
     h = mkh({"docs_evidence": "enforce"}, c7())
     try:
         job = new_job(h)
@@ -195,7 +195,7 @@ def test_missing_or_fabricated_evidence_fails_under_enforce(omo_home, c7, why, c
         h.close()
 
 
-def test_receipt_from_another_job_cannot_be_cited(omo_home, c7):
+def test_receipt_from_another_job_cannot_be_cited(omg_home, c7):
     h = mkh({"docs_evidence": "enforce"}, c7())
     try:
         other = new_job(h)
@@ -208,7 +208,7 @@ def test_receipt_from_another_job_cannot_be_cited(omo_home, c7):
         h.close()
 
 
-def test_forged_lower_level_receipt_cannot_be_cited(omo_home, c7):
+def test_forged_lower_level_receipt_cannot_be_cited(omg_home, c7):
     h = mkh({"docs_evidence": "enforce"}, c7())
     try:
         job = new_job(h)
@@ -220,7 +220,7 @@ def test_forged_lower_level_receipt_cannot_be_cited(omo_home, c7):
         h.close()
 
 
-def test_tampered_stored_transcript_cannot_back_a_citation(omo_home, c7):
+def test_tampered_stored_transcript_cannot_back_a_citation(omg_home, c7):
     h = mkh({"docs_evidence": "enforce"}, c7())
     try:
         job = new_job(h)
@@ -237,7 +237,7 @@ def test_tampered_stored_transcript_cannot_back_a_citation(omo_home, c7):
         h.close()
 
 
-def test_shadow_mode_records_invalid_citations_without_blocking(omo_home, c7):
+def test_shadow_mode_records_invalid_citations_without_blocking(omg_home, c7):
     h = mkh({"docs_evidence": "shadow"}, c7())
     try:
         job = new_job(h)
@@ -250,7 +250,7 @@ def test_shadow_mode_records_invalid_citations_without_blocking(omo_home, c7):
         h.close()
 
 
-def test_off_mode_ignores_citations_entirely(omo_home):
+def test_off_mode_ignores_citations_entirely(omg_home):
     h = mkh({})
     try:
         job = new_job(h)
@@ -261,7 +261,7 @@ def test_off_mode_ignores_citations_entirely(omo_home):
         h.close()
 
 
-def test_not_applicable_research_refused_for_external_api_jobs(omo_home):
+def test_not_applicable_research_refused_for_external_api_jobs(omg_home):
     from helpers import Harness
     configure({"docs_evidence": "enforce", "adaptive_roster": "enforce"})
     h = Harness()
@@ -282,11 +282,11 @@ def trailer_fix(job, trailer=True, extra_commits=0):
     def f(wt):
         p = wt / "calc" / "__init__.py"
         p.write_text(p.read_text().replace(fx.FIX_FROM, fx.FIX_TO).replace(fx.FAKE_LINES, ""))
-        msg = "fix add()" + (f"\n\nOmo-Job: {job}" if trailer else "")
+        msg = "fix add()" + (f"\n\nOmg-Job: {job}" if trailer else "")
         sha = fx.commit_all(wt, msg)
         for i in range(extra_commits):
             p.write_text(p.read_text() + f"# note {i}\n")
-            sha = fx.commit_all(wt, f"note {i}\n\nOmo-Job: {job}")
+            sha = fx.commit_all(wt, f"note {i}\n\nOmg-Job: {job}")
         return sha
     return f
 
@@ -305,7 +305,7 @@ def run_to_gate(h, job, fix):
     return h.e._one("SELECT * FROM gate_results WHERE job_id=? ORDER BY created_at DESC LIMIT 1", (job,))
 
 
-def test_packet_carries_skill_pack_and_delivery_is_recorded_as_delivered_only(omo_home):
+def test_packet_carries_skill_pack_and_delivery_is_recorded_as_delivered_only(omg_home):
     h = mkh({"git_discipline": "enforce"})
     try:
         job = h.submit()["job_id"]
@@ -313,7 +313,7 @@ def test_packet_carries_skill_pack_and_delivery_is_recorded_as_delivered_only(om
         h.approve(job)
         pkt = h.claim(job, "implement")
         pack = pkt["skill_pack"]
-        assert [s["name"] for s in pack] == ["git-master"] and pkt["commit_trailer"] == f"Omo-Job: {job}"
+        assert [s["name"] for s in pack] == ["git-master"] and pkt["commit_trailer"] == f"Omg-Job: {job}"
         assert pack[0]["sha256"] == skills.load("git-master")["sha256"]
         row = receipts_of(h, job, "skill_pack")[0]
         assert row["level"] == "engine_delivered" and row["output_sha256"] == skills.pack_hash(pack)
@@ -322,7 +322,7 @@ def test_packet_carries_skill_pack_and_delivery_is_recorded_as_delivered_only(om
         h.close()
 
 
-def test_off_mode_packet_has_no_skill_pack(omo_home):
+def test_off_mode_packet_has_no_skill_pack(omg_home):
     h = mkh({})
     try:
         job = h.submit()["job_id"]
@@ -334,7 +334,7 @@ def test_off_mode_packet_has_no_skill_pack(omo_home):
         h.close()
 
 
-def test_conforming_history_passes_final_gate_and_receipt_is_executed(omo_home):
+def test_conforming_history_passes_final_gate_and_receipt_is_executed(omg_home):
     h = mkh({"git_discipline": "enforce"})
     try:
         job = h.submit()["job_id"]
@@ -348,7 +348,7 @@ def test_conforming_history_passes_final_gate_and_receipt_is_executed(omo_home):
         h.close()
 
 
-def test_missing_trailer_fails_final_gate(omo_home):
+def test_missing_trailer_fails_final_gate(omg_home):
     h = mkh({"git_discipline": "enforce"})
     try:
         job = h.submit()["job_id"]
@@ -360,7 +360,7 @@ def test_missing_trailer_fails_final_gate(omo_home):
         h.close()
 
 
-def test_too_many_commits_fails_final_gate(omo_home):
+def test_too_many_commits_fails_final_gate(omg_home):
     h = mkh({"git_discipline": "enforce"})
     try:
         h.e.policy["git_max_commits"] = 2
@@ -372,7 +372,7 @@ def test_too_many_commits_fails_final_gate(omo_home):
         h.close()
 
 
-def test_rewritten_repair_is_refused_and_fails_the_history_gate(omo_home):
+def test_rewritten_repair_is_refused_and_fails_the_history_gate(omg_home):
     """A repair that resets to the base and re-commits does not descend from the rejected candidate.
     40d2645 accepted it and the final gate passed."""
     h = mkh({"git_discipline": "enforce"})
@@ -391,7 +391,7 @@ def test_rewritten_repair_is_refused_and_fails_the_history_gate(omo_home):
         def rewrite(path):
             src = path / "calc" / "__init__.py"
             src.write_text(src.read_text().replace(fx.FIX_FROM, fx.FIX_TO) + "\n# rewritten history\n")
-            return fx.commit_all(path, f"rewritten\n\nOmo-Job: {job}")
+            return fx.commit_all(path, f"rewritten\n\nOmg-Job: {job}")
 
         sha2 = rewrite(wt)
         assert sha2 != sha1 and gitops.is_ancestor(wt, sha1, sha2) is False
@@ -412,7 +412,7 @@ def test_rewritten_repair_is_refused_and_fails_the_history_gate(omo_home):
         h.close()
 
 
-def test_repair_that_extends_the_rejected_candidate_passes_the_gate(omo_home):
+def test_repair_that_extends_the_rejected_candidate_passes_the_gate(omg_home):
     h = mkh({"git_discipline": "enforce"})
     try:
         job = h.submit()["job_id"]
@@ -424,7 +424,7 @@ def test_repair_that_extends_the_rejected_candidate_passes_the_gate(omo_home):
         def extend(wt):
             p = wt / "calc" / "__init__.py"
             p.write_text(p.read_text() + "# repair on top\n")
-            return fx.commit_all(wt, f"repair on top\n\nOmo-Job: {job}")
+            return fx.commit_all(wt, f"repair on top\n\nOmg-Job: {job}")
 
         h.implement(job, fix=extend)
         h.review(job, "code_review")
@@ -436,7 +436,7 @@ def test_repair_that_extends_the_rejected_candidate_passes_the_gate(omo_home):
         h.close()
 
 
-def test_shadow_records_history_but_does_not_gate(omo_home):
+def test_shadow_records_history_but_does_not_gate(omg_home):
     h = mkh({"git_discipline": "shadow"})
     try:
         job = h.submit()["job_id"]
@@ -447,7 +447,7 @@ def test_shadow_records_history_but_does_not_gate(omo_home):
         h.close()
 
 
-def test_forged_lower_level_history_receipt_does_not_satisfy_gate(omo_home):
+def test_forged_lower_level_history_receipt_does_not_satisfy_gate(omg_home):
     h = mkh({"git_discipline": "enforce"})
     try:
         job = h.submit()["job_id"]
@@ -486,12 +486,12 @@ def test_history_shape_detects_merge_commits(repo):
     g("checkout", "-qb", "side")
     (r / "s").write_text("s")
     g("add", "-A")
-    g("commit", "-qm", "side\n\nOmo-Job: J1")
+    g("commit", "-qm", "side\n\nOmg-Job: J1")
     g("checkout", "-q", "main")
     (r / "m").write_text("m")
     g("add", "-A")
-    g("commit", "-qm", "main\n\nOmo-Job: J1")
-    g("merge", "-q", "--no-ff", "-m", "merge\n\nOmo-Job: J1", "side")
+    g("commit", "-qm", "main\n\nOmg-Job: J1")
+    g("merge", "-q", "--no-ff", "-m", "merge\n\nOmg-Job: J1", "side")
     shape = gitops.history_shape(r, base, g("rev-parse", "HEAD"), "J1", 50)
     assert shape["merge_commits"] and not shape["ok"]
 
@@ -501,6 +501,15 @@ def test_history_shape_trailer_must_name_this_job(repo):
     base = g("rev-parse", "HEAD")
     (r / "x").write_text("x")
     g("add", "-A")
-    g("commit", "-qm", "x\n\nOmo-Job: OTHER")
+    g("commit", "-qm", "x\n\nOmg-Job: OTHER")
     assert gitops.history_shape(r, base, g("rev-parse", "HEAD"), "J1", 50)["missing_trailer"]
     assert gitops.history_shape(r, base, g("rev-parse", "HEAD"), "OTHER", 50)["ok"]
+
+
+def test_history_shape_accepts_legacy_omo_job_trailer(repo):
+    r, g = repo
+    base = g("rev-parse", "HEAD")
+    (r / "y").write_text("y")
+    g("add", "-A")
+    g("commit", "-qm", "y\n\nOmo-Job: J1")
+    assert gitops.history_shape(r, base, g("rev-parse", "HEAD"), "J1", 50)["ok"]

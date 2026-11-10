@@ -1,5 +1,5 @@
 """Run a real language server over a git revision inside the same bwrap sandbox as candidate code (no network,
-HOME=/tmp, nothing of OMO_HOME visible) and turn its diagnostics into a verdict (spec/ADAPTIVE.md section 7).
+HOME=/tmp, nothing of OMG_HOME visible) and turn its diagnostics into a verdict (spec/ADAPTIVE.md section 7).
 
 Everything here fails closed: anything that stops us obtaining a *trusted* answer raises ``Unavailable`` and the
 caller must treat that as a failed/blocked gate, never as a clean result."""
@@ -222,7 +222,7 @@ class Session:
         c.start()
         try:
             res = c.request("initialize", {
-                "processId": None, "rootUri": f"file://{WORK}", "clientInfo": {"name": "omo-grok"},
+                "processId": None, "rootUri": f"file://{WORK}", "clientInfo": {"name": "oh-my-grok"},
                 "workspaceFolders": [{"uri": f"file://{WORK}", "name": "work"}], "capabilities": CLIENT_CAPS,
                 "initializationOptions": self.profile["init_options"] or None,
             }, timeout=self._left(self.profile["startup_timeout_seconds"]))
@@ -439,13 +439,13 @@ def evaluate(repo: Path, base: str, cand: str, cfg: dict, sbx: sandbox.Probe, sc
 
 def canary_all(cfg: dict, sbx: sandbox.Probe, scratch: Path, only: list[str] | None = None) -> dict:
     """Run only the canary of each enabled profile against a throwaway one-commit repository. This is what
-    `omoctl lsp canary` reports: whether each server can really find a planted defect on THIS machine."""
+    `omg lsp canary` reports: whether each server can really find a planted defect on THIS machine."""
     scratch.mkdir(parents=True, exist_ok=True)
     repo = Path(tempfile.mkdtemp(prefix="canary-repo-", dir=scratch))
     out = {}
     try:
-        env = {"GIT_AUTHOR_NAME": "omo", "GIT_AUTHOR_EMAIL": "omo@invalid", "GIT_COMMITTER_NAME": "omo",
-               "GIT_COMMITTER_EMAIL": "omo@invalid", "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        env = {"GIT_AUTHOR_NAME": "omg", "GIT_AUTHOR_EMAIL": "omg@invalid", "GIT_COMMITTER_NAME": "omg",
+               "GIT_COMMITTER_EMAIL": "omg@invalid", "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
         for cmd in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "canary"]):
             subprocess.run(["git", "-C", str(repo), *cmd], check=True, capture_output=True, env=env)
         sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True,

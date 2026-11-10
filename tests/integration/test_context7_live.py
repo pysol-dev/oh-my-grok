@@ -1,4 +1,4 @@
-"""Live Context7 through the engine (opt-in: OMO_LIVE_CONTEXT7=1). Produces docs/evidence/context7-live-*.json:
+"""Live Context7 through the engine (opt-in: OMG_LIVE_CONTEXT7=1). Produces docs/evidence/context7-live-*.json:
 the engine's own receipt, the stored transcript hash, and a citation the engine re-verified against that transcript.
 This proves the connector works against the real service from this machine; it says nothing about the live host."""
 import hashlib
@@ -11,11 +11,13 @@ import pytest
 
 from test_evidence import explore, finish_research, mkh, receipts_of
 
-pytestmark = pytest.mark.skipif(os.environ.get("OMO_LIVE_CONTEXT7") != "1", reason="set OMO_LIVE_CONTEXT7=1")
+pytestmark = pytest.mark.skipif(
+    os.environ.get("OMG_LIVE_CONTEXT7") != "1" and os.environ.get("OMO_LIVE_CONTEXT7") != "1",
+    reason="set OMG_LIVE_CONTEXT7=1 (OMO_LIVE_CONTEXT7=1 still accepted)")
 EVIDENCE = Path(__file__).resolve().parents[2] / "docs" / "evidence"
 
 
-def test_live_receipt_and_verified_citation(omo_home):
+def test_live_receipt_and_verified_citation(omg_home):
     h = mkh({"docs_evidence": "enforce"})
     try:
         job = h.submit()["job_id"]
@@ -34,7 +36,7 @@ def test_live_receipt_and_verified_citation(omo_home):
         EVIDENCE.mkdir(parents=True, exist_ok=True)
         out = EVIDENCE / f"context7-live-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.json"
         out.write_text(json.dumps({
-            "what": "engine-executed live Context7 query and engine-reverified citation (omo-grok test_context7_live)",
+            "what": "engine-executed live Context7 query and engine-reverified citation (oh-my-grok test_context7_live)",
             "endpoint": json.loads(rc["summary_json"])["endpoint"], "server": r["server"],
             "protocol_version": json.loads(rc["summary_json"])["protocol_version"],
             "authenticated": json.loads(rc["summary_json"])["authenticated"],

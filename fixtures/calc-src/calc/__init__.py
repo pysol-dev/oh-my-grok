@@ -1,4 +1,4 @@
-"""Tiny synthetic fixture module for omo-grok end-to-end tests."""
+"""Tiny synthetic fixture module for oh-my-grok end-to-end tests."""
 
 
 def add(a, b):

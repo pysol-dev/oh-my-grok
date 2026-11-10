@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from omo_grok.errors import Conflict
+from oh_my_grok.errors import Conflict
 
 WORKER = str(Path(__file__).with_name("_worker.py"))
 
@@ -89,6 +89,6 @@ def test_item18_killed_worker_lease_expiry_recovers(harness, tmp_path):
     assert pkt["attempt_no"] == 2
     # a full engine restart (new connection) sees the same durable state
     e.close()
-    from omo_grok.engine import Engine
+    from oh_my_grok.engine import Engine
     harness.e = Engine(transport=harness.transport, clock=harness.clock)
     assert harness.task(job, "explore")["status"] == "working"

@@ -1,5 +1,9 @@
 # omo-grok implementation ledger (authoritative; resume from here)
 
+> **Product rename.** The product in this repository is now **oh-my-grok** (short name **omg**). Entries below are a historical record and still use the names that were true on the day they were written (omo-grok, omoctl, user-omo, omo-bus-*, `/workspace/omo`, `OMO_*`). They were not rewritten. `spec/IMPLEMENTATION.md` is frozen and still uses those old names. Newer docs use oh-my-grok. Live cutover is not done: the GitHub repository is still [pysol-dev/omo-grok](https://github.com/pysol-dev/omo-grok) (the intended name `pysol-dev/oh-my-grok` is not live; the old URL will redirect after the repository is renamed), the live checkout is still `/workspace/omo`, the live connector is still `user-omo`, and live Grok Bot routines have not been renamed in place.
+
+
+
 Spec: /workspace/omo/spec/IMPLEMENTATION.md — 54470 bytes, sha256 9643ee06f6817b08c57ea585fd8f919d4b23639bffd817a4a3084c7c9d0d30ae (verified 2026-11-03 20:40 MST; first section "MANDATORY PREFACE" and last line "Implement now..." present).
 Owner: Hephaestus (bot f497e4a7-5d7d-46e4-829f-b0da987cbac4).
 

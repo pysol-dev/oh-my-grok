@@ -1,21 +1,21 @@
-# omo-grok architecture
+# oh-my-grok architecture
 
-omo-grok is a durable workflow bus that coordinates eight logical roles across existing Grok Bots. It runs on the
+oh-my-grok is a durable workflow bus that coordinates eight logical roles across existing Grok Bots. It runs on the
 shared Bot computer. The parts:
 
-- One SQLite database (`state/omo.sqlite3`).
-- One shared engine (`omo_grok/engine.py`), used by both front ends:
-  - the stdio MCP server `omo` (`omo_grok/mcp_server.py`)
-  - the operator CLI `omoctl` (`omo_grok/cli.py`)
+- One SQLite database (`state/omg.sqlite3`, or an existing `state/omo.sqlite3` when the new file is absent).
+- One shared engine (`oh_my_grok/engine.py`), used by both front ends:
+  - the stdio MCP server `omg` (`oh_my_grok/mcp_server.py`)
+  - the operator CLI `omg` (`omg`; `omoctl` execs it)
 - A transactional outbox that wakes role routines over HTTP webhooks.
 
 ```
-user ─chat─▶ Hephaestus ─MCP─▶ omo engine ◀─MCP── role routines (Explorer, Librarian, Metis, Momus,
+user ─chat─▶ Hephaestus ─MCP─▶ omg engine ◀─MCP── role routines (Explorer, Librarian, Metis, Momus,
                                    │  ▲                     Executor, Code Reviewer, QA)
                           outbox ──┘  └── claim/complete with exact ids
                              │ POST {schema_version, job_id, task_id, dispatch_id, attempt} + Bearer key
                              ▼
-                    omo-bus-<role> webhook routine on the bound Bot
+                    omg-bus-<role> webhook routine on the bound Bot
 ```
 
 ## Modules
@@ -32,22 +32,22 @@ user ─chat─▶ Hephaestus ─MCP─▶ omo engine ◀─MCP── role routi
 | `skills.py` | Delivers the git-master skill text into the executor packet. Delivery is not proof the model obeyed it |
 | `operational.py` | Derives the doctor live-status line from recorded evidence. Never a constant |
 | `mcp_server.py` | The 10 MCP tools (pydantic-validated): submit, claim, context, checkpoint, complete, status, reconcile, cancel, escalate, docs. Logs go to stderr, redacted. No approve/ship/shell/secret tools |
-| `cli.py` | `omoctl`: doctor, migrate, status, submit, plan show, approve/deny (TTY), cancel (TTY), resume, reconcile, export, backup/restore, hook set/check/list, roles, test |
-| `transport.py` | Bounded-timeout HTTP POST (stdlib). Hook URLs must be https (`hooks.py`); plain http is accepted only for 127.0.0.1/localhost with `OMO_ALLOW_INSECURE_HOOKS=1` (tests) |
+| `cli.py` | `omg`: doctor, migrate, status, submit, plan show, approve/deny (TTY), cancel (TTY), resume, reconcile, export, backup/restore, hook set/check/list, roles, test |
+| `transport.py` | Bounded-timeout HTTP POST (stdlib). Hook URLs must be https (`hooks.py`); plain http is accepted only for 127.0.0.1/localhost with `OMG_ALLOW_INSECURE_HOOKS=1` (tests) |
 | `hooks.py` | Webhook URL and key store `state/secrets/hooks.json` (0600 file in a 0700 dir). Separate from job state |
 | `artifacts.py` | Immutable, content-addressed artifact files. Path-traversal and symlink checks. sha256 verified on read |
 | `schemas.py` | Strict per-kind result schemas and the `blocked` / `not_applicable` alternatives |
 | `verifier.py` | Deterministic verifier profiles (argv, no shell, env allowlist, timeout, protected + editable paths, pre-run rejection of shadowing modules, interpreter/test hooks and impure fixture code). Every candidate-running child is sandboxed (`sandbox.py`); trusted files are hashed before/after (`integrity.py`). Template, missing or non-isolated profiles fail closed; no sandbox fails closed |
 | `sandbox.py` | bubblewrap sandbox: read-only `/usr` runtime, fresh writable checkout copy, private `/tmp`, no network, no view of state/code/venv/home/workspace. Neutral random layouts for oracle runs (H1); per-run RLIMIT_AS variation (`preexec_with`). `probe()` validates `bwrap --version`, runs a namespace self-check inside bwrap (pid 1 is the bwrap init, only `lo`, host sentinel paths invisible, one-id uid map, nonce echoed), records the version, and fails closed otherwise |
-| `integrity.py` | sha256 snapshot/diff of `omo_grok/`, `config/`, `omoctl` and the venv (bin, pyvenv.cfg, site-packages); any change during a verification fails it and raises a `tamper` event |
+| `integrity.py` | sha256 snapshot/diff of `oh_my_grok/`, `config/`, `omg` and the venv (bin, pyvenv.cfg, site-packages); any change during a verification fails it and raises a `tamper` event |
 | `oracles.py` | Trusted oracles (e.g. `calc-arith`): exhaustive small grid, boundary pairs, keyword/mixed/aliased copies, bool cases, magnitudes up to 2**4096 and fresh SystemRandom inputs (domain-filtered), plus `run_cases`: fresh large-magnitude draws per run, never shared between runs, expected values, strict `type(v) is int` checks. Lives in the trusted tree, never in the candidate |
 | `oracle_child.py` | Builds the untrusted probe program passed with `python -c`: `import <module>` first (as a normal user would), then answers one oracle request at a time over stdin/stdout with raw JSON values. Each call is made from the program's top level; padded calls get exactly the measured extra recursion headroom. Run 3 times per verification in varied neutral environments; its claims are never trusted |
-| `unittest_child.py` | Untrusted advisory child: runs the expected test manifest and prints one `OMO-UNITTEST-REPORT` line. The report can only add failures |
+| `unittest_child.py` | Untrusted advisory child: runs the expected test manifest and prints one `OMG-UNITTEST-REPORT` line. The report can only add failures |
 | `candidate_scan.py` | Static AST tripwire over changed editable `.py` files (forbidden imports/attrs/calls, introspection, dunder overrides, builtin subclasses); per-profile allow/forbid lists; plus the allowlist pure-function rule for fixture profiles (`pure_modules`; applied by `verifier.pure_tree_problems` to every `.py` under editable paths; round 7: a strict node/builtin/attribute allowlist (`_allowlist_problems`; no methods on values, no dict/set literals, no classes, no `is`) with the older bans kept as a second layer; relative imports only to scanned modules); fail closed |
-| `gitops.py` | Per-job worktree and branch (`omo/<job-id-prefix>`). Repo hooks are disabled. No reset, clean, force or push |
+| `gitops.py` | Per-job worktree and branch (`omg/<job-id-prefix>`). Repo hooks are disabled. No reset, clean, force or push |
 | `fixture.py` | Synthetic `calc` fixture repo: a failing test, a real fix, and a fake "fix" that edits tests or prints PASS |
 | `redact.py` | Removes bearer tokens, Authorization values, key/token/secret assignments, common token prefixes, PEM private keys and registered secrets |
-| `live.py` | Harness for live items 20–22 (`omoctl test live --fixture-only`). Reports NOT RUN without real bindings |
+| `live.py` | Harness for live items 20–22 (`omg test live --fixture-only`). Reports NOT RUN without real bindings |
 
 ## Data model (migration 1 plus migration 2)
 The tables:
@@ -72,7 +72,7 @@ held open during HTTP or verifier runs.
    canonical hash.
 5. **Plan review.** One `plan_review` task (Momus) is created per revision. The result must echo the exact hash.
    A reject or a deny creates a new revision. The number of revision rounds is capped.
-6. **Approval.** The job waits in `awaiting_approval` until `omoctl approve JOB --plan-hash H` is run at a TTY,
+6. **Approval.** The job waits in `awaiting_approval` until `omg approve JOB --plan-hash H` is run at a TTY,
    which records a SOFT receipt. The receipt is bound to the job, the hash, the requirements hash and the scope.
    A plan change revokes it. Fixture jobs may instead use an explicit *synthetic* approval, labelled as such.
 7. **Implementation.** On approval the engine creates a worktree and branch from the base revision, then queues

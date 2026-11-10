@@ -4,14 +4,14 @@ import json
 import os
 from pathlib import Path
 
-from omo_grok import fixture as fx
+from oh_my_grok import fixture as fx
 from test_lsp_real_servers import need
 
 TYPE_ERROR = "\n\ndef label() -> int:\n    return 'not an int'\n"
 
 
 def enable(mode):
-    cfg = Path(os.environ["OMO_CONFIG_DIR"])
+    cfg = Path(os.environ["OMG_CONFIG_DIR"])
     pol = json.loads((cfg / "policy.json").read_text())
     pol["features"] = {"lsp": mode} if mode else {}
     (cfg / "policy.json").write_text(json.dumps(pol))
@@ -26,7 +26,7 @@ def fixed(extra=""):
     return f
 
 
-def make(omo_home, mode):
+def make(omg_home, mode):
     from helpers import Harness
     enable(mode)
     h = Harness()
@@ -46,8 +46,8 @@ def tasks(h, job, kind):
 
 
 @need("python-ruff", "python-basedpyright")
-def test_type_error_that_unit_tests_miss_rejects_candidate_and_opens_repair(omo_home):
-    h, job = make(omo_home, "enforce")
+def test_type_error_that_unit_tests_miss_rejects_candidate_and_opens_repair(omg_home):
+    h, job = make(omg_home, "enforce")
     try:
         _, sha, _ = h.implement(job, fix=fixed(TYPE_ERROR))
         impl = tasks(h, job, "implement")
@@ -70,8 +70,8 @@ def test_type_error_that_unit_tests_miss_rejects_candidate_and_opens_repair(omo_
 
 
 @need("python-ruff", "python-basedpyright")
-def test_repair_then_clean_candidate_reaches_final_gate_with_lsp_receipts(omo_home):
-    h, job = make(omo_home, "enforce")
+def test_repair_then_clean_candidate_reaches_final_gate_with_lsp_receipts(omg_home):
+    h, job = make(omg_home, "enforce")
     try:
         h.implement(job, fix=fixed(TYPE_ERROR))
         _, sha2, _ = h.implement(job, fix=fixed())
@@ -95,8 +95,8 @@ def test_repair_then_clean_candidate_reaches_final_gate_with_lsp_receipts(omo_ho
 
 
 @need("python-ruff", "python-basedpyright")
-def test_final_gate_refuses_without_an_engine_receipt_for_the_exact_revision(omo_home):
-    h, job = make(omo_home, "enforce")
+def test_final_gate_refuses_without_an_engine_receipt_for_the_exact_revision(omg_home):
+    h, job = make(omg_home, "enforce")
     try:
         h.implement(job, fix=fixed())
         for kind in ("code_review", "qa"):
@@ -114,8 +114,8 @@ def test_final_gate_refuses_without_an_engine_receipt_for_the_exact_revision(omo
 
 
 @need("python-ruff", "python-basedpyright")
-def test_shadow_mode_records_but_does_not_block(omo_home):
-    h, job = make(omo_home, "shadow")
+def test_shadow_mode_records_but_does_not_block(omg_home):
+    h, job = make(omg_home, "shadow")
     try:
         h.implement(job, fix=fixed(TYPE_ERROR))
         assert tasks(h, job, "implement")[0]["status"] == "passed"
@@ -125,8 +125,8 @@ def test_shadow_mode_records_but_does_not_block(omo_home):
         h.close()
 
 
-def test_off_mode_has_no_lsp_side_effects(omo_home):
-    h, job = make(omo_home, None)
+def test_off_mode_has_no_lsp_side_effects(omg_home):
+    h, job = make(omg_home, None)
     try:
         h.implement(job, fix=fixed(TYPE_ERROR))
         assert tasks(h, job, "code_review")
@@ -135,13 +135,13 @@ def test_off_mode_has_no_lsp_side_effects(omo_home):
         h.close()
 
 
-def test_unavailable_diagnostics_block_instead_of_passing(omo_home):
-    cfg = Path(os.environ["OMO_CONFIG_DIR"])
+def test_unavailable_diagnostics_block_instead_of_passing(omg_home):
+    cfg = Path(os.environ["OMG_CONFIG_DIR"])
     raw = json.loads((Path(__file__).resolve().parents[2] / "config" / "lsp.json").read_text())
     for p in raw["profiles"].values():
         p["argv"] = ["/nonexistent/server", "--stdio"]
     (cfg / "lsp.json").write_text(json.dumps(raw))
-    h, job = make(omo_home, "enforce")
+    h, job = make(omg_home, "enforce")
     try:
         h.implement(job, fix=fixed())
         impl = tasks(h, job, "implement")[0]
@@ -154,13 +154,13 @@ def test_unavailable_diagnostics_block_instead_of_passing(omo_home):
         h.close()
 
 
-def test_code_language_without_an_enabled_profile_blocks(omo_home):
-    cfg = Path(os.environ["OMO_CONFIG_DIR"])
+def test_code_language_without_an_enabled_profile_blocks(omg_home):
+    cfg = Path(os.environ["OMG_CONFIG_DIR"])
     raw = json.loads((Path(__file__).resolve().parents[2] / "config" / "lsp.json").read_text())
     for p in raw["profiles"].values():
         p["enabled"] = False
     (cfg / "lsp.json").write_text(json.dumps(raw))
-    h, job = make(omo_home, "enforce")
+    h, job = make(omg_home, "enforce")
     try:
         h.implement(job, fix=fixed())
         impl = tasks(h, job, "implement")[0]

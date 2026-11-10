@@ -1,5 +1,5 @@
 """Real language servers (ruff pull, basedpyright push, typescript-language-server push) inside the bwrap sandbox.
-Skipped when the bootstrap-installed tools or bwrap are absent, unless OMO_REQUIRE_TOOLS=1 (then they fail)."""
+Skipped when the bootstrap-installed tools or bwrap are absent, unless OMG_REQUIRE_TOOLS=1 (then they fail)."""
 import copy
 import json
 import os
@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from omo_grok import sandbox
-from omo_grok.lsp import profiles, runner
-from omo_grok.paths import CODE_ROOT
+from oh_my_grok import sandbox
+from oh_my_grok.lsp import profiles, runner
+from oh_my_grok.paths import CODE_ROOT
 
 CFG = profiles.load(CODE_ROOT / "config")
 SBX = sandbox.probe()
@@ -24,8 +24,8 @@ def _missing(names):
 
 def need(*names):
     miss = _missing(names)
-    if miss and os.environ.get("OMO_REQUIRE_TOOLS") == "1":
-        pytest.fail(f"OMO_REQUIRE_TOOLS=1 but missing: {miss}")
+    if miss and (os.environ.get("OMG_REQUIRE_TOOLS") == "1" or os.environ.get("OMO_REQUIRE_TOOLS") == "1"):
+        pytest.fail(f"OMG_REQUIRE_TOOLS=1 but missing: {miss}")
     return pytest.mark.skipif(bool(miss), reason=f"tools missing: {miss[:2]}")
 
 

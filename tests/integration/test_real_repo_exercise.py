@@ -8,8 +8,8 @@ import os
 import subprocess
 from pathlib import Path
 
-from omo_grok import fixture as fx
-from omo_grok.paths import CODE_ROOT
+from oh_my_grok import fixture as fx
+from oh_my_grok.paths import CODE_ROOT
 from test_lsp_real_servers import need
 
 BEARER_LINE = '(re.compile(r"(?i)\\bbearer\\s+[A-Za-z0-9._~+/=\\-]+"), "Bearer [REDACTED]"),\n'
@@ -17,7 +17,7 @@ TYPE_ERROR = '\n\ndef exercise_label(n: int) -> int:\n    return "not-an-int"\n'
 TEST_SRC = '''\
 import unittest
 
-from omo_grok.redact import redact
+from oh_my_grok.redact import redact
 
 
 class RedactTest(unittest.TestCase):
@@ -39,10 +39,10 @@ def disposable_copy(dest: Path) -> tuple[str, str]:
     dest.mkdir()
     archive = subprocess.check_output(["git", "archive", "HEAD"], cwd=CODE_ROOT)
     subprocess.run(["tar", "-x"], cwd=dest, input=archive, check=True)
-    correct = (CODE_ROOT / "omo_grok" / "redact.py").read_text()
+    correct = (CODE_ROOT / "oh_my_grok" / "redact.py").read_text()
     assert BEARER_LINE in correct, "bearer rule moved; the planted defect no longer matches the source"
     buggy = correct.replace(BEARER_LINE, "")
-    (dest / "omo_grok" / "redact.py").write_text(buggy)
+    (dest / "oh_my_grok" / "redact.py").write_text(buggy)
     tests = dest / "exercise_tests"
     tests.mkdir()
     (tests / "__init__.py").write_text("")
@@ -56,18 +56,18 @@ def disposable_copy(dest: Path) -> tuple[str, str]:
 
 
 def configure(repo: Path):
-    cfg = Path(os.environ["OMO_CONFIG_DIR"])
+    cfg = Path(os.environ["OMG_CONFIG_DIR"])
     pol = json.loads((cfg / "policy.json").read_text())
     pol["features"] = {"adaptive_roster": "enforce", "lsp": "enforce", "git_discipline": "enforce"}
     pol["repo_allowlist"] = [str(repo.resolve())]
     (cfg / "policy.json").write_text(json.dumps(pol))
     ver = json.loads((cfg / "verifiers.json").read_text())
     ver["profiles"]["redact-unittest"] = {
-        "runner": "omo-unittest-child",
-        "argv": ["${OMO_PYTHON}", "-I", "-B", "${OMO_CODE_ROOT}/omo_grok/unittest_child.py"],
+        "runner": "omg-unittest-child",
+        "argv": ["${OMG_PYTHON}", "-I", "-B", "${OMG_CODE_ROOT}/oh_my_grok/unittest_child.py"],
         "cwd": ".", "env_allow": [], "timeout_seconds": 120, "start_dir": "exercise_tests",
         "expected_tests": ["exercise_tests.test_redact.RedactTest.test_bearer"],
-        "protected_paths": ["exercise_tests/"], "editable_paths": ["omo_grok/redact.py"],
+        "protected_paths": ["exercise_tests/"], "editable_paths": ["oh_my_grok/redact.py"],
         "source_extensions": [".py"], "static_scan": {},
     }
     (cfg / "verifiers.json").write_text(json.dumps(ver))
@@ -78,12 +78,12 @@ def configure(repo: Path):
 
 
 def commit(wt: Path, job: str, label: str, text: str) -> str:
-    (wt / "omo_grok" / "redact.py").write_text(text)
-    return fx.commit_all(wt, f"{label}\n\nOmo-Job: {job}")
+    (wt / "oh_my_grok" / "redact.py").write_text(text)
+    return fx.commit_all(wt, f"{label}\n\nOmg-Job: {job}")
 
 
 @need("python-ruff", "python-basedpyright")
-def test_disposable_repo_fails_then_repairs_and_passes_an_independent_review(omo_home, tmp_path):
+def test_disposable_repo_fails_then_repairs_and_passes_an_independent_review(omg_home, tmp_path):
     repo = tmp_path / "disposable"
     buggy, correct = disposable_copy(repo)
     configure(repo)
@@ -155,12 +155,12 @@ def test_disposable_repo_fails_then_repairs_and_passes_an_independent_review(omo
         assert live and {r["revision"] for r in live} == {sha4}
         assert {r["verdict"] for r in live} == {"accept"}
 
-        evidence = os.environ.get("OMO_EVIDENCE_DIR")
+        evidence = os.environ.get("OMG_EVIDENCE_DIR") or os.environ.get("OMO_EVIDENCE_DIR")
         if evidence:
             out = Path(evidence)
             out.mkdir(parents=True, exist_ok=True)
             (out / "real-repo-exercise.json").write_text(json.dumps({
-                "job_id": job, "base_defect": "bearer pattern removed from omo_grok/redact.py",
+                "job_id": job, "base_defect": "bearer pattern removed from oh_my_grok/redact.py",
                 "attempt2_sha": sha2, "rejected_sha": sha3, "final_sha": sha4,
                 "reviewer_bot": rejected["bot_id"], "executor_bot": binds["executor"],
                 "lsp_final_level": final["level"], "git_history_level": hist["level"],

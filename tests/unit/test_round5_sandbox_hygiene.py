@@ -3,8 +3,8 @@ symlinks and never chmods anything outside the tree it deletes."""
 import os
 import subprocess
 
-from omo_grok import sandbox
-from omo_grok.verifier import _rmtree
+from oh_my_grok import sandbox
+from oh_my_grok.verifier import _rmtree
 
 
 class _CP:

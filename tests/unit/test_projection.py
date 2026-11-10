@@ -9,22 +9,22 @@ from pathlib import Path
 
 import pytest
 
-from omo_grok import db, projection
-from omo_grok.paths import get_paths
+from oh_my_grok import db, projection
+from oh_my_grok.paths import get_paths
 
 BASE = {"files_estimate": 1, "new_dependency": False, "external_api": False, "security_sensitive": False,
         "cross_cutting": False}
 
 
 def _enable(modes):
-    cfg = Path(os.environ["OMO_CONFIG_DIR"])
+    cfg = Path(os.environ["OMG_CONFIG_DIR"])
     pol = json.loads((cfg / "policy.json").read_text())
     pol["features"] = modes
     (cfg / "policy.json").write_text(json.dumps(pol))
 
 
 @pytest.fixture
-def h(omo_home):
+def h(omg_home):
     from helpers import Harness
     _enable({"boulder": "on"})
     hh = Harness()
@@ -57,9 +57,9 @@ def test_submit_projects_an_upstream_shaped_boulder(h):
     for k in ("active_plan", "started_at", "status", "session_ids", "plan_name", "agent", "task_sessions"):
         assert b[k] == w[k], k  # mirrored root fields exactly as upstream
     assert Path(w["active_plan"]).is_file() and Path(w["active_plan"]).name == w["plan_name"] + ".md"
-    x = b["x_omo_grok"]
+    x = b["x_omg"]
     assert x["job_id"] == job and x["generation"] == gen(h, job)
-    assert x["projection"] == "derived-from-sqlite" and x["resume"] == {"tool": "omo.status", "job_id": job}
+    assert x["projection"] == "derived-from-sqlite" and x["resume"] == {"tool": "omg.status", "job_id": job}
     assert x["phase"] == "research" and x["next_action"]
     d = paths_for(job)[1]
     assert (d / ".gitignore").read_text().strip() == "*"
@@ -71,7 +71,7 @@ def test_claims_become_sessions_with_engine_issued_ids(h):
     pkt = h.claim(job, "explore")
     b = load(job)
     w = b["works"][job]
-    token = f"omo-grok:{h.e._one('SELECT bot_id FROM role_bindings WHERE role=?', ('explorer',))['bot_id']}:{pkt['attempt_id']}"
+    token = f"oh-my-grok:{h.e._one('SELECT bot_id FROM role_bindings WHERE role=?', ('explorer',))['bot_id']}:{pkt['attempt_id']}"
     assert w["session_ids"] == [token]
     (ts,) = w["task_sessions"].values()
     assert ts["session_id"] == token and ts["status"] == "running" and ts["category"] == "explorer"
@@ -88,7 +88,7 @@ def test_hephaestus_without_bot_binding_uses_the_role_in_the_session_id(h):
     h.research(job)
     h.analyze(job)
     pkt = h.claim(job, "plan")
-    assert f"omo-grok:hephaestus:{pkt['attempt_id']}" in load(job)["works"][job]["session_ids"]
+    assert f"oh-my-grok:hephaestus:{pkt['attempt_id']}" in load(job)["works"][job]["session_ids"]
 
 
 CHECK = re.compile(r"^- \[( |x|~)\] (\d+|F[1-4])\. (.+)$")
@@ -164,6 +164,21 @@ def test_never_regresses_when_a_newer_trusted_file_exists(h):
     job = h.submit()["job_id"]
     f = paths_for(job)[0]
     data = json.loads(f.read_text())
+    data["x_omg"]["generation"] = gen(h, job) + 1000
+    newer = (json.dumps(data, sort_keys=True, indent=2) + "\n").encode()
+    f.write_bytes(newer)
+    with db.tx(h.e.conn):
+        h.e.conn.execute("UPDATE boulder_projection SET sha256=?, generation=? WHERE job_id=?",
+                         (hashlib.sha256(newer).hexdigest(), gen(h, job) + 1000, job))
+    r = projection.project(h.e.conn, h.e.paths, job)
+    assert r["status"] == "skipped_newer" and f.read_bytes() == newer
+
+
+def test_legacy_x_omo_grok_generation_is_still_honored(h):
+    job = h.submit()["job_id"]
+    f = paths_for(job)[0]
+    data = json.loads(f.read_text())
+    data["x_omo_grok"] = data.pop("x_omg")
     data["x_omo_grok"]["generation"] = gen(h, job) + 1000
     newer = (json.dumps(data, sort_keys=True, indent=2) + "\n").encode()
     f.write_bytes(newer)
@@ -172,6 +187,7 @@ def test_never_regresses_when_a_newer_trusted_file_exists(h):
                          (hashlib.sha256(newer).hexdigest(), gen(h, job) + 1000, job))
     r = projection.project(h.e.conn, h.e.paths, job)
     assert r["status"] == "skipped_newer" and f.read_bytes() == newer
+    assert "x_omg" not in json.loads(f.read_text())
 
 
 @pytest.mark.parametrize("damage", ["edit", "truncate", "garbage", "delete", "huge_generation"])
@@ -192,7 +208,7 @@ def test_tampering_is_repaired_and_logged_never_imported(h, damage):
         f.unlink()
     else:
         d = json.loads(good)
-        d["x_omo_grok"]["generation"] = 10 ** 12
+        d["x_omg"]["generation"] = 10 ** 12
         f.write_text(json.dumps(d))
     r = projection.project(h.e.conn, h.e.paths, job)
     assert r["status"] == "written" and r["tamper"] is True
@@ -201,7 +217,7 @@ def test_tampering_is_repaired_and_logged_never_imported(h, damage):
     ev = h.e._all("SELECT data_json FROM events WHERE job_id=? AND kind='boulder_tamper'", (job,))
     assert len(ev) == 1
     after = load(job)
-    assert after["x_omo_grok"]["generation"] == gen(h, job)  # includes the tamper event itself
+    assert after["x_omg"]["generation"] == gen(h, job)  # includes the tamper event itself
     assert projection.project(h.e.conn, h.e.paths, job)["status"] == "unchanged"
 
 
@@ -210,7 +226,7 @@ def test_editing_the_file_never_alters_decisions(h):
     f = paths_for(job)[0]
     d = json.loads(f.read_text())
     d["works"][job]["status"] = "completed"
-    d["x_omo_grok"]["phase"] = "done"
+    d["x_omg"]["phase"] = "done"
     f.write_text(json.dumps(d))
     before = h.e.status(job)
     assert before["phase"] == "research"
@@ -264,7 +280,7 @@ def test_symlinked_plans_directory_is_replaced_without_being_followed(h, tmp_pat
     plans = omo / "plans"
     outside = tmp_path / "outside-plans"
     outside.mkdir()
-    plan_leaf = f"omo-{job[:8]}.md"
+    plan_leaf = f"omg-{job[:8]}.md"
     (outside / "marker").write_text("untouched")
     (outside / plan_leaf).write_text("secret-plan")
     shutil.rmtree(plans)
@@ -288,7 +304,7 @@ def test_plan_file_edit_is_detected_and_restored(h):
     assert "ORIGINAL PLAN" in plan.read_text() and r["tamper"] is True
 
 
-def test_off_means_no_files(omo_home):
+def test_off_means_no_files(omg_home):
     from helpers import Harness
     hh = Harness()
     try:

@@ -8,11 +8,11 @@ import pytest
 import test_harness_detection as h1
 import test_round5_probes as r5
 import test_round6_probes as r6
-from omo_grok import fixture as fx
-from omo_grok import oracle_child, oracles, sandbox, verifier
-from omo_grok.candidate_scan import pure_allowlist_problems as allow_only
-from omo_grok.candidate_scan import pure_module_problems as pure
-from omo_grok.config import load_verifier_profiles
+from oh_my_grok import fixture as fx
+from oh_my_grok import oracle_child, oracles, sandbox, verifier
+from oh_my_grok.candidate_scan import pure_allowlist_problems as allow_only
+from oh_my_grok.candidate_scan import pure_module_problems as pure
+from oh_my_grok.config import load_verifier_profiles
 
 ROOT = Path(__file__).resolve().parents[2]
 PROF = load_verifier_profiles(ROOT / "config")["fixture-calc-unittest"]

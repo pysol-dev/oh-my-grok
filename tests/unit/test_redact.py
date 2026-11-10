@@ -4,8 +4,8 @@ import os
 import subprocess
 from pathlib import Path
 
-from omo_grok.redact import redact, redact_obj, register_secret
-from omo_grok.transport import HttpResult
+from oh_my_grok.redact import redact, redact_obj, register_secret
+from oh_my_grok.transport import HttpResult
 
 ROOT = Path(__file__).resolve().parents[2]
 PEM = "-----BEGIN PRIVATE KEY-----\nMIIBVgIBADANBgkqhkiG9w0BAQEFAASCAUAwggE8AgEAAkEA\n-----END PRIVATE KEY-----"
@@ -51,6 +51,6 @@ def test_cli_terminal_output_redacted(harness):
     outs = ""
     for args in (["status", "--json"], ["status", job], ["hook", "list"], ["hook", "check"], ["roles", "list"],
                  ["doctor", "--json"]):
-        r = subprocess.run([str(ROOT / "omoctl"), *args], capture_output=True, text=True, env=env, timeout=60)
+        r = subprocess.run([str(ROOT / "omg"), *args], capture_output=True, text=True, env=env, timeout=60)
         outs += r.stdout + r.stderr
     assert SECRET_KEY not in outs and "hooks.invalid" not in outs

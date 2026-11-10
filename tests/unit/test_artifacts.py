@@ -3,9 +3,9 @@ import os
 
 import pytest
 
-from omo_grok import artifacts as art
-from omo_grok.errors import Conflict, IntegrityError_, ValidationError
-from omo_grok.schemas import classify
+from oh_my_grok import artifacts as art
+from oh_my_grok.errors import Conflict, IntegrityError_, ValidationError
+from oh_my_grok.schemas import classify
 
 
 def test_write_inline_is_immutable_and_hashed(tmp_path):
@@ -160,7 +160,7 @@ def test_tampered_file_at_artifact_path_fails_closed_not_deleted(harness):
     e = harness.e
     job = harness.submit()["job_id"]
     pkt = harness.claim(job, "explore")
-    from omo_grok.config import sha256_text
+    from oh_my_grok.config import sha256_text
     rel = f"{pkt['task_id']}/a{pkt['attempt_no']}/{sha256_text('real')[:16]}/r.md"
     p = e._art_root(job) / rel
     p.parent.mkdir(parents=True)

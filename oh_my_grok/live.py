@@ -1,8 +1,8 @@
-"""Live smoke harness for spec §10 items 20-22 (`omoctl test live --fixture-only`).
+"""Live smoke harness for spec §10 items 20-22 (`omg test live --fixture-only`).
 
 This harness NEVER simulates Bots. It only submits a synthetic fixture job, applies an explicit SYNTHETIC approval
 (fixture-only), runs reconcile on an interval and observes the DB. Real progress requires real Grok Bot routines
-(bound + verified + webhook configured) that claim/complete via the registered `omo` MCP server, and Hephaestus
+(bound + verified + webhook configured) that claim/complete via the registered `omg` MCP server, and Hephaestus
 resuming its awaiting_resume tasks in chat. If prerequisites are missing it reports NOT RUN and exits non-zero.
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ def prerequisites(e: Engine) -> list[str]:
         elif not b["routine_id"] or not b["verified_at"]:
             missing.append(f"{b['role']}: routine not verified")
         if not b["webhook_configured"]:
-            missing.append(f"{b['role']}: webhook not configured (omoctl hook set {b['role']})")
+            missing.append(f"{b['role']}: webhook not configured (omg hook set {b['role']})")
     return missing
 
 
@@ -42,7 +42,7 @@ def run_live_fixture(timeout: int = 3600, poll: int = 60) -> dict:
                 "This is an installation smoke test; it authorizes nothing outside the fixture repo.")
         r = e.submit(goal, f"live-fixture:{uuid.uuid4().hex}", mode="fixture",
                      acceptance_criteria=["python -m unittest discover -s tests exits 0 on the final revision"],
-                     actor="omoctl test live")
+                     actor="omg test live")
         job = r["job_id"]
         deadline = time.time() + timeout
         log = []

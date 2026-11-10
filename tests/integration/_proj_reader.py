@@ -14,7 +14,7 @@ while not os.path.exists(stop):
         time.sleep(0.001)
         continue
     try:
-        g = json.loads(raw)["x_omo_grok"]["generation"]
+        g = json.loads(raw)["x_omg"]["generation"]
     except Exception as e:  # noqa: BLE001
         print(f"UNPARSEABLE after {reads} reads: {e!r}: {raw[:80]!r}")
         sys.exit(1)

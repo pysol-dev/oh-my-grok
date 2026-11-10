@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from omo_grok import features
-from omo_grok.errors import ValidationError
+from oh_my_grok import features
+from oh_my_grok.errors import ValidationError
 
 
 def test_all_features_default_off():
@@ -34,21 +34,21 @@ def test_job_without_frozen_features_runs_with_everything_off():
 
 
 def _write_policy(features_obj):
-    cfg = Path(os.environ["OMO_CONFIG_DIR"])
+    cfg = Path(os.environ["OMG_CONFIG_DIR"])
     pol = json.loads((cfg / "policy.json").read_text())
     pol["features"] = features_obj
     (cfg / "policy.json").write_text(json.dumps(pol))
 
 
-def test_policy_json_features_are_validated_on_load(omo_home):
-    from omo_grok.engine import Engine
+def test_policy_json_features_are_validated_on_load(omg_home):
+    from oh_my_grok.engine import Engine
     _write_policy({"lsp": "sideways"})
     with pytest.raises(ValidationError):
         Engine()
 
 
-def test_policy_features_are_frozen_into_the_job(omo_home):
-    from omo_grok.engine import Engine
+def test_policy_features_are_frozen_into_the_job(omg_home):
+    from oh_my_grok.engine import Engine
     _write_policy({"adaptive_roster": "enforce"})
     e = Engine()
     job = e.submit("goal", "freeze-key-0001", mode="plan_only", intent="implementation",
@@ -61,8 +61,8 @@ def test_policy_features_are_frozen_into_the_job(omo_home):
     e.close()
 
 
-def test_legacy_submit_freezes_the_current_effective_set(omo_home):
-    from omo_grok.engine import Engine
+def test_legacy_submit_freezes_the_current_effective_set(omg_home):
+    from oh_my_grok.engine import Engine
     e = Engine()
     job = e.submit("goal", "freeze-key-0002", mode="plan_only")["job_id"]
     assert e._features(e._job(job)) == features.defaults()

@@ -3,9 +3,9 @@ from pathlib import Path
 
 import pytest
 
-from omo_grok import fixture as fx
-from omo_grok import gitops, verifier
-from omo_grok.config import load_verifier_profiles, validate_profile
+from oh_my_grok import fixture as fx
+from oh_my_grok import gitops, verifier
+from oh_my_grok.config import load_verifier_profiles, validate_profile
 
 ROOT = Path(__file__).resolve().parents[2]
 PROF = load_verifier_profiles(ROOT / "config")["fixture-calc-unittest"]
@@ -36,16 +36,17 @@ def test_deterministic_fixture_base(tmp_path):
 def test_missing_and_template_profiles_fail_closed(tmp_path):
     repo, base = _repo(tmp_path)
     assert verifier.run(repo, base, None, None, tmp_path / "w").status == "error"
-    tmpl = dict(PROF, argv=[*PROF["argv"], "OMO_VERIFY_TEMPLATE"])
-    o = verifier.run(repo, base, "t", tmpl, tmp_path / "w")
-    assert o.status == "error" and "OMO_VERIFY_TEMPLATE" in o.detail
+    for marker in ("OMG_VERIFY_TEMPLATE", "OMO_VERIFY_TEMPLATE"):
+        tmpl = dict(PROF, argv=[*PROF["argv"], marker])
+        o = verifier.run(repo, base, "t", tmpl, tmp_path / "w")
+        assert o.status == "error" and marker in o.detail, marker
     rel = dict(PROF, argv=["python3", "-c", "pass"])
     assert verifier.run(repo, base, "r", rel, tmp_path / "w").status == "error"
 
 
 def test_template_marker_inside_referenced_script_fails_closed(tmp_path):
     repo, _ = _repo(tmp_path)
-    (repo / "verify.sh").write_text("#!/bin/sh\n# OMO_VERIFY_TEMPLATE\necho VERIFIED\nexit 0\n")
+    (repo / "verify.sh").write_text("#!/bin/sh\n# OMG_VERIFY_TEMPLATE\n# OMO_VERIFY_TEMPLATE\necho VERIFIED\nexit 0\n")
     sha = fx.commit_all(repo, "add template verify.sh")
     prof = dict(PROF, argv=["/bin/sh", "verify.sh"], runner=None, exit_code_only=True)
     prof.pop("runner")
@@ -407,10 +408,10 @@ def test_n_attacks_fail_with_static_scan_disabled(tmp_path, monkeypatch, name):
 
 
 def test_no_secret_reaches_candidate_processes(tmp_path, monkeypatch):
-    """The children get a scrubbed env (no OMO_* at all), no extra fds, and argv carries no secret."""
+    """The children get a scrubbed env (no OMG_* or legacy OMO_*), no extra fds, and argv carries no secret."""
     monkeypatch.setattr(verifier, "scope_problems", lambda *a, **k: [])
     repo, base = _repo(tmp_path)
-    probe = ("\nimport os as _o\n_e = sorted(k for k in _o.environ if 'OMO' in k or 'VERIFY' in k)\n"
+    probe = ("\nimport os as _o\n_e = sorted(k for k in _o.environ if 'OMG' in k or 'OMO' in k or 'VERIFY' in k)\n"
              "_f = sorted(int(x) for x in _o.listdir('/proc/self/fd'))\n"
              "import sys as _s\nprint('PROBE', _e, _f, flush=True, file=_s.stderr)  # stdout is the protocol\n")
     _write_calc(repo, (repo / "calc" / "__init__.py").read_text().replace(fx.FIX_FROM, fx.FIX_TO) + probe)
@@ -441,8 +442,8 @@ ORACLE_VARIANTS = {
 _R1 = ("import os\n_b = {blob}\nfor _fd in range(1, 20):\n    try:\n        os.write(_fd, _b)\n"
        "    except OSError:\n        pass\n")
 R1_VARIANTS = {
-    "deep_nesting": _R1.format(blob="b'OMO-UNITTEST-REPORT ' + b'[' * 300000 + b'\\n' + b'[' * 300000 + b'\\n'"),
-    "invalid_utf8": _R1.format(blob="b'OMO-UNITTEST-REPORT \\xff\\xfe{\\n\\xff\\xfe\\xfa\\n'"),
+    "deep_nesting": _R1.format(blob="b'OMG-UNITTEST-REPORT ' + b'[' * 300000 + b'\\n' + b'[' * 300000 + b'\\n'"),
+    "invalid_utf8": _R1.format(blob="b'OMG-UNITTEST-REPORT \\xff\\xfe{\\n\\xff\\xfe\\xfa\\n'"),
     "flood_no_newline": _R1.format(blob="b'{' * 3000000"),
     "huge_int": _R1.format(blob="b'{\"id\": 0, \"value\": ' + b'9' * 50000 + b'}\\n'"),
 }
@@ -471,7 +472,7 @@ def test_r1_hostile_child_output_fails_closed_with_scan_disabled(tmp_path, monke
 
 
 def test_oracle_inputs_are_fresh_per_run():
-    from omo_grok import oracles
+    from oh_my_grok import oracles
     a = oracles.cases("calc-arith", 16)
     b = oracles.cases("calc-arith", 16)
     assert [c["args"] for c in a] != [c["args"] for c in b]
@@ -490,7 +491,7 @@ def test_oracle_inputs_are_fresh_per_run():
 
 
 def test_fixture_profiles_require_oracle_and_report_assurance(tmp_path):
-    from omo_grok.config import profile_assurance
+    from oh_my_grok.config import profile_assurance
     p = dict(PROF)
     p.pop("oracle")
     assert any("oracle" in x for x in validate_profile("fixture-x", p))

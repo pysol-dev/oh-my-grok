@@ -1,8 +1,8 @@
 """Pure roster rules: scope validation, floor table, class resolution, task sets, escalation, diff contradictions."""
 import pytest
 
-from omo_grok import roster
-from omo_grok.errors import ValidationError
+from oh_my_grok import roster
+from oh_my_grok.errors import ValidationError
 
 BASE = {"files_estimate": 1, "new_dependency": False, "external_api": False, "security_sensitive": False,
         "cross_cutting": False}

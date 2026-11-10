@@ -9,7 +9,8 @@ from .paths import CODE_ROOT, get_paths
 
 
 def _files() -> list[Path]:
-    out = sorted((CODE_ROOT / "omo_grok").rglob("*.py"))
+    out = sorted((CODE_ROOT / "oh_my_grok").rglob("*.py"))
+    out += [CODE_ROOT / "omg", CODE_ROOT / "omoctl"]
     cfg = get_paths().config_dir
     if cfg.is_dir():
         out += sorted(p for p in cfg.iterdir() if p.is_file() and p.suffix in (".json", ".txt"))

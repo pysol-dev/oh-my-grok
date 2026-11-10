@@ -1,7 +1,7 @@
 """Momus round 4 (P1/P2/S1, R1) through the REAL Engine flow: candidate code runs only inside the bwrap sandbox.
 
-Each payload aims at the real trusted surfaces (venv site-packages, omo_grok/verifier.py) and at this test's own
-OMO_HOME DB and secrets. Every verification must fail, the trusted files and the DB must be untouched, and the job
+Each payload aims at the real trusted surfaces (venv site-packages, oh_my_grok/verifier.py) and at this test's own
+OMG_HOME DB and secrets. Every verification must fail, the trusted files and the DB must be untouched, and the job
 must not reach done. Run with the static scan ON (rejected before running) and OFF (the sandbox alone holds)."""
 import base64
 import json
@@ -12,12 +12,12 @@ import pytest
 
 from attacks import payload
 from helpers import SECRET_KEY
-from omo_grok import fixture as fx
-from omo_grok import integrity, sandbox, verifier
-from omo_grok.paths import CODE_ROOT, get_paths
+from oh_my_grok import fixture as fx
+from oh_my_grok import integrity, sandbox, verifier
+from oh_my_grok.paths import CODE_ROOT, get_paths
 
 SITE = sorted(str(p) for p in (CODE_ROOT / ".venv" / "lib").glob("python*/site-packages"))
-VERIFIER_SRC = CODE_ROOT / "omo_grok" / "verifier.py"
+VERIFIER_SRC = CODE_ROOT / "oh_my_grok" / "verifier.py"
 PTH = [Path(s) / "zz_omo_p1_probe.pth" for s in SITE]
 
 
@@ -174,7 +174,7 @@ def test_tamper_during_verification_fails_and_raises_event(harness, monkeypatch)
 
 
 def test_sandbox_view_is_minimal(tmp_path):
-    """What a candidate process can see: no state/, omo_grok/, venv, /home, /workspace; no network; ro runtime."""
+    """What a candidate process can see: no state/, oh_my_grok/, venv, /home, /workspace; no network; ro runtime."""
     pr = sandbox.probe()
     assert pr.ok and pr.mechanism == "bwrap", pr
     work = tmp_path / "work"

@@ -60,7 +60,8 @@ def _s1():
     dbs = list(_T.get("db", []))
     d = _os.getcwd()
     while True:
-        dbs += [_os.path.join(d, "omo.sqlite3"), _os.path.join(d, "state", "omo.sqlite3")]
+        for _name in ("omg.sqlite3", "omo.sqlite3"):
+            dbs += [_os.path.join(d, _name), _os.path.join(d, "state", _name)]
         nd = _os.path.dirname(d)
         if nd == d:
             break

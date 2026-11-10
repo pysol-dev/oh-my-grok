@@ -1,4 +1,4 @@
-"""`omoctl hook serve`: local-only per-run session token form. Token/Host/Origin gates, exact storage, no echo/log."""
+"""`omg hook serve`: local-only per-run session token form. Token/Host/Origin gates, exact storage, no echo/log."""
 import http.client
 import json
 import os
@@ -11,8 +11,8 @@ from urllib.parse import urlencode
 
 import pytest
 
-from omo_grok import hook_form
-from omo_grok.paths import get_paths
+from oh_my_grok import hook_form
+from oh_my_grok.paths import get_paths
 
 ROOT = Path(__file__).resolve().parents[2]
 URL = "https://hooks.example.test/routine/abc123"
@@ -20,12 +20,12 @@ KEY = "whk_FORMSECRET_0123456789"
 
 
 def _engine():
-    from omo_grok.engine import Engine
+    from oh_my_grok.engine import Engine
     return Engine()
 
 
 @pytest.fixture
-def srv(omo_home, tmp_path):
+def srv(omg_home, tmp_path):
     s = hook_form.HookFormServer(get_paths(), _engine, idle_seconds=60, url_file=tmp_path / "url")
     t = threading.Thread(target=s.serve, daemon=True)
     t.start()
@@ -71,7 +71,7 @@ def test_bad_token_or_path_is_404(srv, path):
     assert st == 404 and srv.token not in body
     st, _, _ = req(srv, "POST", path.format(t=srv.token), urlencode({"url_explorer": URL, "key_explorer": KEY}))
     assert st == 404
-    assert not (Path(os.environ["OMO_HOME"]) / "state" / "secrets" / "hooks.json").exists()
+    assert not (Path(os.environ["OMG_HOME"]) / "state" / "secrets" / "hooks.json").exists()
 
 
 @pytest.mark.parametrize("hdrs", [{"Host": "evil.example"}, {"Host": "localhost:{p}"}, {"Host": "127.0.0.1"},
@@ -85,7 +85,7 @@ def test_foreign_host_or_origin_is_rejected(srv, hdrs):
     assert st == 403
     st, _, _ = req(srv, "POST", path, urlencode({"url_explorer": URL, "key_explorer": KEY}), headers=h, host=host)
     assert st == 403
-    assert not (Path(os.environ["OMO_HOME"]) / "state" / "secrets" / "hooks.json").exists()
+    assert not (Path(os.environ["OMG_HOME"]) / "state" / "secrets" / "hooks.json").exists()
 
 
 def test_get_renders_all_roles_in_order_with_password_fields(srv):
@@ -95,8 +95,8 @@ def test_get_renders_all_roles_in_order_with_password_fields(srv):
     assert pos == sorted(pos)
     assert body.count("type='password'") == 2 * len(hook_form.FORM_ROLES)
     assert body.count("autocomplete='off' spellcheck='false'") == 2 * len(hook_form.FORM_ROLES)
-    for role, bot, routine in [("metis", "Metis", "omo-bus-metis"), ("qa-executor", "Metis", "omo-bus-qa-executor"),
-                               ("code-reviewer", "Momus", "omo-bus-code-reviewer")]:
+    for role, bot, routine in [("metis", "Metis", "omg-bus-metis"), ("qa-executor", "Metis", "omg-bus-qa-executor"),
+                               ("code-reviewer", "Momus", "omg-bus-code-reviewer")]:
         assert f"{role} &mdash; bot {bot}, routine {routine}" in body
         assert f"Open {bot}'s info pane &gt; Routines &gt; {routine}" in body
     assert "Configured already: <b>no</b>" in body and "hephaestus" not in body
@@ -109,7 +109,7 @@ def test_valid_post_stores_exactly_skips_blanks_and_never_echoes(srv, capfd):
     st, body, _ = req(srv, "POST", f"/setup/{srv.token}", urlencode(form),
                       headers={"Origin": f"http://127.0.0.1:{srv.port}"})
     assert st == 200
-    home = Path(os.environ["OMO_HOME"])
+    home = Path(os.environ["OMG_HOME"])
     data = json.loads((home / "state" / "secrets" / "hooks.json").read_text())
     assert data["metis"]["url"] == URL and data["metis"]["key"] == KEY
     assert set(data) == {"metis"}
@@ -135,7 +135,7 @@ def test_valid_post_stores_exactly_skips_blanks_and_never_echoes(srv, capfd):
 def test_one_blank_field_is_an_error_not_a_store(srv):
     st, body, _ = req(srv, "POST", f"/setup/{srv.token}", urlencode({"url_librarian": URL, "key_librarian": ""}))
     assert "<b>librarian</b>: error" in body and URL not in body
-    assert not (Path(os.environ["OMO_HOME"]) / "state" / "secrets" / "hooks.json").exists()
+    assert not (Path(os.environ["OMG_HOME"]) / "state" / "secrets" / "hooks.json").exists()
 
 
 def test_bad_content_type_or_oversize_is_400(srv):
@@ -146,7 +146,7 @@ def test_bad_content_type_or_oversize_is_400(srv):
     assert st == 400
 
 
-def test_finish_stops_the_server_and_removes_the_url_file(omo_home, tmp_path):
+def test_finish_stops_the_server_and_removes_the_url_file(omg_home, tmp_path):
     s = hook_form.HookFormServer(get_paths(), _engine, idle_seconds=60, url_file=tmp_path / "u")
     res = {}
     t = threading.Thread(target=lambda: res.setdefault("r", s.serve()), daemon=True)
@@ -158,15 +158,15 @@ def test_finish_stops_the_server_and_removes_the_url_file(omo_home, tmp_path):
     assert not t.is_alive() and res["r"] == "finished" and not (tmp_path / "u").exists()
 
 
-def test_idle_timeout_stops_the_server(omo_home, tmp_path):
+def test_idle_timeout_stops_the_server(omg_home, tmp_path):
     s = hook_form.HookFormServer(get_paths(), _engine, idle_seconds=1.5, url_file=tmp_path / "u")
     t0 = time.monotonic()
     assert s.serve() == "idle timeout" and time.monotonic() - t0 < 15
 
 
-def test_cli_serve_writes_url_only_to_file_and_stops_on_finish(omo_home, tmp_path):
+def test_cli_serve_writes_url_only_to_file_and_stops_on_finish(omg_home, tmp_path):
     uf = tmp_path / "cli_url"
-    p = subprocess.Popen([str(ROOT / "omoctl"), "hook", "serve", "--url-file", str(uf), "--idle-minutes", "1"],
+    p = subprocess.Popen([str(ROOT / "omg"), "hook", "serve", "--url-file", str(uf), "--idle-minutes", "1"],
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=dict(os.environ))
     try:
         first = p.stdout.readline()
@@ -195,7 +195,7 @@ def test_referrer_policy_is_same_origin_so_chrome_sends_a_real_origin(srv):
     st, body, _ = req(srv, "POST", f"/setup/{srv.token}",
                       urlencode({"url_executor": URL, "key_executor": KEY, "action": "save"}), headers=origin)
     assert st == 200 and "<b>executor</b>: configured" in body and URL not in body and KEY not in body
-    data = json.loads((Path(os.environ["OMO_HOME"]) / "state" / "secrets" / "hooks.json").read_text())
+    data = json.loads((Path(os.environ["OMG_HOME"]) / "state" / "secrets" / "hooks.json").read_text())
     assert data["executor"]["url"] == URL and data["executor"]["key"] == KEY
     # `null` stays forbidden
     st, _, _ = req(srv, "POST", f"/setup/{srv.token}", "action=save", headers={"Origin": "null"})
@@ -220,16 +220,16 @@ def test_too_many_form_fields_is_400_without_traceback(srv, capfd):
 
 
 def test_validate_url_turns_parse_errors_into_validation_error():
-    from omo_grok.errors import ValidationError
-    from omo_grok.hooks import validate_url
+    from oh_my_grok.errors import ValidationError
+    from oh_my_grok.hooks import validate_url
     for bad in ("https://[SENTINELHOSTCLI]/x", "https://h.example:99999999/x", "https://h.example:abc/x"):
         with pytest.raises(ValidationError) as ei:
             validate_url(bad)
         assert "SENTINEL" not in ei.value.message and "h.example" not in ei.value.message
 
 
-def test_hook_set_reprompts_on_malformed_url(omo_home, monkeypatch, capsys):
-    from omo_grok import cli
+def test_hook_set_reprompts_on_malformed_url(omg_home, monkeypatch, capsys):
+    from oh_my_grok import cli
     vals = iter(["https://[SENTINELHOSTCLI]/x", "https://hooks.example.test/ok", "k" * 32])
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(vals))
     rc = cli.main(["hook", "set", "explorer"])
@@ -237,15 +237,15 @@ def test_hook_set_reprompts_on_malformed_url(omo_home, monkeypatch, capsys):
     assert rc == 0 and "malformed" in err and "SENTINEL" not in out + err and "internal error" not in err
 
 
-def test_sigterm_stops_server_and_removes_url_file_and_log(omo_home, tmp_path):
+def test_sigterm_stops_server_and_removes_url_file_and_log(omg_home, tmp_path):
     """Momus r12 N3: kill -TERM must run the same cleanup as Finish (URL file + redirect log)."""
     uf = tmp_path / "cli_url"
-    log = Path(os.environ["OMO_HOME"]) / "state" / "logs" / "hook_serve.log"
+    log = Path(os.environ["OMG_HOME"]) / "state" / "logs" / "hook_serve.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text("status only\n")
     os.chmod(log, 0o600)
-    # omoctl cleans state/logs/hook_serve.log (and best-effort /tmp/omo_hook_serve.log). Assert the state log goes.
-    p = subprocess.Popen([str(ROOT / "omoctl"), "hook", "serve", "--url-file", str(uf), "--idle-minutes", "5"],
+    # omg cleans state/logs/hook_serve.log (and best-effort /tmp/omg_hook_serve.log). Assert the state log goes.
+    p = subprocess.Popen([str(ROOT / "omg"), "hook", "serve", "--url-file", str(uf), "--idle-minutes", "5"],
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=dict(os.environ))
     try:
         first = p.stdout.readline()
@@ -266,9 +266,9 @@ def test_sigterm_stops_server_and_removes_url_file_and_log(omo_home, tmp_path):
             p.kill()
 
 
-def test_sigint_stops_server_and_removes_url_file(omo_home, tmp_path):
+def test_sigint_stops_server_and_removes_url_file(omg_home, tmp_path):
     uf = tmp_path / "cli_url"
-    p = subprocess.Popen([str(ROOT / "omoctl"), "hook", "serve", "--url-file", str(uf), "--idle-minutes", "5"],
+    p = subprocess.Popen([str(ROOT / "omg"), "hook", "serve", "--url-file", str(uf), "--idle-minutes", "5"],
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=dict(os.environ))
     try:
         p.stdout.readline()

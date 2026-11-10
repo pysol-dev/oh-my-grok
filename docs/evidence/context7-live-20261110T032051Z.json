@@ -26,5 +26,5 @@
     "name": "Context7",
     "version": "4.5.0"
   },
-  "what": "engine-executed live Context7 query and engine-reverified citation (omo-grok test_context7_live)"
+  "what": "engine-executed live Context7 query and engine-reverified citation (oh-my-grok test_context7_live)"
 }
