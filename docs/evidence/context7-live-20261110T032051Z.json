@@ -1,0 +1,30 @@
+{
+  "authenticated": false,
+  "citation_receipt": {
+    "level": "engine_reverified",
+    "quote_excerpt": "### Define and use fixtures with @pytest.fixture",
+    "quote_sha256": "780f5dbf820dbfef565de9b8a17b4039c8827466fefda54c7a90be22889a30f5",
+    "status": "ok"
+  },
+  "endpoint": "https://mcp.context7.com/mcp",
+  "library_id": "/pytest-dev/pytest",
+  "limits": [
+    "a live response proves the service answered now, not that any bot called it",
+    "anonymous rate limits and key behaviour are not characterised"
+  ],
+  "protocol_version": "2025-11-25",
+  "query": "how to define and use fixtures",
+  "receipt": {
+    "input_sha256": "b03d50435281f004717f7adb2c55e2fbac2e170a0339db41137de41b56945c46",
+    "level": "engine_executed",
+    "response_sha256": "61eab762b407235510e96b91e01f60fb0f1b46a12b852d62d022f3e1ddd155b6",
+    "status": "ok",
+    "tool_version": "Context7@4.5.0",
+    "transcript_artifact_sha256": "84179d6bf6738b55895b0af33eef4f02a3e7a58e6fb5f1d3df994b622817b9de"
+  },
+  "server": {
+    "name": "Context7",
+    "version": "4.5.0"
+  },
+  "what": "engine-executed live Context7 query and engine-reverified citation (omo-grok test_context7_live)"
+}

@@ -23,8 +23,15 @@ user ─chat─▶ Hephaestus ─MCP─▶ omo engine ◀─MCP── role routi
 |---|---|
 | `db.py` | Connection (WAL, foreign_keys, busy_timeout), `BEGIN IMMEDIATE` transactions, versioned checksummed migrations, backup/restore with integrity checks |
 | `states.py` | Explicit task, job and dispatch transition tables. Illegal transitions raise |
-| `engine.py` | Every workflow rule: submit, the DAG, claim/lease, complete handlers, plan revisions, approvals, verification, repair loop, independence, final gate, reconcile, cancel/resume, status/export |
-| `mcp_server.py` | The 8 MCP tools (pydantic-validated). Logs go to stderr, redacted. No approve/ship/shell/secret tools |
+| `engine.py` | Every workflow rule: submit, the DAG, claim/lease, complete handlers, plan revisions, approvals, verification, repair loop, independence, final gate, reconcile, cancel/resume, status/export. Also intent gating, roster, escalation, projection flush, LSP and git and docs gates. The database is the only transition authority |
+| `features.py` | Feature modes (`off` / `shadow` / `enforce`, boulder `off` / `on`). Frozen into the job at submit. Default off |
+| `roster.py` | Smallest adequate team from a five-field scope. Escalation only raises the class |
+| `projection.py` | Locked atomic writer for `.omo/boulder.json` and the active-plan markdown. Derived; never read back |
+| `lsp/` | Real language-server client, profiles, sandboxed runner and base/candidate delta. Not a renamed CLI checker |
+| `context7.py` | Streamable-HTTP connector to Context7. Engine receipts only; a later re-fetch is not a receipt |
+| `skills.py` | Delivers the git-master skill text into the executor packet. Delivery is not proof the model obeyed it |
+| `operational.py` | Derives the doctor live-status line from recorded evidence. Never a constant |
+| `mcp_server.py` | The 10 MCP tools (pydantic-validated): submit, claim, context, checkpoint, complete, status, reconcile, cancel, escalate, docs. Logs go to stderr, redacted. No approve/ship/shell/secret tools |
 | `cli.py` | `omoctl`: doctor, migrate, status, submit, plan show, approve/deny (TTY), cancel (TTY), resume, reconcile, export, backup/restore, hook set/check/list, roles, test |
 | `transport.py` | Bounded-timeout HTTP POST (stdlib). Hook URLs must be https (`hooks.py`); plain http is accepted only for 127.0.0.1/localhost with `OMO_ALLOW_INSECURE_HOOKS=1` (tests) |
 | `hooks.py` | Webhook URL and key store `state/secrets/hooks.json` (0600 file in a 0700 dir). Separate from job state |

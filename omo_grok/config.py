@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
+from . import features
 from .errors import ValidationError
+from .paths import CODE_ROOT, node_path, python_path, site_packages, tools_dir
 
 DEFAULT_POLICY = {
     "max_repair_cycles": 3,
@@ -23,6 +26,12 @@ DEFAULT_POLICY = {
     "max_sends_per_flush": 10,
     "repo_allowlist": [],
     "inline_dispatch": True,
+    "projection_lock_seconds": 10,
+    "context7_url": "https://mcp.context7.com/mcp",
+    "context7_timeout_seconds": 30,
+    "docs_max_per_job": 20,
+    "git_max_commits": 50,
+    "features": {},
 }
 
 REMOVED_POLICY_KEYS = {"require_independent_assurance", "fixture_allow_reduced_assurance"}
@@ -56,7 +65,34 @@ def load_policy(config_dir: Path) -> dict:
         if unknown:
             raise ValidationError(f"unknown policy keys: {sorted(unknown)}")
         pol.update(data)
+    pol["features"] = features.normalize(pol.get("features"))
     return pol
+
+
+_PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def placeholder_values() -> dict[str, str]:
+    """The only variables shipped config may reference, so no file needs to hardcode an install location."""
+    return {"OMO_CODE_ROOT": str(CODE_ROOT), "OMO_PYTHON": python_path(), "OMO_TOOLS": str(tools_dir()),
+            "OMO_NODE": node_path(), "OMO_SITE": site_packages()}
+
+
+def expand_placeholders(obj, values: dict[str, str] | None = None):
+    values = values or placeholder_values()
+
+    def sub(m):
+        if m.group(1) not in values:
+            raise ValidationError(f"unknown config placeholder ${{{m.group(1)}}}", known=sorted(values))
+        return values[m.group(1)]
+
+    if isinstance(obj, str):
+        return _PLACEHOLDER.sub(sub, obj)
+    if isinstance(obj, list):
+        return [expand_placeholders(x, values) for x in obj]
+    if isinstance(obj, dict):
+        return {k: expand_placeholders(v, values) for k, v in obj.items()}
+    return obj
 
 
 def load_verifier_profiles(config_dir: Path) -> dict:
@@ -64,7 +100,7 @@ def load_verifier_profiles(config_dir: Path) -> dict:
     if not p.exists():
         return {}
     data = json.loads(p.read_text())
-    return data.get("profiles", {})
+    return expand_placeholders(data.get("profiles", {}))
 
 
 REQUIRED_PROFILE_KEYS = {"argv": list, "cwd": str, "env_allow": list, "timeout_seconds": (int, float)}

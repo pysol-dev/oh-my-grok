@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "_doc": "Engine-owned language-server profiles (spec/ADAPTIVE.md section 7). Only the languages with an enabled profile are verified; every other code extension below fails the gate closed with diagnostics_unavailable. Add a profile (argv, canary) to extend; nothing here is verified until its canary passes on the host.",
+  "code_extensions": {
+    ".py": "python", ".pyi": "python",
+    ".ts": "typescript", ".tsx": "typescript", ".mts": "typescript", ".cts": "typescript",
+    ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+    ".go": "go", ".rs": "rust", ".java": "java", ".kt": "kotlin", ".c": "c", ".h": "c", ".cc": "cpp", ".cpp": "cpp",
+    ".hpp": "cpp", ".cs": "csharp", ".rb": "ruby", ".php": "php", ".swift": "swift", ".scala": "scala",
+    ".sh": "shell", ".bash": "shell"
+  },
+  "profiles": {
+    "python-ruff": {
+      "language": "python",
+      "extensions": [".py", ".pyi"],
+      "argv": ["${OMO_TOOLS}/venv/bin/ruff", "server"],
+      "tool_dirs": ["${OMO_TOOLS}"],
+      "mode": "pull",
+      "fail_on": ["error", "warning"],
+      "config_files": ["pyproject.toml", "ruff.toml", ".ruff.toml"],
+      "exclude": [".venv/*", "venv/*", "node_modules/*", "build/*", "dist/*"],
+      "suppression_patterns": ["#\\s*noqa\\b", "#\\s*ruff:\\s*noqa", "#\\s*type:\\s*ignore", "#\\s*fmt:\\s*(off|skip)"],
+      "canary": {
+        "bad": {"path": "canary_bad.py", "text": "def canary():\n    return undefined_canary_name\n", "expect_codes": ["F821"]},
+        "good": {"path": "canary_good.py", "text": "def canary(x: int) -> int:\n    return x + 1\n"}
+      }
+    },
+    "python-basedpyright": {
+      "language": "python",
+      "extensions": [".py", ".pyi"],
+      "argv": ["${OMO_NODE}", "${OMO_SITE}/basedpyright/dist/pyright-langserver.js", "--stdio"],
+      "tool_dirs": ["${OMO_TOOLS}"],
+      "mode": "push",
+      "quiet_seconds": 1.0,
+      "address_space_mb": null,
+      "fail_on": ["error"],
+      "config_files": ["pyrightconfig.json", "pyproject.toml"],
+      "exclude": [".venv/*", "venv/*", "node_modules/*", "build/*", "dist/*"],
+      "settings": {
+        "python": {"analysis": {"typeCheckingMode": "standard", "diagnosticMode": "openFilesOnly",
+                                 "diagnosticSeverityOverrides": {"reportMissingImports": "none", "reportMissingModuleSource": "none"}}},
+        "basedpyright": {"analysis": {"typeCheckingMode": "standard", "diagnosticMode": "openFilesOnly"}}
+      },
+      "suppression_patterns": ["#\\s*type:\\s*ignore", "#\\s*pyright:\\s*(ignore|basic|off)", "#\\s*basedpyright:\\s*(ignore|ignore\\[)"],
+      "canary": {
+        "bad": {"path": "canary_bad.py", "text": "canary_value: int = 'text'\nprint(undefined_canary_name)\n",
+                "expect_codes": ["reportAssignmentType", "reportUndefinedVariable"]},
+        "good": {"path": "canary_good.py", "text": "canary_value: int = 1\nprint(canary_value)\n"}
+      }
+    },
+    "typescript": {
+      "language": "typescript",
+      "extensions": [".ts", ".tsx", ".mts", ".cts"],
+      "language_ids": {".tsx": "typescriptreact"},
+      "argv": ["${OMO_NODE}", "${OMO_TOOLS}/node/node_modules/typescript-language-server/lib/cli.mjs", "--stdio"],
+      "tool_dirs": ["${OMO_TOOLS}"],
+      "mode": "push",
+      "quiet_seconds": 1.0,
+      "address_space_mb": null,
+      "fail_on": ["error"],
+      "init_options": {"tsserver": {"path": "${OMO_TOOLS}/node/node_modules/typescript/lib/tsserver.js"}},
+      "config_files": ["tsconfig.json", "jsconfig.json"],
+      "exclude": ["node_modules/*", "dist/*", "build/*"],
+      "suppression_patterns": ["@ts-ignore", "@ts-nocheck", "@ts-expect-error", "eslint-disable"],
+      "canary": {
+        "bad": {"path": "canary_bad.ts", "text": "export const canary: number = 'text';\n", "expect_codes": ["2322"]},
+        "good": {"path": "canary_good.ts", "text": "export const canary: number = 1;\n"}
+      }
+    }
+  }
+}

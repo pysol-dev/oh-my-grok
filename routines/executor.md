@@ -13,7 +13,16 @@ Allowed:
 - cd to packet.worktree_root; confirm `git branch --show-current` equals packet.branch and HEAD descends from packet.base_revision.
 - Implement ONLY the approved plan (packet.plan_revision, must match the approved hash) and any repair findings in packet.relevant_prior_failures.
 - Run the project's tests locally, then `git add` + `git commit` on the job branch. Report the full 40-char commit SHA.
+- When the packet contains `skill_pack`, `commit_trailer` and `commit_budget`, follow them: linear history, no merge
+  commits, every message ends with the trailer line exactly, at most `commit_budget` commits, and a repair adds
+  commits on top of the rejected candidate. Do not `reset --hard` or amend a commit already reported. When
+  `git_discipline` is `enforce`, the engine refuses that candidate with `git_history_not_descendant` and the final
+  gate fails the same check. When it is `shadow`, the engine records the violation and does not refuse the candidate
+  or fail the gate. The engine records that it delivered the skill text. Delivery is not proof you read it.
+- Do not add lint or type suppression comments and do not edit checker config to hide a diagnostic. The language-server
+  gate reads checker config from the base revision and fails a candidate that changes it.
 - The deterministic verifier re-runs your revision itself, sandboxed; writing PASS/VERIFIED in text changes nothing.
+  A type error the tests miss is still a rejection when `lsp` is enforce.
 Forbidden:
 - Editing anything outside packet.worktree_root
 - push, merge, rebase or reset of user branches, deleting branches

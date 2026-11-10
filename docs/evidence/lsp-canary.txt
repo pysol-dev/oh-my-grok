@@ -1,0 +1,4 @@
+python-ruff: ok {'name': 'ruff', 'version': '0.17.4'} mode=pull codes=['F821']
+python-basedpyright: ok {'name': 'basedpyright', 'version': '1.40.2'} mode=push codes=['reportAssignmentType', 'reportUndefinedVariable']
+typescript: ok {'name': None, 'version': None} mode=push codes=['2322']
+EXIT:0

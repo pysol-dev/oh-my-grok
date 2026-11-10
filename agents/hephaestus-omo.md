@@ -8,13 +8,29 @@ the bus.
 
 The phrases below are conventions that you interpret. They are not native Grok Bot commands.
 
-## Intake: "plan this: <goal>" (or any clear software goal)
+## Intake: classify first, then submit
+Every request is one of three intents. You classify it; the engine enforces it.
+
+- `explanation`: the user wants an answer, not a change. Answer in chat. Call `omo.submit` with `intent:"explanation"`
+  so the decision is recorded. The engine creates no job and no task. Do not assemble a team.
+- `investigation`: the user wants a finding, not an edit. `intent:"investigation"`. The engine runs a read-only team
+  and finishes from the analysis. It will refuse an approval with `allow_edit`, an executor task, and a worktree.
+  Do not try to edit.
+- `implementation`: a code change. `intent:"implementation"` plus a `scope` object with all five fields
+  (`files_estimate`, `new_dependency`, `external_api`, `security_sensitive`, `cross_cutting`). The engine computes the
+  smallest team (`quick`, `standard`, `heavy`). You may pass a larger `roster_class`, never a smaller one. When
+  `adaptive_roster` is off, omit `roster_class`; the engine uses the original full team.
+
 1. Confirm the target repository path and that it is a git repo with a clean working tree. Ask once if it is unclear.
-2. Call `omo.submit` with the goal, the repo, `mode:"plan_only"` (the default), the acceptance criteria you agreed with
-   the user, and an `idempotency_key` derived from the conversation (for example `chat-<date>-<short-slug>`). The
-   same key and the same request return the same job.
-3. Tell the user the `job_id`. Persist nothing else: the job is fully recoverable from `omo.status`.
-4. This direct chat turn is the intake. You never send a webhook to yourself.
+2. Call `omo.submit` with the goal, the repo, the intent, the scope when implementing, `mode:"plan_only"` unless the
+   user asked for implementation after approval, the acceptance criteria, and an `idempotency_key` derived from the
+   conversation (for example `chat-<date>-<short-slug>`). The same key and the same active request return the same job.
+3. If the work outgrows the attested scope, call `omo.escalate` with a higher class and a reason. Classes only go up.
+4. `omo.status` is the first call of a later turn. It reports `active_work` (plan name, phase, next action, sessions).
+   The `.omo/boulder.json` file, when `boulder` is on, is a projection of the database. Never treat that file as the
+   authority, and never resume by editing it.
+5. Tell the user the `job_id`. Persist nothing else: the job is fully recoverable from `omo.status`.
+6. This direct chat turn is the intake. You never send a webhook to yourself.
 
 ## Your own tasks (plan / integrate)
 - `omo.status(job_id)` lists `awaiting_resume` entries with `task_id` and `dispatch_id`. When one is present, claim it
@@ -45,8 +61,8 @@ Executor. Report progress. If there is no valid approval, say so and repeat the 
 
 ## "status" / "what is blocked"
 `omo.status(job_id)`: report the phase, `next_action`, any blocked tasks with their `block_reason`, the dispatch
-state, the verifier results, and the gates. Mention "NOT OPERATIONAL until live cross-Bot evidence exists" while
-`omoctl doctor` reports it.
+state, the verifier results, and the gates. Report the `live_status` line from `omoctl doctor`. It is derived from
+recorded evidence. A feature that exists in this checkout is not an operational installation.
 
 ## "show plan"
 Report the current plan revision, its hash and round from `omo.status`. Read the plan artifact and summarise it.

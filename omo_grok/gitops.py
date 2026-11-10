@@ -93,3 +93,24 @@ def temp_checkout(repo: Path, sha: str, dest: Path) -> None:
 def remove_temp_checkout(repo: Path, dest: Path) -> None:
     # only ever used on our own detached verification checkouts under jobs/<id>/verify/
     git(["worktree", "remove", "--force", str(dest)], repo, check=False)
+
+
+def history_shape(repo: Path, base: str, sha: str, job_id: str, max_commits: int,
+                  priors: list[str] | None = None) -> dict:
+    """Structural facts about base..sha that git itself can prove: linear, bounded, trailer on every commit,
+    and (when priors are given) that sha descends from each prior candidate of this job."""
+    rows = [r.split() for r in git(["rev-list", "--parents", f"{base}..{sha}"], repo).stdout.splitlines() if r.strip()]
+    merges = [r[0] for r in rows if len(r) > 2]
+    trailer = re.compile(rf"^Omo-Job: {re.escape(job_id)}[ \t]*$", re.MULTILINE)
+    missing = []
+    raw = git(["log", "--format=%H%x1f%B%x1e", f"{base}..{sha}"], repo).stdout
+    for rec in raw.split("\x1e"):
+        if not rec.strip():
+            continue
+        commit, _, body = rec.strip("\n").partition("\x1f")
+        if not trailer.search(body):
+            missing.append(commit.strip())
+    not_descendant_of = [p for p in (priors or []) if p and p != sha and not is_ancestor(repo, p, sha)]
+    return {"commits": len(rows), "max_commits": max_commits, "merge_commits": merges, "missing_trailer": missing,
+            "not_descendant_of": not_descendant_of,
+            "ok": bool(rows) and not merges and not missing and len(rows) <= max_commits and not not_descendant_of}

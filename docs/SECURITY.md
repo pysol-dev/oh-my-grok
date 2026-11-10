@@ -531,9 +531,19 @@ build did not create or verify any Auto Review rule.
   deletes branches. Each job works in its own worktree and branch.
 - Changes to orchestrator code, config or verifier policy should be reviewed (ledger T07: Momus review).
 
+## Evidence levels (adaptive orchestration)
+A gate accepts only an `engine_executed` or `engine_reverified` receipt bound to the exact revision. `engine_delivered` (the engine handed text to a bot) and `agent_claimed` (a bot said it did something) never satisfy a gate. Receipts are tamper-evident to cooperating agents. They are not tamper-proof against a hostile process that shares this account and this database.
+
+Language servers run in the same bubblewrap sandbox as the verifier. The verified set is Python (ruff, basedpyright) and TypeScript (`typescript-language-server`). A changed file in another code language fails closed with `diagnostics_unavailable`. The engine does not rename a CLI checker as an LSP.
+
+`docs` calls `https://mcp.context7.com/mcp` from the engine. An optional `CONTEXT7_API_KEY` is sent as a Bearer header and is not written to logs or receipts. The stored response is what a citation must quote. A second call to the same URL does not prove a bot made the first one.
+
+The git-master skill text is delivered in the executor packet and the engine records that delivery. It does not prove the model read or followed the skill. When `git_discipline` is `shadow` or `enforce`, the engine records whether the history is linear, inside the commit budget, trailer-bearing, and descended from every earlier candidate of that job. `shadow` only records a rewrite. `enforce` refuses it at submit with `git_history_not_descendant` and fails the same check in the final gate.
+
 ## External network dependencies
 | Dependency | Failure behaviour |
 |---|---|
 | Grok Bot routine webhooks (HTTPS POST) | Retried with capped backoff. 4xx auth or missing-routine responses block with a diagnostic. Re-wakes are bounded |
 | Grok Bot routine runs (platform usage, hourly limits) | An hourly per-Bot cap, per-Bot serialization and a bounded re-wake count keep usage low. Unclaimed work blocks; it does not flood |
-| PyPI (installation only) | Install from `requirements.lock`. No network at runtime |
+| PyPI (installation only) | Install from `requirements.lock` and `tooling/requirements-tools.lock`. No network at verifier runtime |
+| Context7 (`https://mcp.context7.com/mcp`) | Only when a job's `docs_evidence` feature is not off and a task calls `docs`. A failed call is a failed receipt and cannot be cited. Anonymous rate limits are not characterised |

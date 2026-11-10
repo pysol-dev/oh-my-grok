@@ -11,12 +11,12 @@ from omo_grok.states import (DISPATCH_STATUSES, JOB_PHASES, TASK_STATUSES, check
 
 def test_migrations_apply_once_and_record_checksums(tmp_path):
     c = db.connect(tmp_path / "x.sqlite3")
-    assert db.migrate(c, dry_run=True) == [1, 2, 3, 4]
+    assert db.migrate(c, dry_run=True) == [1, 2, 3, 4, 5]
     assert db.current_version(c) == 0
-    assert db.migrate(c) == [1, 2, 3, 4]
+    assert db.migrate(c) == [1, 2, 3, 4, 5]
     assert db.migrate(c) == []
     rows = c.execute("SELECT version, checksum FROM schema_migrations").fetchall()
-    assert [r[0] for r in rows] == [1, 2, 3, 4] and all(len(r[1]) == 64 for r in rows)
+    assert [r[0] for r in rows] == [1, 2, 3, 4, 5] and all(len(r[1]) == 64 for r in rows)
     tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     for t in ["jobs", "tasks", "task_attempts", "artifacts", "plan_revisions", "approvals", "role_bindings",
               "dispatch_outbox", "verifications", "reviews", "events", "hooks_meta", "gate_results"]:
@@ -27,7 +27,7 @@ def test_partial_migration_target(tmp_path):
     c = db.connect(tmp_path / "x.sqlite3")
     assert db.migrate(c, target=1) == [1]
     assert db.current_version(c) == 1
-    assert db.migrate(c) == [2, 3, 4]
+    assert db.migrate(c) == [2, 3, 4, 5]
 
 
 def test_checksum_mismatch_detected(tmp_path):
@@ -77,14 +77,15 @@ _TASK_OK = {
     "passed": set(), "rejected": set(), "failed": set(), "cancelled": set(),
 }
 _STOP = {"blocked", "failed", "cancelled"}
+_REENTRY = {"research", "analysis"}  # escalation (spec/ADAPTIVE.md 5.4) re-opens the earliest incomplete phase
 _JOB_OK = {
     "research": {"analysis"} | _STOP,
-    "analysis": {"planning"} | _STOP,
-    "planning": {"plan_review"} | _STOP,
-    "plan_review": {"planning", "awaiting_approval"} | _STOP,
-    "awaiting_approval": {"running", "plan_approved", "planning"} | _STOP,
-    "plan_approved": {"running", "planning"} | _STOP,
-    "running": {"done"} | _STOP,
+    "analysis": {"planning", "research", "done"} | _STOP,  # done: read-only investigations only (SUP-4, engine-guarded)
+    "planning": {"plan_review"} | _REENTRY | _STOP,
+    "plan_review": {"planning", "awaiting_approval"} | _REENTRY | _STOP,
+    "awaiting_approval": {"running", "plan_approved", "planning"} | _REENTRY | _STOP,
+    "plan_approved": {"running", "planning"} | _REENTRY | _STOP,
+    "running": {"done"} | _REENTRY | _STOP,
     "blocked": {"research", "analysis", "planning", "plan_review", "awaiting_approval", "plan_approved", "running",
                 "failed", "cancelled"},
     "done": set(), "failed": set(), "cancelled": set(),
@@ -177,7 +178,7 @@ def test_auto_backup_before_migrating_nonempty_db(omo_home):
     db.migrate(c, target=1)
     c.close()
     e = Engine()
-    assert db.current_version(e.conn) == db.LATEST_VERSION == 4
+    assert db.current_version(e.conn) == db.LATEST_VERSION == 5
     assert list(p.backups_dir.glob("pre-migrate-v1-*.sqlite3"))
     e.close()
 

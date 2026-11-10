@@ -34,14 +34,16 @@ JOB_PHASES = (J_RESEARCH, J_ANALYSIS, J_PLANNING, J_PLAN_REVIEW, J_AWAITING_APPR
 JOB_TERMINAL = frozenset({J_DONE, J_FAILED, J_CANCELLED})
 _STOP = frozenset({J_BLOCKED, J_FAILED, J_CANCELLED})
 
+_REPLAN_ENTRY = frozenset({J_RESEARCH, J_ANALYSIS})  # escalation sends a job back to its earliest incomplete phase
+
 JOB_TRANSITIONS: dict[str, frozenset[str]] = {
     J_RESEARCH: frozenset({J_ANALYSIS}) | _STOP,
-    J_ANALYSIS: frozenset({J_PLANNING}) | _STOP,
-    J_PLANNING: frozenset({J_PLAN_REVIEW}) | _STOP,
-    J_PLAN_REVIEW: frozenset({J_PLANNING, J_AWAITING_APPROVAL}) | _STOP,
-    J_AWAITING_APPROVAL: frozenset({J_RUNNING, J_PLAN_APPROVED, J_PLANNING}) | _STOP,
-    J_PLAN_APPROVED: frozenset({J_RUNNING, J_PLANNING}) | _STOP,
-    J_RUNNING: frozenset({J_DONE}) | _STOP,
+    J_ANALYSIS: frozenset({J_PLANNING, J_RESEARCH, J_DONE}) | _STOP,  # J_DONE only for read-only investigations
+    J_PLANNING: frozenset({J_PLAN_REVIEW}) | _REPLAN_ENTRY | _STOP,
+    J_PLAN_REVIEW: frozenset({J_PLANNING, J_AWAITING_APPROVAL}) | _REPLAN_ENTRY | _STOP,
+    J_AWAITING_APPROVAL: frozenset({J_RUNNING, J_PLAN_APPROVED, J_PLANNING}) | _REPLAN_ENTRY | _STOP,
+    J_PLAN_APPROVED: frozenset({J_RUNNING, J_PLANNING}) | _REPLAN_ENTRY | _STOP,
+    J_RUNNING: frozenset({J_DONE}) | _REPLAN_ENTRY | _STOP,
     # resume from blocked goes back to the phase recorded in jobs.blocked_from
     J_BLOCKED: frozenset({J_RESEARCH, J_ANALYSIS, J_PLANNING, J_PLAN_REVIEW, J_AWAITING_APPROVAL, J_PLAN_APPROVED, J_RUNNING,
                           J_FAILED, J_CANCELLED}),

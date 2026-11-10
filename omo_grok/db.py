@@ -264,6 +264,70 @@ ALTER TABLE verifications ADD COLUMN assurance TEXT NOT NULL DEFAULT 'none';
 ALTER TABLE verifications ADD COLUMN sandbox TEXT NOT NULL DEFAULT 'none';
 ALTER TABLE verifications ADD COLUMN tamper_json TEXT NOT NULL DEFAULT '[]';
 """),
+    (5, "adaptive_orchestration", """
+ALTER TABLE jobs ADD COLUMN intent TEXT;
+ALTER TABLE jobs ADD COLUMN roster_class TEXT;
+ALTER TABLE jobs ADD COLUMN scope_json TEXT;
+CREATE TABLE escalations (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  seq INTEGER NOT NULL,
+  from_class TEXT NOT NULL,
+  to_class TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  automatic INTEGER NOT NULL DEFAULT 0,
+  observed_json TEXT,
+  created_at TEXT NOT NULL,
+  UNIQUE (job_id, seq)
+);
+CREATE TABLE tool_receipts (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  task_id TEXT,
+  kind TEXT NOT NULL,
+  level TEXT NOT NULL CHECK (level IN ('engine_executed','engine_reverified','engine_delivered')),
+  status TEXT NOT NULL,
+  revision TEXT,
+  tool TEXT NOT NULL,
+  tool_version TEXT,
+  argv_sha256 TEXT,
+  config_sha256 TEXT,
+  input_sha256 TEXT,
+  output_sha256 TEXT,
+  artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+  summary_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX receipts_job ON tool_receipts(job_id, kind);
+CREATE TABLE work_sessions (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  attempt_id TEXT NOT NULL UNIQUE,
+  session_token TEXT NOT NULL UNIQUE,
+  role TEXT NOT NULL,
+  bot_id TEXT,
+  started_at TEXT NOT NULL
+);
+CREATE INDEX sessions_job ON work_sessions(job_id);
+CREATE TABLE boulder_projection (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(id),
+  generation INTEGER NOT NULL,
+  sha256 TEXT,
+  pending_sha256 TEXT,
+  plan_sha256 TEXT,
+  pending_plan_sha256 TEXT,
+  status TEXT NOT NULL,
+  last_error TEXT,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE repo_leases (
+  repo_path TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  acquired_at TEXT NOT NULL
+);
+"""),
 ]
 
 LATEST_VERSION = MIGRATIONS[-1][0]

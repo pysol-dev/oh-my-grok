@@ -13,7 +13,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 OMOCTL = str(ROOT / "omoctl")
-DOCUMENTED = [["doctor"], ["migrate"], ["status"], ["submit"], ["plan", "show"], ["approve"], ["deny"], ["cancel"],
+DOCUMENTED = [["features"], ["boulder"], ["receipts"], ["docs"], ["attest"], ["lsp", "status"], ["lsp", "canary"], ["lsp", "check"], ["doctor"], ["migrate"], ["status"], ["submit"], ["plan", "show"], ["approve"], ["deny"], ["cancel"],
               ["reconcile"], ["hook", "set"], ["hook", "check"], ["hook", "list"], ["hook", "serve"], ["test"], ["export"],
               ["resume"], ["backup"], ["restore"], ["roles", "list"], ["roles", "bind"], ["roles", "import"]]
 
@@ -51,7 +51,7 @@ def test_argument_validation_exit_2(args):
 def test_doctor_and_migrate_in_isolated_home(omo_home):
     env = dict(os.environ)
     r = run(["migrate", "--dry-run", "--json"], env=env)
-    assert r.returncode == 0 and json.loads(r.stdout)["pending"] == [1, 2, 3, 4]
+    assert r.returncode == 0 and json.loads(r.stdout)["pending"] == [1, 2, 3, 4, 5]
     assert run(["migrate"], env=env).returncode == 0
     r = run(["doctor", "--json"], env=env)
     d = json.loads(r.stdout)
@@ -134,3 +134,22 @@ def test_hook_set_uses_hidden_prompt_and_never_echoes(omo_home):
     assert json.loads(r.stdout)["explorer"] is True and secret not in r.stdout and "hooks.invalid" not in r.stdout
     r = run(["hook", "check", "explorer", "--json"], env=env)
     assert r.returncode == 0 and secret not in r.stdout and "hooks.invalid" not in r.stdout
+
+
+def test_doctor_state_is_derived_from_evidence_and_attest_needs_a_tty(omo_home):
+    env = dict(os.environ)
+    assert run(["migrate"], env=env).returncode == 0
+    d = json.loads(run(["doctor", "--json"], env=env).stdout)
+    assert d["live_status"].startswith("NOT OPERATIONAL")
+    assert set(d["info"]["operational_criteria"]) == {"real_job_gate_with_lsp_and_git_receipts", "host_cutover",
+                                                      "live_smoke", "live_e2e"}
+    r = run(["attest", "host_cutover", "--statement", "x"], env=env, input_="ATTEST\n")
+    assert r.returncode == 7 and "TTY" in r.stderr, "piped input can never record an attestation"
+    assert json.loads(run(["doctor", "--json"], env=env).stdout)["live_status"].startswith("NOT OPERATIONAL")
+
+
+def test_features_command_shows_defaults_all_off(omo_home):
+    env = dict(os.environ)
+    assert run(["migrate"], env=env).returncode == 0
+    d = json.loads(run(["features", "--json"], env=env).stdout)
+    assert set(d["configured"].values()) == {"off"}

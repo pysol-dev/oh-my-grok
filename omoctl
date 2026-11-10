@@ -2,5 +2,11 @@
 # omoctl: thin wrapper; all logic lives in omo_grok (shared with the MCP server).
 set -euo pipefail
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+PY="${OMO_PYTHON:-$HERE/.venv/bin/python}"
+if [ ! -x "$PY" ]; then
+  echo "omoctl: interpreter not found: $PY" >&2
+  echo "omoctl: run $HERE/scripts/bootstrap.sh (creates .venv from requirements.lock and installs the pinned tools)" >&2
+  exit 8
+fi
 export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
-exec "$HERE/.venv/bin/python" -m omo_grok.cli "$@"
+exec "$PY" -m omo_grok.cli "$@"

@@ -51,6 +51,13 @@ def _confirm(prompt: str, expect: str) -> bool:
     return ans == expect
 
 
+def cmd_mcp_command(args) -> int:
+    """The exact, absolute command to register as the command-based `omo` MCP app (computed, never stored)."""
+    from .paths import mcp_command
+    print(mcp_command())
+    return 0
+
+
 # ---------------------------------------------------------------- doctor / migrate
 def cmd_doctor(args) -> int:
     paths = get_paths()
@@ -121,8 +128,24 @@ def cmd_doctor(args) -> int:
     add("git_available", shutil.which("git") is not None)
     sb = sandbox.probe()  # candidate code never runs without it; verification fails closed
     add("candidate_sandbox", sb.ok, f"{sb.mechanism}: {sb.detail}")
+    lsp_info = {}
+    try:
+        from .lsp import profiles as lsp_profiles
+        from .lsp import runner as lsp_runner
+        cfg = lsp_profiles.load(paths.config_dir)
+        lsp_info = lsp_runner.tool_status(cfg)
+        pol = load_policy(paths.config_dir)
+        needed = pol["features"].get("lsp", "off") != "off"
+        add("lsp_config_valid", True, ",".join(sorted(lsp_info)))
+        missing = {n: v["missing"] for n, v in lsp_info.items() if not v["present"]}
+        if needed:
+            add("lsp_tools_present", not missing, "; ".join(f"{n}: {m}" for n, m in missing.items())
+                + (" (run scripts/bootstrap.sh)" if missing else ""))
+    except OmoError as e:
+        add("lsp_config_valid", False, e.message)
     # informational (do not fail doctor): live wiring is the operator's job
-    info = {"hooks_configured": hook_status(paths)}
+    info = {"hooks_configured": hook_status(paths), "lsp_tools": lsp_info,
+            "features_default": load_policy(paths.config_dir)["features"]}
     try:
         e = _engine()
         info["bindings"] = [{k: b[k] for k in ("role", "bot_name", "routine_id", "verified_at")}
@@ -131,8 +154,14 @@ def cmd_doctor(args) -> int:
     except Exception as ex:
         info["bindings_error"] = redact(str(ex))
     ok = all(c["ok"] for c in checks)
-    data = {"ok": ok, "version": __version__, "checks": checks, "info": info,
-            "live_status": "NOT OPERATIONAL until live cross-Bot evidence exists (omoctl test live --fixture-only)"}
+    try:
+        e = _engine()
+        op = e.operational_state()
+        e.close()
+    except Exception as ex:  # pragma: no cover
+        op = {"state": "NOT OPERATIONAL: evidence could not be read (" + redact(str(ex))[:100] + ")", "criteria": {}}
+    info["operational_criteria"] = op["criteria"]
+    data = {"ok": ok, "version": __version__, "checks": checks, "info": info, "live_status": op["state"]}
     lines = [f"{'PASS' if c['ok'] else 'FAIL'}  {c['check']}  {c['detail']}" for c in checks]
     lines.append("hooks configured: " + ", ".join(f"{r}={v}" for r, v in info["hooks_configured"].items()))
     lines.append(data["live_status"])
@@ -489,6 +518,117 @@ def cmd_test(args) -> int:
     return EXIT_OK if res.get("result") == "PASSED" else EXIT_TEST
 
 
+# ---------------------------------------------------------------- adaptive surfaces
+def cmd_features(args) -> int:
+    from . import features
+    pol = load_policy(get_paths().config_dir)
+    data = {"configured": pol["features"], "modes": {k: list(v) for k, v in features.FEATURE_MODES.items()},
+            "note": "a job freezes the effective set at submit; later changes never affect a running job"}
+    if args.job:
+        e = _engine()
+        data["job"] = e.job_features(args.job)
+        e.close()
+    _out(args, data, "\n".join([f"{k:<16} configured={pol['features'][k]:<8} modes={'|'.join(m)}"
+                                for k, m in features.FEATURE_MODES.items()]
+                               + ([f"job {args.job}: {data['job']}"] if args.job else [])))
+    return EXIT_OK
+
+
+def cmd_boulder(args) -> int:
+    e = _engine()
+    if args.refresh:
+        e.project_job(args.job)
+    works = [w for w in e.active_work() if w["job_id"] == args.job]
+    e.close()
+    if not works:
+        _out(args, {"job_id": args.job, "active": False}, f"job {args.job} is not active (done, failed or cancelled)")
+        return EXIT_OK
+    r = works[0]
+    _out(args, r, f"work {r['work_id']}  plan {r['plan_name']}  phase={r['phase']}  intent={r['intent']}\n"
+                  f"  next: {r['next_action']}\n  boulder: {r['boulder_path']}")
+    return EXIT_OK
+
+
+def cmd_receipts(args) -> int:
+    e = _engine()
+    rows = e.receipts_for(args.job)
+    e.close()
+    _out(args, {"job_id": args.job, "receipts": rows},
+         "\n".join(f"{r['level']:<18} {r['kind']:<16} {r['status']:<10} rev={str(r['revision'])[:12]:<12} "
+                   f"{r['tool']} {r['tool_version'] or ''}" for r in rows) or "no receipts")
+    return EXIT_OK
+
+
+def cmd_docs(args) -> int:
+    e = _engine()
+    r = e.docs(args.job, args.query, args.library, args.library_id)
+    e.close()
+    _out(args, r, (r.get("text") or r.get("error", ""))[:4000])
+    return EXIT_OK if r.get("ok") else 1
+
+
+def cmd_attest(args) -> int:
+    from .operational import ATTEST_KINDS
+    print(f"You are attesting: {args.kind} = {ATTEST_KINDS[args.kind]}", file=sys.stderr)
+    print(f"Statement: {args.statement}", file=sys.stderr)
+    if not _confirm("Type ATTEST to record this as a human attestation: ", "ATTEST"):
+        print("aborted", file=sys.stderr)
+        return EXIT_ABORTED
+    e = _engine()
+    r = e.attest(args.kind, getpass.getuser(), args.statement)
+    e.close()
+    _out(args, r, f"recorded attestation {args.kind}")
+    return EXIT_OK
+
+
+def _lsp_cfg():
+    from .lsp import profiles as lsp_profiles
+    return lsp_profiles.load(get_paths().config_dir)
+
+
+def cmd_lsp_status(args) -> int:
+    from .lsp import runner
+    cfg = _lsp_cfg()
+    ts = runner.tool_status(cfg)
+    sb = sandbox.probe()
+    data = {"sandbox": {"ok": sb.ok, "detail": sb.detail}, "profiles": ts,
+            "code_extensions_without_profile": sorted(
+                e for e, lang in cfg["code_extensions"].items()
+                if not any(e in p["extensions"] for p in cfg["profiles"].values() if p["enabled"])),
+            "note": "presence only; run `omoctl lsp canary` to prove each server finds a planted defect here"}
+    _out(args, data, "\n".join([f"sandbox: {'ok' if sb.ok else 'UNAVAILABLE'} {sb.detail}"]
+                               + [f"{n}: {'present' if v['present'] else 'MISSING ' + str(v['missing'])}"
+                                  for n, v in ts.items()]
+                               + ["uncovered code extensions (fail closed): "
+                                  + ", ".join(data["code_extensions_without_profile"])]))
+    return EXIT_OK if sb.ok and all(v["present"] for v in ts.values()) else EXIT_DOCTOR
+
+
+def cmd_lsp_canary(args) -> int:
+    import tempfile
+    from .lsp import runner
+    cfg = _lsp_cfg()
+    with tempfile.TemporaryDirectory(prefix="omo-lsp-canary-") as d:
+        res = runner.canary_all(cfg, sandbox.probe(), Path(d), args.profile or None)
+    ok = bool(res) and all(r["status"] == "ok" for r in res.values())
+    _out(args, {"ok": ok, "profiles": res},
+         "\n".join(f"{n}: {r['status']}" + (f" {r['server']} mode={r['mode']} codes={r['canary']['bad_codes']}"
+                                            if r["status"] == "ok" else f" {r['reason']}: {r['detail']}")
+                   for n, r in res.items()))
+    return EXIT_OK if ok else EXIT_DOCTOR
+
+
+def cmd_lsp_check(args) -> int:
+    import tempfile
+    from .lsp import runner
+    cfg = _lsp_cfg()
+    with tempfile.TemporaryDirectory(prefix="omo-lsp-check-") as d:
+        res = runner.evaluate(Path(args.repo), args.base, args.candidate, cfg, sandbox.probe(), Path(d))
+    _out(args, res, f"{res['status']}: new={len(res['new'])} config_violations={res['config_violations']} "
+                    f"suppressions={len(res['suppressions'])} reasons={res['reasons']}")
+    return EXIT_OK if res["status"] in ("clean", "not_applicable") else EXIT_DOCTOR
+
+
 # ---------------------------------------------------------------- parser
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="omoctl", description="omo-grok operator CLI (fallback controls; everyday use is "
@@ -505,6 +645,7 @@ def build_parser() -> argparse.ArgumentParser:
         return sp
 
     add("doctor", cmd_doctor, "check installation, DB, permissions, MCP SDK and verifier profiles")
+    add("mcp-command", cmd_mcp_command, "print the exact MCP registration command for this checkout", json_=False)
     sp = add("migrate", cmd_migrate, "apply schema migrations (auto-backup first)")
     sp.add_argument("--dry-run", action="store_true")
     sp = add("status", cmd_status, "show jobs or one job")
@@ -578,6 +719,30 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--disabled", action="store_true")
     sp.add_argument("--provenance")
     sp.add_argument("--force", action="store_true")
+    sp = add("features", cmd_features, "show feature modes (configured, and frozen into one job)")
+    sp.add_argument("job", nargs="?")
+    sp = add("boulder", cmd_boulder, "show the active work (plan, phase, next action, sessions); --refresh rewrites .omo/")
+    sp.add_argument("job")
+    sp.add_argument("--refresh", action="store_true")
+    sp = add("receipts", cmd_receipts, "list the engine-held tool receipts of a job")
+    sp.add_argument("job")
+    sp = add("docs", cmd_docs, "ask the engine to query Context7 for a job (creates a receipt)")
+    sp.add_argument("job")
+    sp.add_argument("--query", required=True)
+    g = sp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--library")
+    g.add_argument("--library-id")
+    sp = add("attest", cmd_attest, "record a HUMAN attestation of live evidence (interactive TTY)")
+    sp.add_argument("kind", choices=["host_cutover", "live_smoke", "live_e2e"])
+    sp.add_argument("--statement", required=True)
+    lsp = sub.add_parser("lsp", help="language-server diagnostics gate").add_subparsers(dest="lsp_cmd", required=True)
+    add("status", cmd_lsp_status, "sandbox and tool presence, uncovered languages", parent=lsp)
+    sp = add("canary", cmd_lsp_canary, "prove each server finds a planted defect on this machine", parent=lsp)
+    sp.add_argument("--profile", action="append")
+    sp = add("check", cmd_lsp_check, "base->candidate diagnostics delta for a repository", parent=lsp)
+    sp.add_argument("--repo", required=True)
+    sp.add_argument("--base", required=True)
+    sp.add_argument("--candidate", required=True)
     sp = add("test", cmd_test, "run test suites")
     sp.add_argument("suite", choices=["unit", "integration", "live"])
     sp.add_argument("--fixture-only", action="store_true")

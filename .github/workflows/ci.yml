@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: sandbox prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap python3-venv
+          # Candidate code and language servers run in a user namespace. Ubuntu images that set
+          # kernel.apparmor_restrict_unprivileged_userns=1 make bwrap fail closed.
+          sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: bootstrap
+        run: scripts/bootstrap.sh
+      - name: suite
+        run: OMO_REQUIRE_TOOLS=1 .venv/bin/python -m pytest -q -p no:cacheprovider

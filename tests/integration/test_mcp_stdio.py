@@ -10,7 +10,8 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 ROOT = Path(__file__).resolve().parents[2]
 PY = str(ROOT / ".venv" / "bin" / "python")
 SERVER = str(ROOT / "omo_grok" / "mcp_server.py")
-EXPECTED = {"submit", "claim", "context", "checkpoint", "complete", "status", "reconcile", "cancel"}
+EXPECTED = {"submit", "claim", "context", "checkpoint", "complete", "status", "reconcile", "cancel", "escalate",
+            "docs"}
 
 
 def _params():
@@ -164,3 +165,41 @@ def test_planted_secrets_never_leak_via_mcp_status_log_or_export(omo_home, tmp_p
         for secret in (HOOK_KEY, ENV_SECRET, URL_TOKEN, ERR_SECRET):
             assert secret not in text, f"{secret[:12]}... leaked via {name}"
     assert '"last_error"' in export_text and job in export_text  # export really carries the failed dispatches
+
+
+SCOPE = {"files_estimate": 2, "new_dependency": False, "external_api": False, "security_sensitive": False,
+         "cross_cutting": False}
+
+
+async def _adaptive_flow(errlog):
+    async with stdio_client(_params(), errlog=errlog) as (r, w):
+        async with ClientSession(r, w) as s:
+            await s.initialize()
+            expl = _payload(await s.call_tool("submit", {"goal": "What does calc.add do?",
+                                                         "idempotency_key": "mcp-adaptive-0001",
+                                                         "intent": "explanation"}))
+            inv = _payload(await s.call_tool("submit", {"goal": "Why is add wrong?",
+                                                        "idempotency_key": "mcp-adaptive-0002",
+                                                        "intent": "investigation"}))
+            bad_scope = await s.call_tool("submit", {"goal": "x", "idempotency_key": "mcp-adaptive-0003",
+                                                     "intent": "implementation",
+                                                     "scope": {**SCOPE, "surprise": True}})
+            low = await s.call_tool("submit", {"goal": "x", "idempotency_key": "mcp-adaptive-0004",
+                                               "intent": "implementation", "mode": "fixture", "roster_class": "quick",
+                                               "scope": {**SCOPE, "security_sensitive": True}})
+            docs_off = await s.call_tool("docs", {"job_id": inv["job_id"], "query": "q", "library_name": "pytest"})
+            down = await s.call_tool("escalate", {"job_id": inv["job_id"], "to_class": "heavy", "reason": "r"})
+            down_bad = await s.call_tool("escalate", {"job_id": inv["job_id"], "to_class": "quick", "reason": "r"})
+            return expl, inv, bad_scope, low, docs_off, down, down_bad
+
+
+def test_adaptive_submit_escalate_and_docs_over_real_mcp(omo_home, tmp_path):
+    with open(tmp_path / "stderr.log", "w") as errlog:
+        expl, inv, bad_scope, low, docs_off, esc, esc_bad = asyncio.run(_adaptive_flow(errlog))
+    assert expl == {"created": False, "roster_class": "none", "action": "answer_directly"}
+    assert inv["created"] is True and inv["roster_class"] == "investigation"
+    assert bad_scope.is_error and "invalid" in bad_scope.content[0].text, "unknown scope keys are rejected"
+    assert low.is_error, "a class below the computed floor (security_sensitive -> heavy) is refused or ignored"
+    assert docs_off.is_error and "docs_evidence is off" in docs_off.content[0].text
+    assert esc.is_error, "an investigation job cannot be escalated into an editing team"
+    assert esc_bad.is_error and "invalid" in esc_bad.content[0].text

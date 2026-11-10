@@ -2,10 +2,43 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 CODE_ROOT = Path(__file__).resolve().parent.parent
+
+
+def python_path() -> str:
+    """Interpreter used by verifier profiles and the MCP command: OMO_PYTHON, else the code root's own venv."""
+    return os.environ.get("OMO_PYTHON") or str(CODE_ROOT / ".venv" / "bin" / "python")
+
+
+def tools_dir() -> Path:
+    """Where scripts/bootstrap.sh installs language servers (never the runtime venv)."""
+    return Path(os.environ.get("OMO_TOOLS_DIR") or CODE_ROOT / "tools")
+
+
+def _tool_glob(pattern: str, missing: str) -> str:
+    hits = sorted(tools_dir().glob(pattern))
+    return str(hits[0]) if hits else str(tools_dir() / missing)
+
+
+def node_path() -> str:
+    """The node binary shipped inside the bootstrap-installed nodejs-wheel (a path that does not exist if absent,
+    so the profile fails closed with missing_tool instead of falling back to some other node)."""
+    return _tool_glob("venv/lib/python3*/site-packages/nodejs_wheel/bin/node", "venv/MISSING-nodejs_wheel/node")
+
+
+def site_packages() -> str:
+    return _tool_glob("venv/lib/python3*/site-packages", "venv/MISSING-site-packages")
+
+
+def mcp_command() -> str:
+    py = python_path()
+    if not os.path.exists(py):
+        py = sys.executable
+    return f"{py} {CODE_ROOT / 'omo_grok' / 'mcp_server.py'}"
 
 
 @dataclass(frozen=True)

@@ -10,4 +10,5 @@ do not claim, complete, approve, cancel or edit any task, file or database; do n
 webhooks yourself. If the call fails, report the error text (it is already redacted) and STOP.
 ```
 
-Manual equivalent (always available): `/workspace/omo/omoctl reconcile`.
+Manual equivalent (always available): `omoctl reconcile` from the checkout (on the current host, `/workspace/omo/omoctl reconcile`).
+The database is the only record of what to do next. `.omo/boulder.json` is a projection and is not read back.
