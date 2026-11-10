@@ -5,6 +5,7 @@ compare-and-swap checks; HTTP and subprocess work happens strictly outside trans
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import re
 import secrets as pysecrets
@@ -14,12 +15,14 @@ from pathlib import Path
 from typing import Callable
 
 from . import artifacts as art
-from . import db, features, gitops, projection, roster, verifier
+from . import db, features, gitops, projection, receipts, roster, sandbox, verifier
 from . import fixture as fx
 from .config import (canonical_json, load_policy, load_verifier_profiles, profile_assurance, profile_hash,
                      sha256_text)
 from .errors import Conflict, GateRefused, IntegrityError_, NotFound, OmoError, ValidationError
 from .hooks import hook_status, load_hooks
+from .lsp import profiles as lsp_profiles
+from .lsp import runner as lsp_runner
 from .paths import Paths, get_paths
 from .redact import redact, redact_obj, redact_urls
 from .schemas import SCHEMAS, classify, output_schema
@@ -1275,6 +1278,8 @@ class Engine:
         vid, name, prof = self._start_verification(job, task_id, "candidate", sha)
         # subprocess OUTSIDE any transaction; no caching (always re-run on the exact commit)
         out = verifier.run(Path(job["repo_path"]), sha, name, prof, self.paths.job_dir(job_id) / "verify")
+        lsp = self._run_lsp(job, sha) if out.status == "passed" else None
+        lsp_mode = self._features(job)["lsp"]
         with db.tx(self.conn):
             res = self._record_verification(job_id, task_id, vid, out)
             t = self._one("SELECT * FROM tasks WHERE id=?", (task_id,))
@@ -1282,7 +1287,18 @@ class Engine:
             if t["status"] != SUBMITTED or job["candidate_revision"] != sha or job["phase"] != J_RUNNING:
                 self._ev("verification_stale", job_id, task_id, "verifier", revision=sha)
                 return res
-            if out.status == "passed":
+            lsp_aid = None
+            if lsp is not None:
+                _, lsp_aid = self._record_lsp(job, task_id, sha, "candidate", lsp)
+                res["lsp"] = {"status": lsp["status"], "mode": lsp_mode, "new": len(lsp["new"])}
+            if lsp is not None and lsp_mode == features.ENFORCE and lsp["status"] == "findings":
+                self._set_task(t, REJECTED, block_reason=("language diagnostics: " + self._lsp_brief(lsp))[:500])
+                self._repair(job, ("language diagnostics rejected " + sha[:12] + ": " + self._lsp_brief(lsp))[:300],
+                             [lsp_aid, *res["artifact_ids"]], t["cycle"])
+            elif lsp is not None and lsp_mode == features.ENFORCE and lsp["status"] == "unavailable":
+                self._block_task(t, ("language diagnostics unavailable (fail closed): "
+                                     + "; ".join(lsp["reasons"]))[:500])
+            elif out.status == "passed":
                 self._pass(t)
                 inputs = [*self._inputs(task_id), *self._task_artifacts(task_id)]
                 self._new_task(job_id, "code_review", deps=[task_id], inputs=inputs, cycle=t["cycle"], candidate=sha)
@@ -1296,6 +1312,62 @@ class Engine:
             self._schedule(job_id)
         self._after()
         return res
+
+    # ------------------------------------------------------------------ language-server gate
+    def _run_lsp(self, job, sha: str) -> dict | None:
+        """Real language-server delta of base -> sha (spec section 7). Runs OUTSIDE any transaction. Returns None when
+        the feature is off; a result with status 'unavailable' when no trusted answer could be produced."""
+        mode = self._features(job)["lsp"]
+        if mode == features.OFF:
+            return None
+        jd = self.paths.job_dir(job["id"]) / "lsp"
+        try:
+            cfg = lsp_profiles.load(self.paths.config_dir)
+        except OmoError as e:
+            return {"status": "unavailable", "base": job["base_revision"], "candidate": sha, "profiles": {},
+                    "uncovered": {}, "new": [], "config_violations": [], "suppressions": [],
+                    "reasons": [f"lsp configuration invalid: {e.message}"], "config_sha256": None}
+        raw = lsp_profiles.config_path(self.paths.config_dir).read_bytes()
+        try:
+            if not job["base_revision"]:
+                raise lsp_runner.Unavailable("no_base_revision", "job has no base revision to diff against")
+            res = lsp_runner.evaluate(Path(job["repo_path"]), job["base_revision"], sha, cfg, sandbox.probe(),
+                                      jd / "scratch", cache_dir=jd / "cache")
+        except lsp_runner.Unavailable as e:
+            res = {"status": "unavailable", "base": job["base_revision"], "candidate": sha, "profiles": {},
+                   "uncovered": {}, "new": [], "config_violations": [], "suppressions": [], "reasons": [str(e)]}
+        res["config_sha256"] = hashlib.sha256(raw).hexdigest()
+        return res
+
+    def _record_lsp(self, job, task_id, sha: str, purpose: str, res: dict) -> tuple[str, str]:
+        """Caller holds the transaction. Stores the full result as an artifact and an engine_executed receipt."""
+        body = json.dumps(redact_obj(res), sort_keys=True, indent=2)
+        aid = self._engine_artifact(job["id"], f"engine/lsp/{purpose}-{sha[:12]}-{uuid.uuid4().hex[:8]}.json", body,
+                                    "lsp_result", task_id, revision=sha)
+        sha256 = self._one("SELECT sha256 FROM artifacts WHERE id=?", (aid,))["sha256"]
+        servers = sorted({f"{n}:{(p.get('server') or {}).get('name')}@{(p.get('server') or {}).get('version')}"
+                          for n, p in res["profiles"].items() if p.get("status") == "ok"})
+        rid = receipts.record(
+            self.conn, job_id=job["id"], task_id=task_id, kind=f"lsp_{purpose}", level="engine_executed",
+            status=res["status"], revision=sha, tool="language-server:" + ",".join(sorted(res["profiles"])),
+            tool_version=";".join(servers) or None, config_sha256=res.get("config_sha256"),
+            input_sha256=f"{res.get('base')}..{sha}", output_sha256=sha256, artifact_ids=[aid],
+            summary={"status": res["status"], "purpose": purpose, "new": len(res["new"]),
+                     "codes": sorted({d["code"] for d in res["new"]})[:20],
+                     "config_violations": res["config_violations"][:20], "suppressions": res["suppressions"][:20],
+                     "uncovered": res["uncovered"], "reasons": res["reasons"][:10], "mode": self._features(job)["lsp"],
+                     "profiles": {n: {k: p.get(k) for k in ("status", "mode", "reason", "scope", "files")}
+                                  for n, p in res["profiles"].items()}})
+        self._ev("lsp_result", job["id"], task_id, "engine", status=res["status"], purpose=purpose, revision=sha,
+                 receipt_id=rid, new=len(res["new"]), mode=self._features(job)["lsp"])
+        return rid, aid
+
+    @staticmethod
+    def _lsp_brief(res: dict) -> str:
+        bits = [f"{d['path']}: {d['code']} {d['message']}" for d in res["new"][:5]]
+        bits += [f"config file changed: {p}" for p in res["config_violations"][:3]]
+        bits += [f"new suppression in {s['path']}" for s in res["suppressions"][:3]]
+        return "; ".join(bits)[:400]
 
     def _record_verification(self, job_id, task_id, vid, out) -> dict:
         so = self._engine_artifact(job_id, f"engine/verify/{vid}/stdout.txt", out.stdout, "verifier_stdout", task_id)
@@ -1561,6 +1633,8 @@ class Engine:
             except OmoError as e:
                 bad.append(f"{a['rel_path']}: {e.message}")
         chk("artifact_integrity", not bad, "; ".join(bad[:5]))
+        if self._features(job)["lsp"] == features.ENFORCE:
+            self._lsp_gate_checks(job_id, sha, chk)
         ind = self._independence(job_id, sha) if sha else {"level": "unknown", "problems": ["no revision"]}
         independent = ind["level"] == "separate_bots_same_account"
         reduced = not independent and self._reduced_acceptance(ap)
@@ -1579,6 +1653,20 @@ class Engine:
             assurance += "+soft_approval"
         return all(v["ok"] for v in c.values()), c, assurance
 
+    def _lsp_gate_checks(self, job_id, sha, chk) -> None:
+        """Gate checks derived ONLY from an engine_executed receipt for this exact revision (never from a bot)."""
+        row = receipts.latest(self.conn, job_id, "lsp_final", sha) if sha else None
+        summ = _l(row["summary_json"]) if row else {}
+        chk("lsp_receipt_for_exact_revision", row is not None and summ.get("purpose") == "final",
+            row and f"receipt {row['id']} ({row['tool_version']})" or "no engine-executed LSP receipt for this revision")
+        status = row["status"] if row else "missing"
+        chk("lsp_delta_clean", status in ("clean", "not_applicable") and not summ.get("new"),
+            f"status={status}; new={summ.get('new')}; codes={summ.get('codes')}; reasons={summ.get('reasons')}")
+        chk("lsp_config_untouched", row is not None and not summ.get("config_violations"),
+            _j(summ.get("config_violations") or []))
+        chk("lsp_no_new_suppressions", row is not None and not summ.get("suppressions"),
+            _j(summ.get("suppressions") or []))
+
     @_flushes
     def run_final_gate(self, job_id, integrate_task_id) -> dict:
         job = self._job(job_id)
@@ -1588,11 +1676,13 @@ class Engine:
         sha = job["candidate_revision"]
         vid, name, prof = self._start_verification(job, integrate_task_id, "final", sha)
         out = verifier.run(Path(job["repo_path"]), sha, name, prof, self.paths.job_dir(job_id) / "verify")
+        lsp = self._run_lsp(job, sha)
         with db.tx(self.conn):
             fv = self._record_verification(job_id, integrate_task_id, vid, out)
             job = self._job(job_id)
             if job["candidate_revision"] != sha or job["phase"] != J_RUNNING:
                 return {"passed": False, "stale": True}
+            lsp_aid = self._record_lsp(job, integrate_task_id, sha, "final", lsp)[1] if lsp is not None else None
             ok, checks, assurance = self.gate_checks(job_id, fv)
             gid = str(uuid.uuid4())
             self.conn.execute("INSERT INTO gate_results(id,job_id,revision,passed,assurance,checks_json,created_at) "
@@ -1606,6 +1696,10 @@ class Engine:
             elif out.status == "failed":
                 self._set_task(t, REJECTED, block_reason="final verification failed")
                 self._repair(job, f"final verification failed on {sha[:12]}", fv["artifact_ids"], t["cycle"])
+            elif lsp is not None and lsp["status"] == "findings" and self._features(job)["lsp"] == features.ENFORCE:
+                self._set_task(t, REJECTED, block_reason=("language diagnostics: " + self._lsp_brief(lsp))[:500])
+                self._repair(job, ("final language diagnostics rejected " + sha[:12] + ": "
+                                   + self._lsp_brief(lsp))[:300], [lsp_aid, *fv["artifact_ids"]], t["cycle"])
             else:
                 self._block_task(t, "final gate refused: " + ", ".join(k for k, v in checks.items() if not v["ok"]))
             self._schedule(job_id)

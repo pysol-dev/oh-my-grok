@@ -83,21 +83,21 @@ semantics, a real LSP diagnostics gate, engine-proven tool evidence (LSP, Contex
 
 ## Stage 3: real LSP
 
-- [ ] 3.1 `scripts/bootstrap.sh` tool install; verify the three servers start (manual probe already recorded in
+- [x] 3.1 `scripts/bootstrap.sh` tool install; verify the three servers start (manual probe already recorded in
   `docs/evidence/`).
-- [ ] 3.2 RED `tests/unit/test_lsp_client.py` with a scripted fake server (protocol framing, pull and push modes,
+- [x] 3.2 RED `tests/unit/test_lsp_client.py` with a scripted fake server (protocol framing, pull and push modes,
   version filtering, server requests, timeouts, crash, malformed frames, oversize).
-- [ ] 3.3 RED `tests/unit/test_lsp_delta.py`: multiset delta, line-drift immunity, severities, suppressions, config files.
-- [ ] 3.4 RED `tests/integration/test_lsp_real_servers.py`: ruff (pull), basedpyright (push), typescript (push) real
+- [x] 3.3 RED `tests/unit/test_lsp_delta.py`: multiset delta, line-drift immunity, severities, suppressions, config files.
+- [x] 3.4 RED `tests/integration/test_lsp_real_servers.py`: ruff (pull), basedpyright (push), typescript (push) real
   canary; real delta (base clean, candidate adds a type error); unavailable server (missing binary, stub that exits 0
   and is silent, stub that answers initialize only) all fail closed.
-- [ ] 3.5 GREEN `lsp/` package and sandbox wrapper for long-lived stdio children.
-- [ ] 3.6 RED `tests/integration/test_lsp_gate.py`: candidate verification and final gate consume receipts; a type
+- [x] 3.5 GREEN `lsp/` package and sandbox wrapper for long-lived stdio children.
+- [x] 3.6 RED `tests/integration/test_lsp_gate.py`: candidate verification and final gate consume receipts; a type
   error that unit tests miss rejects the candidate and opens a repair cycle; unavailable diagnostics block;
   `shadow` records without blocking; unsupported code extension blocks.
-- [ ] 3.7 GREEN engine integration (candidate verification, final gate checks `lsp_delta_clean`,
+- [x] 3.7 GREEN engine integration (candidate verification, final gate checks `lsp_delta_clean`,
   `lsp_config_untouched`, `lsp_no_new_suppressions`).
-- [ ] 3.8 Verify and commit.
+- [x] 3.8 Verify and commit.
 
 ## Stage 4: evidence, Context7, git-master
 
