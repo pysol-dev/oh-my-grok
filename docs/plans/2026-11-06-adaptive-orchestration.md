@@ -112,22 +112,22 @@ semantics, a real LSP diagnostics gate, engine-proven tool evidence (LSP, Contex
 
 ## Stage 5: surfaces and instructions
 
-- [ ] 5.1 MCP tools `escalate`, `docs`; `submit` arguments; `tests/integration/test_mcp_stdio.py` updated.
-- [ ] 5.2 CLI: `lsp`, `boulder`, `features`, `mcp-command`, `docs`, `receipts`, `attest`; `doctor` derives its verdict.
-- [ ] 5.3 Instructions: `agents/hephaestus-omo.md`, executor, librarian, explorer, reconcile routines (versioned).
-- [ ] 5.4 Docs: ARCHITECTURE, SECURITY, RUNBOOK, MIGRATION, README, PROGRESS.
-- [ ] 5.5 Verify and commit.
+- [x] 5.1 MCP tools `escalate`, `docs`; `submit` arguments; `tests/integration/test_mcp_stdio.py` updated.
+- [x] 5.2 CLI: `lsp`, `boulder`, `features`, `mcp-command`, `docs`, `receipts`, `attest`; `doctor` derives its verdict.
+- [x] 5.3 Instructions: `agents/hephaestus-omo.md`, executor, librarian, explorer, reconcile routines (versioned).
+- [x] 5.4 Docs: ARCHITECTURE, SECURITY, RUNBOOK, MIGRATION, README, PROGRESS.
+- [x] 5.5 Verify and commit.
 
 ## Stage 6: real-repository exercise
 
-- [ ] 6.1 Build a disposable copy of this repository (tracked files only, new git history) with a controlled defect in
+- [x] 6.1 Build a disposable copy of this repository (tracked files only, new git history) with a controlled defect in
   a text-processing module and a unittest suite that exposes it.
-- [ ] 6.2 RED/GREEN `tests/integration/test_real_repo_exercise.py`: job through the adaptive classes; attempt 1 fails
+- [x] 6.2 RED/GREEN `tests/integration/test_real_repo_exercise.py`: job through the adaptive classes; attempt 1 fails
   verification; attempt 2 passes tests but introduces a type error that only the real language servers see and is
   rejected; attempt 3 is correct; reviews on earlier revisions are invalidated; reviewers are different Bots from the
   executor; the final gate passes with LSP and git receipts; evidence files exported.
-- [ ] 6.3 Off-box CI workflow `.github/workflows/ci.yml` that runs bootstrap and the suite.
-- [ ] 6.4 Verify, commit, push, open PR.
+- [x] 6.3 Off-box CI workflow `.github/workflows/ci.yml` that runs bootstrap and the suite.
+- [x] 6.4 Verify, commit, push, open PR.
 
 ## Final verification (every stage re-run)
 

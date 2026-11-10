@@ -1,0 +1,6 @@
+sandbox: ok bubblewrap 0.9.0; userns+mountns+pidns+netns (self-check passed); kernel 6.12.113+
+python-ruff: present
+python-basedpyright: present
+typescript: present
+uncovered code extensions (fail closed): .bash, .c, .cc, .cjs, .cpp, .cs, .go, .h, .hpp, .java, .js, .jsx, .kt, .mjs, .php, .rb, .rs, .scala, .sh, .swift
+EXIT:0
