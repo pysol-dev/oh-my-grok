@@ -274,6 +274,15 @@ class Engine:
     def _inputs(self, task_id) -> list[str]:
         return [r["artifact_id"] for r in self._all("SELECT artifact_id FROM task_inputs WHERE task_id=?", (task_id,))]
 
+    def _current_plan_inputs(self, job) -> list[str]:
+        """Inputs of the implementation bound to the current plan. A repair must not inherit a superseded plan."""
+        row = self._one("SELECT id FROM tasks WHERE job_id=? AND kind='implement' AND plan_revision_id=? "
+                        "ORDER BY created_at LIMIT 1", (job["id"], job["current_plan_revision_id"]))
+        if row is None:
+            row = self._one("SELECT id FROM tasks WHERE job_id=? AND kind='implement' ORDER BY created_at LIMIT 1",
+                            (job["id"],))
+        return self._inputs(row["id"]) if row else []
+
     # ------------------------------------------------------------------ bindings
     def known_bots(self) -> dict:
         p = self.paths.config_dir / "bots.json"
@@ -1361,8 +1370,8 @@ class Engine:
         if result["verdict"] == "reject":
             self._repair(job, f"{typ} review rejected revision {result['revision'][:12]}", ids, t["cycle"])
             return []
-        siblings = self._all("SELECT * FROM tasks WHERE job_id=? AND cycle=? AND kind IN ('code_review','qa')",
-                             (job["id"], t["cycle"]))
+        siblings = self._all("SELECT * FROM tasks WHERE job_id=? AND cycle=? AND plan_revision_id IS ? AND kind IN "
+                             "('code_review','qa')", (job["id"], t["cycle"], t["plan_revision_id"]))
         if all(s["status"] == PASSED for s in siblings):
             verdicts = self._all("SELECT verdict FROM reviews WHERE job_id=? AND revision=? AND type IN ('code','qa') "
                                  "AND invalidated=0", (job["id"], result["revision"]))
@@ -1396,10 +1405,8 @@ class Engine:
         if failures >= pol["max_repair_cycles"]:
             self._block_job(job, f"repair_budget_exhausted after {failures} failed cycles; last: {reason}")
             return
-        first_impl = self._one("SELECT id FROM tasks WHERE job_id=? AND kind='implement' ORDER BY created_at LIMIT 1",
-                               (job["id"],))
-        base_inputs = self._inputs(first_impl["id"]) if first_impl else []
-        self._new_task(job["id"], "implement", inputs=[*base_inputs, *failure_artifacts], cycle=cycle + 1)
+        self._new_task(job["id"], "implement", inputs=[*self._current_plan_inputs(job), *failure_artifacts],
+                       cycle=cycle + 1)
 
     # ------------------------------------------------------------------ verification
     def _verify_profile(self, job):
@@ -1682,7 +1689,8 @@ class Engine:
                 research = [r["id"] for r in self._all(
                     "SELECT a.id FROM artifacts a JOIN tasks t ON t.id=a.task_id WHERE a.job_id=? AND t.kind IN "
                     "('explore','research','analyze')", (job_id,))]
-                self._new_task(job_id, "implement", inputs=[rev["artifact_id"], *research], cycle=1)
+                used = self._one("SELECT MAX(cycle) c FROM tasks WHERE job_id=? AND kind='implement'", (job_id,))["c"]
+                self._new_task(job_id, "implement", inputs=[rev["artifact_id"], *research], cycle=(used or 0) + 1)
             self._ev("implementation_started", job_id, None, "engine", worktree=str(wt), branch=branch, base=base)
             self._schedule(job_id)
 
@@ -2015,9 +2023,7 @@ class Engine:
                 job = self._set_job(job, policies_json=_j(pol))
                 last = self._one("SELECT * FROM tasks WHERE job_id=? AND kind='implement' ORDER BY created_at DESC "
                                  "LIMIT 1", (job_id,))
-                first = self._one("SELECT id FROM tasks WHERE job_id=? AND kind='implement' ORDER BY created_at LIMIT 1",
-                                  (job_id,))
-                self._new_task(job_id, "implement", inputs=[*self._inputs(first["id"]),
+                self._new_task(job_id, "implement", inputs=[*self._current_plan_inputs(job),
                                                             *self._task_artifacts(last["id"])],
                                cycle=last["cycle"] + 1)
             elif reason.startswith("plan review loop exhausted"):

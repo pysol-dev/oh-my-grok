@@ -220,21 +220,25 @@ class Session:
     def __enter__(self):
         c = self.client
         c.start()
-        res = c.request("initialize", {
-            "processId": None, "rootUri": f"file://{WORK}", "clientInfo": {"name": "omo-grok"},
-            "workspaceFolders": [{"uri": f"file://{WORK}", "name": "work"}], "capabilities": CLIENT_CAPS,
-            "initializationOptions": self.profile["init_options"] or None,
-        }, timeout=self._left(self.profile["startup_timeout_seconds"]))
-        caps = (res or {}).get("capabilities") or {}
-        self.server = {"name": ((res or {}).get("serverInfo") or {}).get("name"),
-                       "version": ((res or {}).get("serverInfo") or {}).get("version")}
-        has_pull = bool(caps.get("diagnosticProvider"))
-        want = self.profile["mode"]
-        if want == "pull" and not has_pull:
-            raise Unavailable("pull_unsupported", "profile requires pull diagnostics but the server has none")
-        self.mode = "pull" if (want == "pull" or (want == "auto" and has_pull)) else "push"
-        c.notify("initialized", {})
-        c.notify("workspace/didChangeConfiguration", {"settings": self.profile["settings"]})
+        try:
+            res = c.request("initialize", {
+                "processId": None, "rootUri": f"file://{WORK}", "clientInfo": {"name": "omo-grok"},
+                "workspaceFolders": [{"uri": f"file://{WORK}", "name": "work"}], "capabilities": CLIENT_CAPS,
+                "initializationOptions": self.profile["init_options"] or None,
+            }, timeout=self._left(self.profile["startup_timeout_seconds"]))
+            caps = (res or {}).get("capabilities") or {}
+            self.server = {"name": ((res or {}).get("serverInfo") or {}).get("name"),
+                           "version": ((res or {}).get("serverInfo") or {}).get("version")}
+            has_pull = bool(caps.get("diagnosticProvider"))
+            want = self.profile["mode"]
+            if want == "pull" and not has_pull:
+                raise Unavailable("pull_unsupported", "profile requires pull diagnostics but the server has none")
+            self.mode = "pull" if (want == "pull" or (want == "auto" and has_pull)) else "push"
+            c.notify("initialized", {})
+            c.notify("workspace/didChangeConfiguration", {"settings": self.profile["settings"]})
+        except BaseException:
+            c.close()
+            raise
         return self
 
     def __exit__(self, *exc):
@@ -353,6 +357,18 @@ def _cached_base(cache_dir: Path | None, key: str):
         return None
 
 
+def _config_hits(cfg: dict, changed: list[str], only_profiles: list[str] | None) -> list[str]:
+    """Protected checker-config paths in the diff, whether or not a source file selected a profile."""
+    hits = []
+    for name, prof in profiles.enabled_profiles(cfg).items():
+        if only_profiles is not None and name not in only_profiles:
+            continue
+        for path in delta.config_violations(changed, prof["config_files"]):
+            if path not in hits:
+                hits.append(path)
+    return hits
+
+
 def evaluate(repo: Path, base: str, cand: str, cfg: dict, sbx: sandbox.Probe, scratch: Path,
              cache_dir: Path | None = None, only_profiles: list[str] | None = None) -> dict:
     """The delta verdict for base -> cand. status: clean | findings | unavailable | not_applicable."""
@@ -364,7 +380,12 @@ def evaluate(repo: Path, base: str, cand: str, cfg: dict, sbx: sandbox.Probe, sc
     res = {"base": base, "candidate": cand, "changed": len(changed), "profiles": {}, "uncovered": uncovered,
            "new": [], "config_violations": [], "suppressions": [], "reasons": []}
     if not apply and not uncovered:
-        res["status"] = "not_applicable"
+        hits = _config_hits(cfg, changed, only_profiles)
+        if hits:
+            res["config_violations"] = hits
+            res["status"] = "findings"
+        else:
+            res["status"] = "not_applicable"
         return res
     if uncovered:
         res["reasons"].append("diagnostics_unavailable: no enabled language-server profile for "
@@ -402,6 +423,9 @@ def evaluate(repo: Path, base: str, cand: str, cfg: dict, sbx: sandbox.Probe, sc
         except Unavailable as e:
             entry.update(status="unavailable", reason=e.reason, detail=e.detail[:400])
             res["reasons"].append(f"{pname}: {e}")
+    for path in _config_hits(cfg, changed, only_profiles):
+        if path not in res["config_violations"]:
+            res["config_violations"].append(path)
     unavailable = bool(uncovered) or any(e["status"] != "ok" for e in res["profiles"].values()) or any(
         e.get("unanalysed") for e in res["profiles"].values())
     if unavailable:

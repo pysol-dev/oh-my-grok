@@ -325,6 +325,61 @@ def test_escalation_requires_reason_and_a_live_adaptive_job(h):
         h.e.escalate(job, "standard", "too late", actor="t")
 
 
+def test_reviews_from_a_superseded_plan_do_not_block_the_new_plan(h):
+    """A candidate that already has code review and QA, then an escalation, must still reach integration.
+    The cancelled reviews stay at cycle 1; the replacement implementation must not share that cycle."""
+    job = sub(h, scope=S())["job_id"]
+    h.plan(job)
+    h.review_plan(job)
+    h.approve(job)
+    h.implement(job)
+    old_reviews = h.e._all("SELECT id, cycle, status FROM tasks WHERE job_id=? AND kind IN ('code_review','qa')",
+                           (job,))
+    assert len(old_reviews) == 2 and {r["cycle"] for r in old_reviews} == {1}
+    h.e.escalate(job, "standard", "the first candidate needs a wider look", actor="hephaestus")
+    left = h.e._all("SELECT status FROM tasks WHERE job_id=? AND kind IN ('code_review','qa') AND cycle=1", (job,))
+    assert {r["status"] for r in left} == {"cancelled"}
+    h.do(job, "explore", {"repo_map": "m", "files": ["a:1"], "tests": [], "constraints": [], "questions": []},
+         [{"kind": "explore", "name": "e2.md", "content": "EXPLORE AFTER ESCALATION"}])
+    h.analyze(job)
+    h.plan(job, "PLAN v2 after a reviewed candidate")
+    h.review_plan(job)
+    h.approve(job)
+    new_impl = h.task(job, "implement", "dispatched")
+    assert new_impl["cycle"] > 1
+    h.implement(job)
+    h.review(job, "code_review")
+    h.review(job, "qa")
+    _, res = h.integrate(job)
+    assert res["final_gate"]["passed"] is True and h.e.status(job)["phase"] == "done"
+
+
+def test_repair_after_escalation_carries_the_current_plan(h):
+    job = sub(h, scope=S(), max_repair_cycles=1)["job_id"]
+    h.plan(job)
+    h.review_plan(job)
+    h.approve(job)
+    old_art = h.e._one("SELECT artifact_id FROM plan_revisions WHERE id=?",
+                       (h.e._job(job)["current_plan_revision_id"],))["artifact_id"]
+    h.e.escalate(job, "standard", "replace the plan before repairing", actor="hephaestus")
+    h.do(job, "explore", {"repo_map": "m", "files": ["a:1"], "tests": [], "constraints": [], "questions": []},
+         [{"kind": "explore", "name": "e2.md", "content": "EXPLORE AFTER ESCALATION"}])
+    h.analyze(job)
+    h.plan(job, "PLAN v2 the repair must read")
+    h.review_plan(job)
+    h.approve(job)
+    new_art = h.e._one("SELECT artifact_id FROM plan_revisions WHERE id=?",
+                       (h.e._job(job)["current_plan_revision_id"],))["artifact_id"]
+    assert new_art != old_art
+    h.implement(job, fix="fake")
+    assert h.e.status(job)["phase"] == "blocked"
+    h.e.resume(job, actor="hephaestus", grant_repair_cycles=1)
+    repair = h.task(job, "implement", "dispatched")
+    ins = {r["artifact_id"] for r in h.e._all("SELECT artifact_id FROM task_inputs WHERE task_id=?", (repair["id"],))}
+    assert new_art in ins and old_art not in ins
+    assert repair["plan_revision_id"] == h.e._job(job)["current_plan_revision_id"]
+
+
 def test_escalation_to_heavy_adds_the_research_task(h):
     job = sub(h, scope=S(files_estimate=5))["job_id"]  # standard, no research
     assert "research" not in kinds(h, job)

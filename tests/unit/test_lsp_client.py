@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from omo_grok import sandbox
+from omo_grok.lsp import profiles, runner
 from omo_grok.lsp.client import LspClient, LspError, MethodNotFound
 
 FAKE = str(Path(__file__).parent / "fake_lsp_server.py")
@@ -160,3 +162,22 @@ def test_close_kills_unresponsive_server_promptly():
     c.close(graceful_timeout=0.5)
     assert time.monotonic() - t < 5
     assert c.proc.poll() is not None
+
+
+def test_pull_profile_against_a_push_server_does_not_leave_the_child_running(tmp_path):
+    sbx = sandbox.probe()
+    if not sbx.ok:
+        pytest.skip(sbx.detail)
+    work = tmp_path / "work"
+    work.mkdir()
+    fake = Path(__file__).resolve().parent / "fake_lsp_server.py"
+    prof = {**profiles.PROFILE_DEFAULTS, "mode": "pull", "language": "python", "extensions": [".py"],
+            "argv": ["/usr/bin/python3", str(fake), "push_versioned"], "init_options": {}, "settings": {},
+            "tool_dirs": [str(fake.parent)], "address_space_mb": None, "startup_timeout_seconds": 10,
+            "canary": {"bad": {"path": "b.py", "text": "x\n", "expect_codes": ["E1"]},
+                       "good": {"path": "g.py", "text": "y\n"}}}
+    sess = runner.Session(sbx, prof, work, time.monotonic() + 30)
+    with pytest.raises(runner.Unavailable):
+        with sess:
+            pass
+    assert sess.client.proc is not None and sess.client.proc.poll() is not None

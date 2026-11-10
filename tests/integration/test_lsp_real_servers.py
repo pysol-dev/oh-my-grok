@@ -125,6 +125,14 @@ def test_candidate_cannot_loosen_checker_config_or_suppress(tmp_path):
     assert res["status"] == "findings" and res["suppressions"] and not res["new"]
 
 
+def test_checker_config_alone_is_a_finding_when_no_source_file_changed(tmp_path):
+    r = Repo(tmp_path / "r")
+    base = r.commit({"tsconfig.json": '{"compilerOptions": {"strict": true}}\n'})
+    cand = r.commit({"tsconfig.json": '{"compilerOptions": {"strict": false}}\n'})
+    res = ev(r, base, cand, tmp_path, None)
+    assert res["status"] == "findings" and res["config_violations"] == ["tsconfig.json"] and res["profiles"] == {}
+
+
 @need("python-ruff")
 def test_non_code_change_is_not_applicable_and_unknown_language_fails_closed(tmp_path):
     r = Repo(tmp_path / "r")
