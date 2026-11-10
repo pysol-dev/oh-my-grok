@@ -2,7 +2,6 @@
 Acceptance tests for R1, R2, R3 and R12 (spec/ADAPTIVE.md section 11)."""
 import json
 import os
-import uuid
 from pathlib import Path
 
 import pytest

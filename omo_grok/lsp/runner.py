@@ -297,7 +297,10 @@ def analyze(repo: Path, sha: str, name: str, profile: dict, files: list[str], sb
     try:
         work = run_dir / "work"
         tree = ls_tree(repo, sha)
-        stage_revision(repo, sha, work)
+        if tree:
+            stage_revision(repo, sha, work)
+        else:
+            work.mkdir(parents=True)
         if overlay:
             overlay_base_config(repo, overlay["base"], tree, ls_tree(repo, overlay["base"]), work,
                                 profile["config_files"])
@@ -408,3 +411,40 @@ def evaluate(repo: Path, base: str, cand: str, cfg: dict, sbx: sandbox.Probe, sc
     else:
         res["status"] = "clean"
     return res
+
+
+def canary_all(cfg: dict, sbx: sandbox.Probe, scratch: Path, only: list[str] | None = None) -> dict:
+    """Run only the canary of each enabled profile against a throwaway one-commit repository. This is what
+    `omoctl lsp canary` reports: whether each server can really find a planted defect on THIS machine."""
+    scratch.mkdir(parents=True, exist_ok=True)
+    repo = Path(tempfile.mkdtemp(prefix="canary-repo-", dir=scratch))
+    out = {}
+    try:
+        env = {"GIT_AUTHOR_NAME": "omo", "GIT_AUTHOR_EMAIL": "omo@invalid", "GIT_COMMITTER_NAME": "omo",
+               "GIT_COMMITTER_EMAIL": "omo@invalid", "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        for cmd in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "canary"]):
+            subprocess.run(["git", "-C", str(repo), *cmd], check=True, capture_output=True, env=env)
+        sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True,
+                             text=True).stdout.strip()
+        for name, prof in profiles.enabled_profiles(cfg).items():
+            if only is not None and name not in only:
+                continue
+            try:
+                r = analyze(repo, sha, name, prof, [], sbx, scratch, deadline_s=300)
+                out[name] = {"status": "ok", "mode": r["mode"], "server": r["server"], "canary": r["canary"],
+                             "identity": r["identity"]}
+            except Unavailable as e:
+                out[name] = {"status": "unavailable", "reason": e.reason, "detail": e.detail[:300]}
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+    return out
+
+
+def tool_status(cfg: dict) -> dict:
+    """Static presence check (no server is started): which profile files/dirs are missing."""
+    out = {}
+    for name, prof in profiles.enabled_profiles(cfg).items():
+        missing = [a for a in prof["argv"] if a.startswith("/") and not os.path.isfile(a)]
+        missing += [d for d in prof["tool_dirs"] if not os.path.isdir(d)]
+        out[name] = {"present": not missing, "missing": missing, "languages": sorted(prof["extensions"])}
+    return out

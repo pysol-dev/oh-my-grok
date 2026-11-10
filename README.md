@@ -7,7 +7,8 @@
 **PARTIALLY INSTALLED / NOT OPERATIONAL.**
 
 - Code, MCP (`user-omo`), bindings, hooks, unit/integration suites, and live fixture jobs pass on **DB evidence**. Momus round 13 signed off on `028255b`.
-- `./omoctl doctor` still prints the NOT OPERATIONAL banner.
+- This branch adds adaptive orchestration (intent gating, roster, boulder projection, real language-server gates, Context7 receipts, git-history checks). Every new behaviour defaults to **off**. Implementing it here does not install it on the host and does not make the installation OPERATIONAL.
+- `./omoctl doctor` derives its live-status line from recorded evidence (a passed real-repo gate with engine LSP and git receipts, plus human attestations of host cutover and the original live smoke and end-to-end items). With none of those, it reports NOT OPERATIONAL.
 - Routine run **receipts** from the Grok Bot UI are still not readable from this session, so this install is not called OPERATIONAL.
 - Webhook keys were entered in chat (user choice on 2026-11-04). **Keys are not being rotated** (user request). Rotation stays optional until a chat paste path that keeps secrets out of history exists. See `docs/SECURITY.md`.
 
@@ -36,12 +37,12 @@ Upstream OmO is the **oh-my-openagent / LazyCodex** lineage:
 | Topic | Upstream OmO (oh-my-openagent / LazyCodex) | omo-grok (this repo) |
 |---|---|---|
 | Where it runs | In-process Codex / OpenCode **plugin** harness | Separate process on the shared Bot computer under `/workspace/omo` |
-| Continuity | Session lifecycle hooks (`SessionStart`, `PreToolUse`, `Stop`, …); boulder state in `.omo/boulder.json`; plans under `.omo/plans/` | Durable **SQLite** job/task/outbox DB (`state/omo.sqlite3`); no `boulder.json` |
+| Continuity | Session lifecycle hooks (`SessionStart`, `PreToolUse`, `Stop`, …); boulder state in `.omo/boulder.json`; plans under `.omo/plans/` | Durable **SQLite** job/task/outbox DB (`state/omo.sqlite3`) is the only authority. With `boulder=on`, `.omo/boulder.json` and an active-plan markdown file are a locked projection of that DB and are never read back |
 | How work is delegated | Native multi-agent / `spawn_agent` inside one Codex session family; model routing per role | HTTPS **webhook outbox** wakes Grok Bot routines (`omo-bus-*`); body is **ids-only** + Bearer key |
 | Primary agents | Sisyphus / Hephaestus / Prometheus / Atlas (+ explore, librarian, metis, momus, …) | Eight logical roles on existing Grok Bots; **no** Sisyphus, Atlas, Prometheus, or ulw hooks |
 | Intake | Same-machine session continuity | Hephaestus owns the goal in **chat** → MCP `submit`; optional resume webhook draft exists, not required for intake |
 | Approval | Plan / work loops inside the plugin session | **Plan-hash SOFT** approval via `omoctl approve` (TTY); strict external signatures documented, not implemented |
-| Verification | Ultralwork / ulw-loop / start-work hooks; comment-checker, LSP, rules injection | bubblewrap sandbox + trusted **oracle** for fixture profiles; Momus/Metis as separate bots (same account → independence disclosed as reduced) |
+| Verification | Ultralwork / ulw-loop / start-work hooks; comment-checker, LSP, rules injection | bubblewrap sandbox + trusted **oracle** for fixture profiles; with `lsp=enforce`, a base-versus-candidate delta from real language servers (ruff, basedpyright, typescript-language-server). Other languages fail closed. Momus/Metis as separate bots (same account → independence disclosed as reduced) |
 | Install shape | Codex plugin install | MCP stdio server `omo` + `omoctl` CLI; **not** a native OmO hook implementation |
 
 **In one sentence:** OmO keeps a multi-agent loop *inside* one Codex session with plugin hooks and boulder state; omo-grok keeps durable job state in SQLite and *pings separate Grok Bots* when a task is ready.

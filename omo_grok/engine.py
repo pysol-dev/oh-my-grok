@@ -1153,6 +1153,25 @@ class Engine:
                 "how_to_cite": "put {receipt_id, quote} in research.citations; the quote must be a verbatim excerpt "
                                "of text (whitespace-normalised) of at least 20 characters"}
 
+    def attest(self, kind: str, who: str, statement: str) -> dict:
+        """Record a HUMAN attestation (omoctl, TTY-confirmed). Stored as an append-only event; never a secret."""
+        from .operational import ATTEST_KINDS
+        if kind not in ATTEST_KINDS:
+            raise ValidationError(f"attestation kind must be one of {sorted(ATTEST_KINDS)}")
+        if not isinstance(statement, str) or not (1 <= len(statement.strip()) <= 2000):
+            raise ValidationError("statement must be 1..2000 chars")
+        with db.tx(self.conn):
+            self._ev("attestation", None, None, str(who)[:200], attestation=kind, statement=redact(statement)[:2000],
+                     meaning=ATTEST_KINDS[kind])
+        return {"ok": True, "attestation": kind, "who": who}
+
+    def job_features(self, job_id: str) -> dict:
+        return self._features(self._job(job_id))
+
+    def operational_state(self) -> dict:
+        from . import operational
+        return operational.evaluate(self.conn)
+
     def receipts_for(self, job_id: str) -> list[dict]:
         self._job(job_id)
         return receipts.listing(self.conn, job_id)
@@ -2186,7 +2205,8 @@ class Engine:
                 "ASSURANCE_LABEL": summary.get("WARNING") or ("REDUCED ASSURANCE" if summary["reduced_assurance"]
                                                               else f"assurance={job['assurance']}")}
         for tbl in ("tasks", "task_attempts", "artifacts", "plan_revisions", "approvals", "dispatch_outbox",
-                    "verifications", "reviews", "gate_results", "events"):
+                    "verifications", "reviews", "gate_results", "events", "tool_receipts", "escalations",
+                    "work_sessions", "boulder_projection", "repo_leases"):
             data[tbl] = [dict(r) for r in self._all(f"SELECT * FROM {tbl} WHERE job_id=?", (job_id,))]
         integrity = []
         for a in data["artifacts"]:

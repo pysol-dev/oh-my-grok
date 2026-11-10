@@ -1,6 +1,6 @@
 """stdio MCP server 'omo' (official `mcp` SDK, MCPServer API).
 
-Tools (exactly): submit, claim, context, checkpoint, complete, status, reconcile, cancel.
+Tools (exactly): submit, claim, context, checkpoint, complete, status, reconcile, cancel, escalate, docs.
 There are deliberately NO approve / ship / mark_done / shell / secret tools: approval is human-only via omoctl.
 stdout carries MCP protocol only; all logging goes to stderr and is redacted.
 Run:  <python> <code root>/omo_grok/mcp_server.py   (the exact command: `omoctl mcp-command`)
@@ -27,7 +27,8 @@ from omo_grok.errors import OmoError  # noqa: E402
 from omo_grok.fingerprint import fingerprint  # noqa: E402
 from omo_grok.redact import redact, redact_obj, redact_urls  # noqa: E402
 
-TOOL_NAMES = ("submit", "claim", "context", "checkpoint", "complete", "status", "reconcile", "cancel")
+TOOL_NAMES = ("submit", "claim", "context", "checkpoint", "complete", "status", "reconcile", "cancel", "escalate",
+              "docs")
 UUID = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 Id = Annotated[str, Field(pattern=UUID, description="UUID")]
 
@@ -57,6 +58,17 @@ class ArtifactRef(BaseModel):
     sha256: Annotated[str | None, Field(default=None, pattern=r"^[0-9a-f]{64}$")] = None
     artifact_id: Annotated[str | None, Field(default=None, pattern=UUID)] = None
     revision: Annotated[str | None, Field(default=None, max_length=64)] = None
+
+
+class ScopeAttestation(BaseModel):
+    """The scope Hephaestus attests to when proposing an implementation team. All five fields are required; the engine
+    computes the minimum team from them and escalates automatically if the real diff contradicts them."""
+    model_config = ConfigDict(extra="forbid")
+    files_estimate: Annotated[int, Field(ge=1, le=10000)]
+    new_dependency: bool
+    external_api: bool
+    security_sensitive: bool
+    cross_cutting: bool
 
 
 def _refs(refs):
@@ -113,8 +125,11 @@ server = _RedactingMCPServer(
 )
 
 
-@server.tool(description="Submit a new job (Hephaestus intake). Idempotent on idempotency_key. Creates the research "
-                         "DAG (Explorer+Librarian -> Metis -> plan). Never self-webhooks.")
+@server.tool(description="Submit a new job (Hephaestus intake). Idempotent on idempotency_key. Classify the request "
+                         "first: intent=explanation answers directly and creates NO job; investigation is read-only "
+                         "(can never edit); implementation needs a scope attestation and gets the smallest adequate "
+                         "team (quick|standard|heavy; you may propose a larger class, never a smaller one). Without "
+                         "an intent the original research DAG is created. Never self-webhooks.")
 def submit(goal: Annotated[str, Field(min_length=1, max_length=20000)],
            idempotency_key: Annotated[str, Field(pattern=r"^[A-Za-z0-9._:\-]{8,128}$")],
            repo: Annotated[str | None, Field(max_length=1024)] = None,
@@ -122,9 +137,14 @@ def submit(goal: Annotated[str, Field(min_length=1, max_length=20000)],
            constraints: Annotated[list[Annotated[str, Field(max_length=2000)]] | None, Field(max_length=100)] = None,
            acceptance_criteria: Annotated[list[Annotated[str, Field(max_length=2000)]] | None,
                                           Field(max_length=100)] = None,
-           verifier_profile: Annotated[str | None, Field(max_length=128)] = None) -> dict[str, Any]:
+           verifier_profile: Annotated[str | None, Field(max_length=128)] = None,
+           intent: Literal["explanation", "investigation", "implementation"] | None = None,
+           roster_class: Literal["quick", "standard", "heavy"] | None = None,
+           scope: ScopeAttestation | None = None) -> dict[str, Any]:
     return _call(lambda e: e.submit(goal, idempotency_key, repo=repo, mode=mode, constraints=constraints,
-                                    acceptance_criteria=acceptance_criteria, verifier_profile=verifier_profile))
+                                    acceptance_criteria=acceptance_criteria, verifier_profile=verifier_profile,
+                                    intent=intent, roster_class=roster_class,
+                                    scope=scope.model_dump() if scope else None))
 
 
 def claim_with_task_role(e: Engine, job_id: str, task_id: str, dispatch_id: str) -> dict[str, Any]:
@@ -176,6 +196,26 @@ def reconcile(job_id: Annotated[str | None, Field(pattern=UUID)] = None) -> dict
                          "the user must run `omoctl cancel JOB`. Nothing is deleted.")
 def cancel(job_id: Id, reason: Annotated[str, Field(min_length=1, max_length=1000)]) -> dict[str, Any]:
     return _call(lambda e: e.cancel(job_id, reason, actor="mcp", confirmed=False))
+
+
+@server.tool(description="Raise a job's team class (quick -> standard -> heavy; never down). Adds the missing research, "
+                         "supersedes the current plan, revokes any approval and re-plans. Use when the work turns out "
+                         "larger than attested.")
+def escalate(job_id: Id, to_class: Literal["standard", "heavy"],
+             reason: Annotated[str, Field(min_length=1, max_length=2000)]) -> dict[str, Any]:
+    return _call(lambda e: e.escalate(job_id, to_class, reason, actor="mcp"))
+
+
+@server.tool(description="Ask the ENGINE to query Context7 for library documentation (only when docs_evidence is on "
+                         "for the job). Returns the text and a receipt_id; cite it in research.citations as "
+                         "{receipt_id, quote} with a verbatim excerpt. A claim that you called a tool yourself is "
+                         "never evidence.")
+def docs(job_id: Id, query: Annotated[str, Field(min_length=1, max_length=2000)],
+         library_name: Annotated[str | None, Field(max_length=200)] = None,
+         library_id: Annotated[str | None, Field(pattern=r"^/[A-Za-z0-9._~-]+(/[A-Za-z0-9._~-]+)+$")] = None,
+         task_id: Annotated[str | None, Field(pattern=UUID)] = None) -> dict[str, Any]:
+    return _call(lambda e: e.docs(job_id, query, library_name, library_id, task_id,
+                                  actor=(e._task(job_id, task_id)["role"] if task_id else "librarian")))
 
 
 def main():

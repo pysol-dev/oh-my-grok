@@ -1,14 +1,13 @@
 """Boulder continuity: restart/resume semantics, duplicate-job prevention, repo lease (spec/ADAPTIVE.md 6.5, R4, R5)."""
 import json
 import os
-import subprocess
 from pathlib import Path
 
 import pytest
 
 from omo_grok import fixture as fx
 from omo_grok import gitops
-from omo_grok.errors import Conflict, GateRefused
+from omo_grok.errors import GateRefused
 from omo_grok.paths import get_paths
 
 BASE = {"files_estimate": 1, "new_dependency": False, "external_api": False, "security_sensitive": False,
@@ -129,7 +128,6 @@ def test_active_work_lists_per_task_sessions(h):
 # --------------------------------------------------------------------------- repo lease
 @pytest.fixture
 def two_jobs(omo_home, tmp_path):
-    from helpers import Harness
     repo = tmp_path / "shared-repo"
     fx.make_repo(repo)
     top = str(gitops.toplevel(repo))

@@ -27,6 +27,25 @@ python3 -m venv .venv
 ./omoctl test integration
 ```
 
+## 1b. Fresh clone (relocation-safe)
+`scripts/bootstrap.sh` is the install. It does not use sudo and it does not read or write the live runtime.
+
+```bash
+# host packages this script does not install: Python >= 3.12, git, bubblewrap (bwrap)
+git clone https://github.com/pysol-dev/omo-grok.git
+cd omo-grok
+scripts/bootstrap.sh          # .venv from requirements.lock, tools/ from tooling locks
+./omoctl migrate
+./omoctl doctor               # live status is derived; NOT OPERATIONAL until evidence exists
+./omoctl lsp status           # which language servers are present, which languages fail closed
+./omoctl lsp canary           # each present server must find a planted defect
+./omoctl mcp-command          # exact stdio command for this checkout
+```
+
+`scripts/bootstrap.sh --check` exits 8 when a piece is missing. Placeholders in shipped config are only `${OMO_CODE_ROOT}`, `${OMO_PYTHON}`, `${OMO_TOOLS}`, `${OMO_NODE}` and `${OMO_SITE}`. Nothing in code or config hardcodes `/workspace/omo`.
+
+Host-side needs this script cannot do: the `bubblewrap` package, unprivileged user namespaces (otherwise the sandbox fails closed), registering the MCP command in Grok Bot, binding roles, webhook secrets via `omoctl hook set` or `hook serve` (never paste keys into chat), and pasting routine instructions. See `docs/MIGRATION.md` for the cutover order. Do not delete Bots or routines as part of install.
+
 ## 2. Register the MCP server in Grok Bot (command server; user/parent step)
 Register a custom **command** (stdio) MCP server named `omo`:
 
@@ -39,7 +58,7 @@ and `OMO_PYTHON`, so a relocated checkout never carries a stale path). Install t
 `scripts/bootstrap.sh`. The command needs no environment variables or secrets. Registration applies account-wide.
 
 Confirm it from **at least two Bots**, for example Hephaestus and Explorer: the tool list should contain exactly
-`submit, claim, context, checkpoint, complete, status, reconcile, cancel`, and a `status` call should succeed. A local
+`submit, claim, context, checkpoint, complete, status, reconcile, cancel, escalate, docs`, and a `status` call should succeed. A local
 `python -m` test does not count as registration.
 
 ## 3. Bind roles to Bots and routines

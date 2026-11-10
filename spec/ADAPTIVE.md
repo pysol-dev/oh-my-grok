@@ -1,8 +1,8 @@
 # ADAPTIVE ORCHESTRATION SPEC (sibling to `spec/IMPLEMENTATION.md`)
 
-Status of this document: **DRAFT FOR IMPLEMENTATION, version 1 (2026-11-06)**. It records the corrected design ("v2")
-that follows the read-only audit of `acb40e5`. It describes what the code in this branch is required to do and what it
-is forbidden to claim. It is not evidence that anything is installed or operational.
+Status of this document: **IMPLEMENTED ON THIS BRANCH, version 1 (2026-11-09)**. It records the corrected design ("v2")
+that follows the read-only audit of `acb40e5`. The code on this branch is what the tests exercise. It is not evidence
+that anything is installed on the host, and it is not OPERATIONAL.
 
 `spec/IMPLEMENTATION.md` (the original spec) is **not edited**. Its SHA-256 is
 `9643ee06f6817b08c57ea585fd8f919d4b23639bffd817a4a3084c7c9d0d30ae` (see `spec/IMPLEMENTATION.md.sha256`); a test
@@ -249,8 +249,9 @@ capability), `initialized`, per file `didOpen` (version 1, full text), diagnosti
 ### 7.3 Sandbox and inputs
 
 The server runs under `sandbox.wrap`-style bubblewrap (no network, private `/tmp`, scrubbed environment) with the
-revision's files staged read-write at `/work` from `git archive` (never the user's worktree) and the tools directory
-bound read-only at `/omo-tools`. The sandbox, the tool paths, and the staged tree are inputs of the receipt.
+revision's files staged read-write at `/work` from `git archive` (never the user's worktree) and each tools directory
+bound read-only at its own host path (node and the language servers resolve their own files from that path; a relocated
+`/omo-tools` mount breaks them). The sandbox, the tool paths, and the staged tree are inputs of the receipt.
 `didOpen` text hashes are compared with the git blob ids of the revision (`git ls-tree`), so what the server saw is
 bound to the exact revision. Engine-owned configuration: the profile's `config_files` are taken from the **base**
 revision for both runs; a candidate that adds, edits or deletes one of them fails `lsp_config_untouched`.
@@ -258,7 +259,7 @@ revision for both runs; a candidate that adds, edits or deletes one of them fail
 ### 7.4 Canary (positive control)
 
 Before analysing repository files, in the same server session, the client opens a known-bad file and a known-good
-file written to the scratch directory (never part of the repository). The run is valid only if the bad file yields at
+file written under `omo_canary/` in the staged copy (not a hidden directory: basedpyright ignores those; never the user's worktree). The run is valid only if the bad file yields at
 least one diagnostic with a code in the profile's `expect_codes` and the good file yields no error-severity
 diagnostic. A server that is missing, silent, stubbed, or crashed fails the canary and the receipt is `unavailable`.
 
@@ -276,8 +277,8 @@ the scope is the changed files only and the receipt says so. New suppression com
 |---|---|---|---|
 | Python | `ruff server` | pull | implemented and verified against the real server in tests |
 | Python | `basedpyright-langserver --stdio` | push (versioned) | implemented and verified against the real server in tests |
-| TypeScript / JavaScript | `typescript-language-server --stdio` + `typescript` | push | implemented and verified against the real server in tests |
-| anything else | none | n/a | **unsupported**: a changed file with a known code extension and no working profile fails with `diagnostics_unavailable` (R8). Profile templates for other servers may be added to `config/lsp.json` but are disabled and unverified. Documentation files (md, json, yaml, txt...) are not code. |
+| TypeScript | `typescript-language-server --stdio` + `typescript` | push (this server's `publishDiagnostics` carries no `version`, and `serverInfo` is empty; the canary code `2322` is the proof) | implemented and verified against the real server in tests |
+| JavaScript, Go, Rust, and every other entry in `code_extensions` | none enabled | n/a | **unsupported**: a changed file with that extension fails with `diagnostics_unavailable` (R8). Add an enabled profile to extend coverage. Documentation files (md, json, yaml, txt...) are not code. |
 
 This spec never claims general language coverage. The list above is the entire verified set.
 

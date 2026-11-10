@@ -4,8 +4,6 @@ import json
 import os
 from pathlib import Path
 
-import pytest
-
 from omo_grok import fixture as fx
 from test_lsp_real_servers import need
 
