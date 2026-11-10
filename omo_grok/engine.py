@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import artifacts as art
-from . import db, gitops, verifier
+from . import db, features, gitops, roster, verifier
 from . import fixture as fx
 from .config import (canonical_json, load_policy, load_verifier_profiles, profile_assurance, profile_hash,
                      sha256_text)
@@ -101,6 +101,7 @@ class Engine:
         self.profiles = load_verifier_profiles(self.paths.config_dir)
         self.transport = transport or post_json
         self.clock = clock or time.time
+        self._diff_files: dict[str, list[str]] = {}
 
     # ------------------------------------------------------------------ infra
     def ensure_schema(self) -> list[int]:
@@ -160,6 +161,8 @@ class Engine:
         dst = dst or job["phase"]
         if dst != job["phase"]:
             check_job(job["phase"], dst)
+        if dst == J_DONE and job["phase"] == J_ANALYSIS and job["intent"] != "investigation":
+            raise Conflict("only a read-only investigation may finish from the analysis phase")
         cols = ", ".join(f"{k}=?" for k in fields)
         sql = (f"UPDATE jobs SET phase=?, version=version+1, updated_at=?{', ' + cols if cols else ''} "
                "WHERE id=? AND version=?")
@@ -194,6 +197,10 @@ class Engine:
         pol.update(_l(job["policies_json"]) or {})
         return pol
 
+    def _features(self, job) -> dict:
+        """The feature modes frozen into this job at submit; a job that predates them runs with everything off."""
+        return features.frozen(_l(job["policies_json"]))
+
     def _art_root(self, job_id: str) -> Path:
         return self.paths.artifacts_dir(job_id)
 
@@ -201,7 +208,9 @@ class Engine:
                   priority=0, max_attempts=None) -> str:
         tid = str(uuid.uuid4())
         now = db.utcnow()
-        job = self._one("SELECT policies_json, current_plan_revision_id FROM jobs WHERE id=?", (job_id,))
+        job = self._one("SELECT policies_json, current_plan_revision_id, intent FROM jobs WHERE id=?", (job_id,))
+        if job["intent"] in ("explanation", "investigation") and kind in roster.READ_ONLY_FORBIDDEN_KINDS:
+            raise GateRefused(f"job intent {job['intent']!r} is read-only; a {kind} task can never be created for it")
         if plan_revision_id is None and kind in ("implement", "code_review", "qa", "integrate"):
             plan_revision_id = job["current_plan_revision_id"]  # post-approval work is bound to the approved revision
             if not plan_revision_id:
@@ -304,14 +313,35 @@ class Engine:
     # ------------------------------------------------------------------ submit
     def submit(self, goal: str, idempotency_key: str, repo: str | None = None, constraints: list | None = None,
                acceptance_criteria: list | None = None, mode: str | None = None, verifier_profile: str | None = None,
-               max_repair_cycles: int | None = None, actor: str = "hephaestus") -> dict:
+               max_repair_cycles: int | None = None, actor: str = "hephaestus", intent: str | None = None,
+               roster_class: str | None = None, scope: dict | None = None) -> dict:
         if not isinstance(goal, str) or not goal.strip() or len(goal) > 20000:
             raise ValidationError("goal must be 1..20000 chars")
         if not isinstance(idempotency_key, str) or not IDEM_RE.match(idempotency_key):
             raise ValidationError("idempotency_key must match [A-Za-z0-9._:-]{8,128}")
+        feats = features.normalize(self.policy.get("features"))
+        if intent is not None and intent not in roster.INTENTS:
+            raise ValidationError(f"intent must be one of {list(roster.INTENTS)}")
+        if intent is None and feats["adaptive_roster"] == features.ENFORCE:
+            raise ValidationError("intent is required (explanation|investigation|implementation) while "
+                                  "adaptive_roster is enforced")
+        if scope is not None:
+            scope = roster.validate_scope(scope)
+        if intent == "explanation":
+            with db.tx(self.conn):
+                self._ev("intent_gated", None, None, actor, intent=intent, goal_chars=len(goal),
+                         note="explanation: answered directly, no job and no task created")
+            return {"created": False, "roster_class": "none", "action": "answer_directly"}
+        if roster_class is not None:
+            if intent != "implementation":
+                raise ValidationError("roster_class applies only to intent=implementation")
+            if feats["adaptive_roster"] != features.ENFORCE:
+                raise ValidationError("roster_class requires adaptive_roster=enforce")
         mode = mode or "plan_only"
         if mode not in ("plan_only", "implement", "fixture"):
             raise ValidationError("mode must be plan_only|implement|fixture")
+        if intent == "investigation" and mode != "plan_only":
+            raise ValidationError("an investigation is read-only: mode must be plan_only")
         constraints = list(constraints or [])
         acceptance_criteria = list(acceptance_criteria or [])
         for lst in (constraints, acceptance_criteria):
@@ -336,13 +366,31 @@ class Engine:
             if mode == "fixture" and profile_assurance(self.profiles[verifier_profile]) != "oracle":
                 raise ValidationError("fixture jobs require an oracle verifier profile (the pass/fail "
                                       "decision is recomputed by the parent, not taken from a self-report)")
-        policies = {}
+        cls = None
+        if intent == "investigation":
+            cls = roster.INVESTIGATION_CLASS
+        elif intent == "implementation":
+            if feats["adaptive_roster"] == features.ENFORCE:
+                if scope is None:
+                    raise ValidationError("scope attestation is required for intent=implementation while "
+                                          "adaptive_roster is enforced")
+                cls = roster.resolve_class(scope, roster_class)
+            else:
+                cls = "heavy"  # the original DAG; shadow mode only records what enforce would have done
+        policies = {"features": feats}
         if max_repair_cycles is not None:
             if not (1 <= int(max_repair_cycles) <= 10):
                 raise ValidationError("max_repair_cycles must be 1..10")
             policies["max_repair_cycles"] = int(max_repair_cycles)
         req = {"goal": goal, "repo": repo_path, "constraints": constraints, "acceptance_criteria": acceptance_criteria,
-               "mode": mode, "verifier_profile": verifier_profile, "policies": policies}
+               "mode": mode, "verifier_profile": verifier_profile,
+               "policies": {k: v for k, v in policies.items() if k != "features"}}
+        if intent is not None:
+            req["intent"] = intent
+            if scope is not None:
+                req["scope"] = scope
+            if roster_class is not None:
+                req["roster_class"] = roster_class
         rhash = sha256_text(canonical_json(req))
         job_id = str(uuid.uuid4())
         with db.tx(self.conn):
@@ -352,29 +400,42 @@ class Engine:
                     raise Conflict("idempotency_key reused with a different request", job_id=ex["id"])
                 tasks = {r["kind"]: r["id"] for r in self._all("SELECT kind,id FROM tasks WHERE job_id=? AND cycle=0 "
                                                                 "ORDER BY created_at", (ex["id"],))}
-                return {"job_id": ex["id"], "created": False, "phase": ex["phase"], "mode": ex["mode"],
-                        "task_ids": tasks, "requirements_hash": rhash}
+                out = {"job_id": ex["id"], "created": False, "phase": ex["phase"], "mode": ex["mode"],
+                       "task_ids": tasks, "requirements_hash": rhash}
+                if ex["intent"]:
+                    out.update(intent=ex["intent"], roster_class=ex["roster_class"])
+                return out
             now = db.utcnow()
             if mode == "fixture":
                 repo_path = str(self.paths.job_dir(job_id) / "fixture-repo")
+            kinds = roster.task_kinds(cls or "heavy", scope)
+            phase = J_PLANNING if kinds[0] == "plan" else J_RESEARCH
             self.conn.execute("INSERT INTO jobs(id,idempotency_key,goal,repo_path,mode,requirements_json,"
-                              "requirements_hash,phase,policies_json,verifier_profile,created_at,updated_at) "
-                              "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                              (job_id, idempotency_key, goal, repo_path, mode, canonical_json(req), rhash, J_RESEARCH,
-                               _j(policies), verifier_profile, now, now))
-            t_ex = self._new_task(job_id, "explore")
-            t_li = self._new_task(job_id, "research")
-            t_me = self._new_task(job_id, "analyze", deps=[t_ex, t_li])
-            t_pl = self._new_task(job_id, "plan", deps=[t_me])
-            self._ev("job_submitted", job_id, None, actor, mode=mode, requirements_hash=rhash,
-                     note="direct Hephaestus intake; no self-webhook")
+                              "requirements_hash,phase,policies_json,verifier_profile,intent,roster_class,scope_json,"
+                              "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                              (job_id, idempotency_key, goal, repo_path, mode, canonical_json(req), rhash, phase,
+                               _j(policies), verifier_profile, intent, cls, scope and canonical_json(scope), now, now))
+            task_ids = {}
+            for k in kinds:
+                deps = {"analyze": [task_ids[x] for x in ("explore", "research") if x in task_ids],
+                        "plan": [task_ids["analyze"]] if "analyze" in task_ids else []}.get(k, [])
+                task_ids[k] = self._new_task(job_id, k, deps=deps)
+            self._ev("job_submitted", job_id, None, actor, mode=mode, requirements_hash=rhash, intent=intent,
+                     roster_class=cls, note="direct Hephaestus intake; no self-webhook")
+            if intent == "implementation" and scope is not None and feats["adaptive_roster"] == features.SHADOW:
+                would = roster.resolve_class(scope, None)
+                self._ev("roster_shadow", job_id, None, "engine", would_be_class=would,
+                         would_create=roster.task_kinds(would, scope), actual_class=cls,
+                         floor_triggers=roster.floor(scope)[1])
             self._schedule(job_id)
         if mode == "fixture":
             fx.make_repo(Path(repo_path))
         self._after()
-        return {"job_id": job_id, "created": True, "phase": J_RESEARCH, "mode": mode,
-                "task_ids": {"explore": t_ex, "research": t_li, "analyze": t_me, "plan": t_pl},
-                "requirements_hash": rhash}
+        out = {"job_id": job_id, "created": True, "phase": phase, "mode": mode, "task_ids": task_ids,
+               "requirements_hash": rhash}
+        if intent is not None:
+            out.update(intent=intent, roster_class=cls)
+        return out
 
     # ------------------------------------------------------------------ scheduling / dispatch
     def _bot_busy(self, bot_id: str, limit: int) -> bool:
@@ -849,6 +910,9 @@ class Engine:
             raise ValidationError(f"{t['kind']} requires at least {SCHEMAS[t['kind']]['min_artifacts']} artifact(s)")
         if cls == "normal" and t["kind"] == "implement":
             self._prevalidate_commit(job, result["commit_sha"])  # git reads OUTSIDE the transaction
+            if job["scope_json"] and self._features(job)["adaptive_roster"] == features.ENFORCE:
+                self._diff_files[result["commit_sha"]] = gitops.changed_files(
+                    Path(job["worktree_path"]), job["base_revision"], result["commit_sha"])
         post: list[tuple] = []
         with db.tx(self.conn):
             job, t, a = self._live_attempt(job_id, task_id, attempt_id)
@@ -893,12 +957,17 @@ class Engine:
 
     def _on_research_done(self, job, t, ids):
         self._pass(t)
-        metis = self._one("SELECT * FROM tasks WHERE job_id=? AND kind='analyze' AND cycle=0", (job["id"],))
-        for aid in ids:
-            self.conn.execute("INSERT OR IGNORE INTO task_inputs(task_id,artifact_id) VALUES (?,?)", (metis["id"], aid))
-        others = self._all("SELECT status FROM tasks WHERE job_id=? AND kind IN ('explore','research')", (job["id"],))
-        if all(o["status"] == PASSED for o in others):
-            self._set_job(self._job(job["id"]), J_ANALYSIS)
+        for analyze in self._all("SELECT a.* FROM task_deps d JOIN tasks a ON a.id=d.task_id WHERE d.depends_on=? "
+                                 "AND a.kind='analyze' AND a.status NOT IN ('cancelled','rejected','failed')",
+                                 (t["id"],)):
+            for aid in ids:
+                self.conn.execute("INSERT OR IGNORE INTO task_inputs(task_id,artifact_id) VALUES (?,?)",
+                                  (analyze["id"], aid))
+            deps = self._all("SELECT d.status FROM task_deps x JOIN tasks d ON d.id=x.depends_on WHERE x.task_id=?",
+                             (analyze["id"],))
+            cur = self._job(job["id"])
+            if all(d["status"] == PASSED for d in deps) and cur["phase"] == J_RESEARCH:
+                self._set_job(cur, J_ANALYSIS)
         return []
 
     def _on_analyze(self, job, t, a, result, ids, cls):
@@ -909,8 +978,15 @@ class Engine:
             raise ValidationError("Metis must list the sha256 of BOTH research inputs in consumed_artifacts",
                                   missing=sorted(missing))
         self._pass(t)
-        plan = self._one("SELECT * FROM tasks WHERE job_id=? AND kind='plan' AND status='queued' ORDER BY created_at "
-                         "DESC LIMIT 1", (job["id"],))
+        if job["intent"] == "investigation":
+            self._set_job(self._job(job["id"]), J_DONE, assurance="read_only_investigation")
+            self._ev("investigation_done", job["id"], t["id"], "engine", artifact_ids=ids,
+                     note="read-only investigation finished from the analysis phase; no plan, approval or worktree")
+            return []
+        plan = self._one("SELECT p.* FROM task_deps d JOIN tasks p ON p.id=d.task_id WHERE d.depends_on=? AND "
+                         "p.kind='plan' AND p.status='queued' ORDER BY p.created_at DESC LIMIT 1", (t["id"],))
+        if not plan:
+            raise GateRefused("no queued plan task depends on this analysis (fail closed)")
         for aid in ids + self._inputs(t["id"]):
             self.conn.execute("INSERT OR IGNORE INTO task_inputs(task_id,artifact_id) VALUES (?,?)", (plan["id"], aid))
         self._set_job(self._job(job["id"]), J_PLANNING)
@@ -983,14 +1059,19 @@ class Engine:
 
     def _replan(self, job, extra_inputs, why):
         pol = self._policy(job)
-        if job["plan_rounds"] >= pol["max_plan_rounds"]:
+        escalations = self._one("SELECT COUNT(*) c FROM escalations WHERE job_id=?", (job["id"],))["c"]
+        if job["plan_rounds"] >= pol["max_plan_rounds"] + escalations:  # each escalation earns one more round
             self._block_job(job, f"plan review loop exhausted after {job['plan_rounds']} rounds ({why})")
             return
         self._set_job(job, J_PLANNING)
-        first_plan = self._one("SELECT id FROM tasks WHERE job_id=? AND kind='plan' ORDER BY created_at LIMIT 1",
-                               (job["id"],))
-        self._new_task(job["id"], "plan", inputs=[*self._inputs(first_plan["id"]), *extra_inputs],
+        self._new_task(job["id"], "plan", inputs=[*self._analysis_inputs(job["id"]), *extra_inputs],
                        cycle=job["plan_rounds"])
+
+    def _analysis_inputs(self, job_id) -> list[str]:
+        """Artifacts every plan of this job starts from: the latest passed analysis and what it consumed."""
+        a = self._one("SELECT id FROM tasks WHERE job_id=? AND kind='analyze' AND status='passed' "
+                      "ORDER BY created_at DESC LIMIT 1", (job_id,))
+        return [*self._task_artifacts(a["id"]), *self._inputs(a["id"])] if a else []
 
     def _revoke_approvals(self, job_id, reason):
         n = self.conn.execute("UPDATE approvals SET revoked_at=?, revoke_reason=? WHERE job_id=? AND revoked_at IS "
@@ -1021,8 +1102,26 @@ class Engine:
         self.conn.execute("UPDATE tasks SET candidate_revision=? WHERE id=?", (sha, t["id"]))
         n = self.conn.execute("UPDATE reviews SET invalidated=1 WHERE job_id=? AND type IN ('code','qa') AND "
                               "(revision IS NULL OR revision!=?) AND invalidated=0", (job["id"], sha)).rowcount
-        self._set_job(self._job(job["id"]), candidate_revision=sha)
+        job = self._set_job(self._job(job["id"]), candidate_revision=sha)
         self._ev("candidate_revision", job["id"], t["id"], "executor", revision=sha, invalidated_reviews=n)
+        changed = self._diff_files.pop(sha, None)
+        if changed is not None and job["scope_json"]:
+            contra = roster.scope_contradictions(_l(job["scope_json"]), changed)
+            if contra:
+                nxt = roster.next_class(job["roster_class"])
+                if nxt is None:
+                    self._ev("scope_contradiction_at_max_class", job["id"], t["id"], "engine", revision=sha,
+                             contradictions=contra, note="already the largest team; recorded, not blocked")
+                else:
+                    self._ev("auto_escalation", job["id"], t["id"], "engine", revision=sha, to_class=nxt,
+                             contradictions=contra)
+                    self._set_task(self._one("SELECT * FROM tasks WHERE id=?", (t["id"],)), REJECTED,
+                                   block_reason=("scope contradicts attestation: " + contra[0])[:500])
+                    self._escalate_tx(self._job(job["id"]), nxt, "automatic: " + "; ".join(contra)[:1500],
+                                      "engine", automatic=True,
+                                      observed={"revision": sha, "changed_files": changed[:200],
+                                                "contradictions": contra})
+                    return []
         return [("verify", t["id"])]
 
     def _on_code_review(self, job, t, a, result, ids, cls):
@@ -1205,6 +1304,8 @@ class Engine:
             raise ValidationError("plan hash must be 64 hex chars")
         with db.tx(self.conn):
             job = self._job(job_id)
+            if allow_edit and job["intent"] in ("explanation", "investigation"):
+                raise GateRefused(f"job intent {job['intent']!r} is read-only; an edit approval can never be recorded")
             if mode == "synthetic_fixture" and job["mode"] != "fixture":
                 raise GateRefused("synthetic approval is only valid for synthetic fixture jobs")
             if job["phase"] not in (J_AWAITING_APPROVAL, J_PLAN_APPROVED):
@@ -1244,6 +1345,8 @@ class Engine:
 
     def _start_implementation(self, job_id):
         job = self._job(job_id)
+        if job["intent"] in ("explanation", "investigation"):
+            raise GateRefused(f"job intent {job['intent']!r} is read-only; implementation can never start")
         repo = Path(job["repo_path"])
         if job["mode"] == "fixture" and not repo.exists():
             fx.make_repo(repo)
@@ -1260,7 +1363,8 @@ class Engine:
             if others:
                 self._ev("concurrent_jobs_same_repo", job_id, None, "engine", other_jobs=[o["id"] for o in others],
                          note="separate worktrees/branches; conflicting target revisions must be merged by a human")
-            if not self._one("SELECT 1 FROM tasks WHERE job_id=? AND kind='implement'", (job_id,)):
+            if not self._one("SELECT 1 FROM tasks WHERE job_id=? AND kind='implement' AND plan_revision_id=?",
+                             (job_id, job["current_plan_revision_id"])):
                 rev = self._one("SELECT * FROM plan_revisions WHERE id=?", (job["current_plan_revision_id"],))
                 research = [r["id"] for r in self._all(
                     "SELECT a.id FROM artifacts a JOIN tasks t ON t.id=a.task_id WHERE a.job_id=? AND t.kind IN "
@@ -1419,6 +1523,66 @@ class Engine:
             self._schedule(job_id)
         return {"gate_id": gid, "passed": ok, "assurance": assurance, "checks": checks, "revision": sha}
 
+    # ------------------------------------------------------------------ escalation
+    def escalate(self, job_id: str, to_class: str, reason: str, actor: str = "hephaestus") -> dict:
+        """Add work, never remove it: classes only go up (spec/ADAPTIVE.md 5.4)."""
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
+            raise ValidationError("reason must be 1..2000 chars")
+        with db.tx(self.conn):
+            job = self._job(job_id)
+            if job["phase"] in (J_DONE, J_FAILED, J_CANCELLED):
+                raise Conflict(f"job is {job['phase']}; it cannot be escalated")
+            if job["phase"] == J_BLOCKED:
+                raise Conflict("job is blocked; resume it before escalating")
+            res = self._escalate_tx(job, to_class, reason.strip(), str(actor)[:200], automatic=False)
+        self._after()
+        return res
+
+    def _escalate_tx(self, job, to_class, reason, actor, automatic, observed=None) -> dict:
+        """Caller holds the transaction. Revokes approval, supersedes the plan, cancels not-yet-finished plan/analysis/
+        implementation tasks, creates the research the target class needs, and moves the job back."""
+        job_id = job["id"]
+        roster.check_escalation(job["roster_class"], to_class)
+        scope = _l(job["scope_json"])
+        seq = self._one("SELECT COUNT(*) c FROM escalations WHERE job_id=?", (job_id,))["c"] + 1
+        self.conn.execute("INSERT INTO escalations(id,job_id,seq,from_class,to_class,reason,actor,automatic,"
+                          "observed_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                          (str(uuid.uuid4()), job_id, seq, job["roster_class"], to_class, reason[:2000], actor,
+                           int(automatic), observed and _j(redact_obj(observed)), db.utcnow()))
+        self.conn.execute("UPDATE plan_revisions SET review_status='superseded' WHERE job_id=? AND review_status IN "
+                          "('pending','accepted')", (job_id,))
+        self._revoke_approvals(job_id, f"escalated to {to_class}")
+        stop_kinds = ("plan", "plan_review", "analyze", *self.PLAN_BOUND_KINDS)
+        q = ",".join("?" * len(stop_kinds))
+        for t in self._all(f"SELECT * FROM tasks WHERE job_id=? AND kind IN ({q}) AND status IN ('queued',"
+                           "'dispatched','awaiting_resume','working','submitted','blocked')", (job_id, *stop_kinds)):
+            if t["current_attempt_id"]:
+                self.conn.execute("UPDATE task_attempts SET status='superseded', ended_at=? WHERE id=? AND "
+                                  "status='working'", (db.utcnow(), t["current_attempt_id"]))
+            self._set_task(t, CANCELLED, block_reason=f"superseded by escalation to {to_class}"[:500],
+                           lease_token=None, lease_expires_at=None)
+            self.conn.execute("UPDATE dispatch_outbox SET superseded=1 WHERE task_id=? AND status IN "
+                              "('pending','retry_wait')", (t["id"],))
+        live = {}
+        for t in self._all("SELECT * FROM tasks WHERE job_id=? AND kind IN ('explore','research') AND status NOT IN "
+                           "('cancelled','rejected','failed') ORDER BY created_at", (job_id,)):
+            live[t["kind"]] = t
+        created = {}
+        for kind in roster.research_kinds(to_class, scope):
+            if kind not in live:
+                created[kind] = self._new_task(job_id, kind, cycle=seq)
+        deps = [t["id"] for t in live.values()] + list(created.values())
+        inputs = [aid for t in live.values() if t["status"] == PASSED for aid in self._task_artifacts(t["id"])]
+        analyze = self._new_task(job_id, "analyze", deps=deps, inputs=inputs, cycle=seq)
+        plan = self._new_task(job_id, "plan", deps=[analyze], cycle=job["plan_rounds"])
+        phase = J_RESEARCH if any(t["status"] != PASSED for t in live.values()) or created else J_ANALYSIS
+        self._set_job(self._one("SELECT * FROM jobs WHERE id=?", (job_id,)), phase, roster_class=to_class)
+        self._ev("escalation", job_id, None, actor, from_class=job["roster_class"], to_class=to_class, seq=seq,
+                 automatic=bool(automatic), reason=reason[:500], phase=phase)
+        self._schedule(job_id)
+        return {"ok": True, "job_id": job_id, "from_class": job["roster_class"], "to_class": to_class, "phase": phase,
+                "task_ids": {**created, "analyze": analyze, "plan": plan}}
+
     # ------------------------------------------------------------------ cancel / resume
     def cancel(self, job_id, reason, actor, confirmed=False) -> dict:
         if not isinstance(reason, str) or not reason.strip():
@@ -1557,6 +1721,7 @@ class Engine:
     def _job_summary(self, job, detail=False) -> dict:
         tasks = self._all("SELECT * FROM tasks WHERE job_id=? ORDER BY created_at", (job["id"],))
         out = {"job_id": job["id"], "phase": job["phase"], "mode": job["mode"], "goal": job["goal"][:300],
+               "intent": job["intent"], "roster_class": job["roster_class"],
                "repo": job["repo_path"], "worktree": job["worktree_path"], "branch": job["branch"],
                "base_revision": job["base_revision"], "candidate_revision": job["candidate_revision"],
                "final_result_revision": job["final_result_revision"], "assurance": job["assurance"],

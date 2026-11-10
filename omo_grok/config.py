@@ -6,6 +6,7 @@ import json
 import re
 from pathlib import Path
 
+from . import features
 from .errors import ValidationError
 from .paths import CODE_ROOT, python_path, tools_dir
 
@@ -25,6 +26,7 @@ DEFAULT_POLICY = {
     "max_sends_per_flush": 10,
     "repo_allowlist": [],
     "inline_dispatch": True,
+    "features": {},
 }
 
 REMOVED_POLICY_KEYS = {"require_independent_assurance", "fixture_allow_reduced_assurance"}
@@ -58,6 +60,7 @@ def load_policy(config_dir: Path) -> dict:
         if unknown:
             raise ValidationError(f"unknown policy keys: {sorted(unknown)}")
         pol.update(data)
+    pol["features"] = features.normalize(pol.get("features"))
     return pol
 
 

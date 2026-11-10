@@ -56,16 +56,16 @@ semantics, a real LSP diagnostics gate, engine-proven tool evidence (LSP, Contex
 
 ## Stage 1: features, schema v5, intent and roster
 
-- [ ] 1.1 RED `tests/unit/test_features.py`: defaults off, unknown names and modes refused, per-job freeze.
-- [ ] 1.2 RED `tests/unit/test_roster.py`: floor table, attestation validation, class ordering.
-- [ ] 1.3 GREEN `features.py`, `roster.py`, migration v5 (`jobs.intent`, `jobs.roster_class`, `jobs.scope_json`,
+- [x] 1.1 RED `tests/unit/test_features.py`: defaults off, unknown names and modes refused, per-job freeze.
+- [x] 1.2 RED `tests/unit/test_roster.py`: floor table, attestation validation, class ordering.
+- [x] 1.3 GREEN `features.py`, `roster.py`, migration v5 (`jobs.intent`, `jobs.roster_class`, `jobs.scope_json`,
   `escalations`, `tool_receipts`, `work_sessions`, `boulder_projection`, `repo_leases`).
-- [ ] 1.4 RED `tests/integration/test_adaptive_roster.py`: explanation creates nothing; investigation read-only in all
+- [x] 1.4 RED `tests/integration/test_adaptive_roster.py`: explanation creates nothing; investigation read-only in all
   four enforcement points; quick/standard/heavy task sets; heavy equals the legacy DAG; below-floor refused;
   escalation adds tasks, revokes approval, re-plans; auto-escalation on a contradicting diff; legacy path unchanged
   with flags off.
-- [ ] 1.5 GREEN engine changes (`submit`, `_new_task`, `approve`, `_start_implementation`, `_on_*`, `escalate`).
-- [ ] 1.6 Verify: new tests plus `tests/integration/test_workflow.py`, `test_dispatch.py`. Commit.
+- [x] 1.5 GREEN engine changes (`submit`, `_new_task`, `approve`, `_start_implementation`, `_on_*`, `escalate`).
+- [x] 1.6 Verify: new tests plus `tests/integration/test_workflow.py`, `test_dispatch.py`. Commit.
 
 ## Stage 2: continuity and projection
 

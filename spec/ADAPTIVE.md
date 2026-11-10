@@ -147,6 +147,7 @@ triggering fields in the error. A class above the floor is allowed.
 | quick | `plan` -> `plan_review` | `explore`, `research`, `analyze` absent (SUP-1, SUP-2) |
 | standard | `explore` -> `analyze` -> `plan`; plus `research` when `external_api` | |
 | heavy | `explore`, `research`, `analyze`, `plan` | identical to the original DAG |
+| investigation (intent, not a class a caller can request) | `explore`, `research` only if `scope.external_api` (or no scope was given), `analyze` | stored as `roster_class='investigation'`; read-only, no plan |
 
 After approval the implementation chain (`implement`, verifier, `code_review` and `qa`, `integrate`, final gate) is
 identical for all classes.
@@ -312,7 +313,7 @@ commit message carries the trailer `Omo-Job: <job_id>`; commits are on the job b
 
 `policy.json` key `features`, each `off | shadow | enforce`: `adaptive_roster`, `boulder` (`off | on`), `lsp`,
 `git_discipline`, `docs_evidence`, `repo_lease`. All default `off`. `shadow` computes and records the decision as an
-event without changing behaviour. `enforce` changes behaviour. The effective set is copied into the job's
+event without changing behaviour. `enforce` changes behaviour. `roster_class` is accepted only when `adaptive_roster=enforce`; with `off` or `shadow` an implementation job always gets the original (heavy) DAG, and `shadow` records an `roster_shadow` event naming what `enforce` would have created. A new job always freezes the feature set, including all-off. The effective set is copied into the job's
 `policies_json.features` at submit; running jobs ignore later configuration changes. `omoctl features` prints the
 effective and per-job values. Intent-based refusals for read-only intents (section 4.2 rules 2 to 5) apply whenever
 an `intent` is supplied, independent of flags, because they only remove capability.
