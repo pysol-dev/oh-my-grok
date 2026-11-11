@@ -1,6 +1,6 @@
 """stdio MCP server 'omg' (official `mcp` SDK, MCPServer API).
 
-Tools (exactly): submit, claim, context, checkpoint, complete, status, reconcile, cancel, escalate, docs.
+Tools (exactly): submit, claim, context, checkpoint, complete, status, reconcile, cancel, escalate, docs, heal.
 There are deliberately NO approve / ship / mark_done / shell / secret tools: approval is human-only via omg.
 stdout carries MCP protocol only; all logging goes to stderr and is redacted.
 Run:  <python> <code root>/oh_my_grok/mcp_server.py   (the exact command: `omg mcp-command`)
@@ -22,13 +22,13 @@ from pydantic import BaseModel, ConfigDict, Field  # noqa: E402
 from pydantic import ValidationError as PydanticValidationError  # noqa: E402
 
 from oh_my_grok.engine import Engine  # noqa: E402
-from oh_my_grok.errors import OmgError  # noqa: E402
+from oh_my_grok.errors import OmgError, ValidationError  # noqa: E402
 from oh_my_grok.fingerprint import fingerprint  # noqa: E402
 from oh_my_grok.paths import env_get  # noqa: E402
 from oh_my_grok.redact import redact, redact_obj, redact_urls  # noqa: E402
 
 TOOL_NAMES = ("submit", "claim", "context", "checkpoint", "complete", "status", "reconcile", "cancel", "escalate",
-              "docs")
+              "docs", "heal")
 UUID = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 Id = Annotated[str, Field(pattern=UUID, description="UUID")]
 
@@ -204,6 +204,22 @@ def cancel(job_id: Id, reason: Annotated[str, Field(min_length=1, max_length=100
 def escalate(job_id: Id, to_class: Literal["standard", "heavy"],
              reason: Annotated[str, Field(min_length=1, max_length=2000)]) -> dict[str, Any]:
     return _call(lambda e: e.escalate(job_id, to_class, reason, actor="mcp"))
+
+
+@server.tool(description="Project the failure corpus. action=collect writes one snapshot and a failures_collected "
+                         "audit event when healing is shadow or enforce, and writes nothing when healing is off. "
+                         "It does not change job phase, tasks, or dispatch, and it does not enqueue a fix. "
+                         "action=show reads the latest snapshot, or snapshot_id. No role binding is required. "
+                         "The snapshot is a projection, not authority; do not read the database to invent a corpus.")
+def heal(action: Literal["collect", "show"],
+         snapshot_id: Annotated[str | None, Field(pattern=UUID)] = None) -> dict[str, Any]:
+    def run(e: Engine) -> dict[str, Any]:
+        if action == "collect":
+            if snapshot_id is not None:
+                raise ValidationError("collect does not take a snapshot_id")
+            return e.heal_collect()
+        return e.heal_show(snapshot_id)
+    return _call(run)
 
 
 @server.tool(description="Ask the ENGINE to query Context7 for library documentation (only when docs_evidence is on "

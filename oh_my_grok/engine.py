@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import artifacts as art
-from . import context7, db, features, gitops, projection, receipts, roster, sandbox, skills, verifier
+from . import context7, db, features, gitops, healing, projection, receipts, roster, sandbox, skills, verifier
 from . import fixture as fx
 from .config import (canonical_json, load_policy, load_verifier_profiles, profile_assurance, profile_hash,
                      sha256_text)
@@ -157,6 +157,16 @@ class Engine:
         """Explicit refresh (omg boulder --refresh). Works for any job, whatever its frozen feature set."""
         self._job(job_id)
         return projection.project(self.conn, self.paths, job_id, float(self.policy["projection_lock_seconds"]))
+
+    def heal_collect(self) -> dict:
+        """Project the failure corpus (spec/HEALING.md). Uses the current policy, not a job's frozen flag.
+
+        Does not change jobs, tasks, or dispatch, and does not flush the boulder projection. The only new event is
+        ``failures_collected``, written by ``healing.collect`` with a null job id."""
+        return healing.collect(self.conn, self.policy["features"]["healing"])
+
+    def heal_show(self, snapshot_id: str | None = None) -> dict:
+        return healing.show(self.conn, snapshot_id)
 
     def _ev(self, ev_kind, job_id=None, task_id=None, actor=None, correlation_id=None, **data):
         if job_id:

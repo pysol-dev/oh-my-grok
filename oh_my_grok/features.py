@@ -1,4 +1,4 @@
-"""Per-feature rollout modes (spec/ADAPTIVE.md section 10).
+"""Per-feature rollout modes (spec/ADAPTIVE.md section 10, spec/HEALING.md).
 
 Every adaptive behaviour is behind one of these switches and every switch defaults to ``off``. The effective set is
 copied into the job at submit (``jobs.policies_json.features``), so editing configuration later cannot change what a
@@ -16,6 +16,7 @@ FEATURE_MODES: dict[str, tuple[str, ...]] = {
     "git_discipline": (OFF, SHADOW, ENFORCE),
     "docs_evidence": (OFF, SHADOW, ENFORCE),
     "repo_lease": (OFF, SHADOW, ENFORCE),
+    "healing": (OFF, SHADOW, ENFORCE),
 }
 
 

@@ -11,7 +11,7 @@ from oh_my_grok.errors import ValidationError
 
 def test_all_features_default_off():
     d = features.defaults()
-    assert set(d) == {"adaptive_roster", "boulder", "lsp", "git_discipline", "docs_evidence", "repo_lease"}
+    assert set(d) == {"adaptive_roster", "boulder", "lsp", "git_discipline", "docs_evidence", "repo_lease", "healing"}
     assert set(d.values()) == {"off"}
 
 
@@ -25,6 +25,14 @@ def test_partial_mapping_is_completed_with_off():
 def test_unknown_names_and_modes_are_refused(raw):
     with pytest.raises(ValidationError):
         features.normalize(raw)
+
+
+def test_healing_flag_accepts_shadow_and_enforce_only():
+    assert features.normalize({"healing": "shadow"})["healing"] == "shadow"
+    assert features.normalize({"healing": "enforce"})["healing"] == "enforce"
+    assert features.normalize({})["healing"] == "off"
+    with pytest.raises(ValidationError):
+        features.normalize({"healing": "on"})
 
 
 def test_job_without_frozen_features_runs_with_everything_off():
