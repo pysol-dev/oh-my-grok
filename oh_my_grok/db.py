@@ -328,6 +328,28 @@ CREATE TABLE repo_leases (
   acquired_at TEXT NOT NULL
 );
 """),
+    (6, "failure_snapshots", """
+CREATE TABLE failure_snapshots (
+  id TEXT PRIMARY KEY,
+  seq INTEGER NOT NULL UNIQUE,
+  mode TEXT NOT NULL CHECK (mode IN ('shadow','enforce')),
+  item_count INTEGER NOT NULL,
+  corpus_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE failure_items (
+  snapshot_id TEXT NOT NULL REFERENCES failure_snapshots(id),
+  ordinal INTEGER NOT NULL,
+  item_sha256 TEXT NOT NULL,
+  class TEXT NOT NULL,
+  source TEXT NOT NULL,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  task_id TEXT REFERENCES tasks(id),
+  payload_json TEXT NOT NULL,
+  PRIMARY KEY (snapshot_id, ordinal)
+);
+CREATE INDEX failure_items_job ON failure_items(job_id);
+"""),
 ]
 
 LATEST_VERSION = MIGRATIONS[-1][0]

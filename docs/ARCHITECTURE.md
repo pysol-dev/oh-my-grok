@@ -27,12 +27,13 @@ user ─chat─▶ Hephaestus ─MCP─▶ omg engine ◀─MCP── role routi
 | `features.py` | Feature modes (`off` / `shadow` / `enforce`, boulder `off` / `on`). Frozen into the job at submit. Default off |
 | `roster.py` | Smallest adequate team from a five-field scope. Escalation only raises the class |
 | `projection.py` | Locked atomic writer for `.omo/boulder.json` and the active-plan markdown. Derived; never read back |
+| `healing.py` | Failure-corpus projection (`omg heal`, MCP `heal`). Derived from jobs, rejected reviews, and `repair_cycle` events. Never read back. Collect does not change a job |
 | `lsp/` | Real language-server client, profiles, sandboxed runner and base/candidate delta. Not a renamed CLI checker |
 | `context7.py` | Streamable-HTTP connector to Context7. Engine receipts only; a later re-fetch is not a receipt |
 | `skills.py` | Delivers the git-master skill text into the executor packet. Delivery is not proof the model obeyed it |
 | `operational.py` | Derives the doctor live-status line from recorded evidence. Never a constant |
-| `mcp_server.py` | The 10 MCP tools (pydantic-validated): submit, claim, context, checkpoint, complete, status, reconcile, cancel, escalate, docs. Logs go to stderr, redacted. No approve/ship/shell/secret tools |
-| `cli.py` | `omg`: doctor, migrate, status, submit, plan show, approve/deny (TTY), cancel (TTY), resume, reconcile, export, backup/restore, hook set/check/list, roles, test |
+| `mcp_server.py` | The 11 MCP tools (pydantic-validated): submit, claim, context, checkpoint, complete, status, reconcile, cancel, escalate, docs, heal. `heal` projects the failure corpus and does not require a role binding. Logs go to stderr, redacted. No approve/ship/shell/secret tools |
+| `cli.py` | `omg`: doctor, migrate, status, submit, plan show, approve/deny (TTY), cancel (TTY), resume, reconcile, export, backup/restore, hook set/check/list, roles, heal collect/show, test |
 | `transport.py` | Bounded-timeout HTTP POST (stdlib). Hook URLs must be https (`hooks.py`); plain http is accepted only for 127.0.0.1/localhost with `OMG_ALLOW_INSECURE_HOOKS=1` (tests) |
 | `hooks.py` | Webhook URL and key store `state/secrets/hooks.json` (0600 file in a 0700 dir). Separate from job state |
 | `artifacts.py` | Immutable, content-addressed artifact files. Path-traversal and symlink checks. sha256 verified on read |
@@ -58,6 +59,7 @@ The tables:
 - `role_bindings` (versioned)
 - `dispatch_outbox`, `verifications`, `reviews`, `gate_results`
 - `events` (append-only audit)
+- `failure_snapshots`, `failure_items` (migration 6): append-only projection of the failure corpus. `omg heal collect` writes them. They are not read back to decide a transition
 - `hooks_meta` (booleans only)
 - `schema_migrations` (version and checksum)
 

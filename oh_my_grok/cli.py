@@ -535,6 +535,33 @@ def cmd_features(args) -> int:
     return EXIT_OK
 
 
+def _heal_lines(r) -> str:
+    lines = [f"snapshot {r['snapshot_id']}", f"sha256: {r['sha256']}", f"mode: {r['mode']}",
+             f"items: {r['item_count']}"]
+    lines += [f"  {it['class']}  {it['job_id']}  {it['sha256']}" for it in r["items"]]
+    return "\n".join(lines)
+
+
+def cmd_heal_collect(args) -> int:
+    e = _engine()
+    try:
+        r = e.heal_collect()
+    finally:
+        e.close()
+    _out(args, r, _heal_lines(r))
+    return EXIT_OK
+
+
+def cmd_heal_show(args) -> int:
+    e = _engine()
+    try:
+        r = e.heal_show(args.snapshot)
+    finally:
+        e.close()
+    _out(args, r, _heal_lines(r))
+    return EXIT_OK
+
+
 def cmd_boulder(args) -> int:
     e = _engine()
     if args.refresh:
@@ -720,6 +747,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--disabled", action="store_true")
     sp.add_argument("--provenance")
     sp.add_argument("--force", action="store_true")
+    heal = sub.add_parser("heal", help="project failures into a snapshot (does not change jobs)").add_subparsers(
+        dest="heal_cmd", required=True)
+    add("collect", cmd_heal_collect, "derive a failure snapshot from the database", parent=heal)
+    sp = add("show", cmd_heal_show, "show one failure snapshot (latest if no id is given)", parent=heal)
+    sp.add_argument("snapshot", nargs="?")
     sp = add("features", cmd_features, "show feature modes (configured, and frozen into one job)")
     sp.add_argument("job", nargs="?")
     sp = add("boulder", cmd_boulder, "show the active work (plan, phase, next action, sessions); --refresh rewrites .omo/")

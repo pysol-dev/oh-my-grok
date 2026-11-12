@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PY = str(ROOT / ".venv" / "bin" / "python")
 SERVER = str(ROOT / "oh_my_grok" / "mcp_server.py")
 EXPECTED = {"submit", "claim", "context", "checkpoint", "complete", "status", "reconcile", "cancel", "escalate",
-            "docs"}
+            "docs", "heal"}
 
 
 def _params():
