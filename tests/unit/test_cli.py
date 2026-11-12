@@ -162,3 +162,195 @@ def test_features_command_shows_defaults_all_off(omg_home):
     assert run(["migrate"], env=env).returncode == 0
     d = json.loads(run(["features", "--json"], env=env).stdout)
     assert set(d["configured"].values()) == {"off"}
+
+
+# The synthetic calc fixture's real fix is one line in calc/__init__.py.
+FIXTURE_SCOPE = {"files_estimate": 1, "new_dependency": False, "external_api": False,
+                 "security_sensitive": False, "cross_cutting": False}
+
+
+def _features(mode_map):
+    cfg = Path(os.environ["OMG_CONFIG_DIR"])
+    pol = json.loads((cfg / "policy.json").read_text())
+    pol["features"] = mode_map
+    (cfg / "policy.json").write_text(json.dumps(pol))
+
+
+def _goal(tmp_path, name="goal.md"):
+    p = tmp_path / name
+    p.write_text("Fix calc.add so the fixture unittest suite passes.\n")
+    return str(p)
+
+
+def _scope_file(tmp_path, payload, name="scope.json"):
+    p = tmp_path / name
+    p.write_text(payload if isinstance(payload, str) else json.dumps(payload))
+    return str(p)
+
+
+def _json_error(result):
+    assert result.returncode == 2, result.stderr
+    assert result.stdout.strip(), result.stderr
+    body = json.loads(result.stdout)
+    assert body["code"] == "invalid_input"
+    return body
+
+
+def test_submit_without_intent_when_roster_off_keeps_the_original_job(omg_home, tmp_path):
+    r = run(["submit", "--goal-file", _goal(tmp_path), "--fixture", "--json",
+             "--idempotency-key", "cli-legacy-0001"], env=dict(os.environ))
+    assert r.returncode == 0, r.stderr
+    body = json.loads(r.stdout)
+    assert body["created"] is True and body["mode"] == "fixture" and "intent" not in body
+    assert set(body["task_ids"]) == {"explore", "research", "analyze", "plan"}
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow"])
+def test_submit_intent_implementation_when_roster_not_enforced(omg_home, tmp_path, mode):
+    if mode != "off":
+        _features({"adaptive_roster": mode})
+    goal = _goal(tmp_path)
+    bare = run(["submit", "--goal-file", goal, "--fixture", "--intent", "implementation", "--json",
+                "--idempotency-key", f"cli-impl-{mode}-bare"], env=dict(os.environ))
+    assert bare.returncode == 0, bare.stderr + bare.stdout
+    body = json.loads(bare.stdout)
+    assert body["intent"] == "implementation" and body["roster_class"] == "heavy"
+    assert set(body["task_ids"]) == {"explore", "research", "analyze", "plan"}
+    scoped = run(["submit", "--goal-file", goal, "--fixture", "--intent", "implementation", "--json",
+                  "--scope-file", _scope_file(tmp_path, FIXTURE_SCOPE),
+                  "--idempotency-key", f"cli-impl-{mode}-scope"], env=dict(os.environ))
+    assert scoped.returncode == 0, scoped.stderr + scoped.stdout
+    scoped_body = json.loads(scoped.stdout)
+    assert scoped_body["roster_class"] == "heavy" and scoped_body["intent"] == "implementation"
+
+
+@pytest.mark.parametrize("mode", ["off", "enforce"])
+def test_submit_intent_explanation_creates_no_job(omg_home, tmp_path, mode):
+    if mode == "enforce":
+        _features({"adaptive_roster": "enforce"})
+    r = run(["submit", "--goal-file", _goal(tmp_path), "--intent", "explanation",
+             "--idempotency-key", f"cli-explain-{mode}-01"], env=dict(os.environ))
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "no job" in r.stdout.lower()
+    js = run(["submit", "--goal-file", _goal(tmp_path), "--intent", "explanation", "--json",
+              "--idempotency-key", f"cli-explain-{mode}-02"], env=dict(os.environ))
+    assert js.returncode == 0, js.stderr
+    body = json.loads(js.stdout)
+    assert body == {"action": "answer_directly", "created": False, "roster_class": "none"}
+
+
+def test_submit_without_intent_is_refused_when_roster_enforced(omg_home, tmp_path):
+    _features({"adaptive_roster": "enforce"})
+    r = run(["submit", "--goal-file", _goal(tmp_path), "--fixture", "--json",
+             "--idempotency-key", "cli-no-intent-enf"], env=dict(os.environ))
+    body = _json_error(r)
+    assert "intent is required" in body["message"]
+
+
+def test_submit_implementation_under_enforce_requires_scope_then_accepts_it(omg_home, tmp_path):
+    _features({"adaptive_roster": "enforce"})
+    env = dict(os.environ)
+    goal = _goal(tmp_path)
+    missing = run(["submit", "--goal-file", goal, "--fixture", "--intent", "implementation", "--json",
+                   "--idempotency-key", "cli-impl-enf-noscope"], env=env)
+    assert "scope attestation is required" in _json_error(missing)["message"]
+    ok = run(["submit", "--goal-file", goal, "--fixture", "--intent", "implementation", "--json",
+              "--scope-file", _scope_file(tmp_path, FIXTURE_SCOPE),
+              "--idempotency-key", "cli-impl-enf-scope"], env=env)
+    assert ok.returncode == 0, ok.stderr + ok.stdout
+    body = json.loads(ok.stdout)
+    assert body["created"] is True and body["intent"] == "implementation"
+    assert body["roster_class"] == "quick" and body["mode"] == "fixture"
+    assert set(body["task_ids"]) == {"plan"}
+
+
+def test_submit_roster_class_may_only_raise_the_floor_under_enforce(omg_home, tmp_path):
+    _features({"adaptive_roster": "enforce"})
+    env = dict(os.environ)
+    goal = _goal(tmp_path)
+    scope = _scope_file(tmp_path, FIXTURE_SCOPE)
+    # quick is the floor for FIXTURE_SCOPE, so naming it is allowed.
+    low = run(["submit", "--goal-file", goal, "--fixture", "--intent", "implementation", "--json",
+               "--scope-file", scope, "--roster-class", "quick", "--idempotency-key", "cli-floor-low"], env=env)
+    assert low.returncode == 0, low.stderr + low.stdout
+    assert json.loads(low.stdout)["roster_class"] == "quick"
+    heavy_scope = _scope_file(tmp_path, {**FIXTURE_SCOPE, "security_sensitive": True}, name="heavy.json")
+    below = run(["submit", "--goal-file", goal, "--fixture", "--intent", "implementation", "--json",
+                 "--scope-file", heavy_scope, "--roster-class", "quick",
+                 "--idempotency-key", "cli-floor-below"], env=env)
+    assert "below the floor" in _json_error(below)["message"]
+    raised = run(["submit", "--goal-file", goal, "--fixture", "--intent", "implementation", "--json",
+                  "--scope-file", scope, "--roster-class", "standard",
+                  "--idempotency-key", "cli-floor-raise"], env=env)
+    assert raised.returncode == 0, raised.stderr + raised.stdout
+    assert json.loads(raised.stdout)["roster_class"] == "standard"
+
+
+def test_submit_roster_class_requires_enforce(omg_home, tmp_path):
+    r = run(["submit", "--goal-file", _goal(tmp_path), "--fixture", "--intent", "implementation",
+             "--roster-class", "quick", "--json", "--idempotency-key", "cli-class-off"], env=dict(os.environ))
+    assert "roster_class requires adaptive_roster=enforce" in _json_error(r)["message"]
+
+
+@pytest.mark.parametrize("payload,fragment", [
+    ({**FIXTURE_SCOPE, "surprise": True}, "unknown scope keys"),
+    ({"files_estimate": 1}, "scope attestation is incomplete"),
+    ("[]", "scope must be an object"),
+    ("not-json", "scope file must be a JSON object"),
+])
+def test_submit_scope_file_is_validated_like_the_mcp_attestation(omg_home, tmp_path, payload, fragment):
+    r = run(["submit", "--goal-file", _goal(tmp_path), "--fixture", "--intent", "implementation", "--json",
+             "--scope-file", _scope_file(tmp_path, payload, name="bad-scope.json"),
+             "--idempotency-key", "cli-bad-scope-01"], env=dict(os.environ))
+    assert fragment in _json_error(r)["message"]
+
+
+def _fail_if_the_harness_waits(_seconds):
+    raise AssertionError("live fixture waited")
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+def test_live_fixture_submits_under_adaptive_roster(omg_home, monkeypatch, mode):
+    """Submit must succeed under off, shadow, and enforce.
+
+    Bindings are the ordinary harness (verified roles and hooks). The webhook transport and the
+    wait are stubbed, and no task is claimed, so the result is not live evidence.
+    """
+    feats = {"adaptive_roster": mode}
+    if mode == "enforce":
+        feats.update(boulder="on", lsp="enforce", git_discipline="enforce", docs_evidence="enforce",
+                     repo_lease="enforce", healing="shadow")
+    _features(feats)
+    from helpers import Harness
+    from oh_my_grok.engine import Engine
+    from oh_my_grok.live import run_live_fixture
+    from oh_my_grok.transport import HttpResult
+
+    bound = Harness()
+    bound.close()
+    monkeypatch.setattr("oh_my_grok.engine.post_json", lambda *a, **k: HttpResult(200, None, None))
+    monkeypatch.setattr("oh_my_grok.live.time.sleep", _fail_if_the_harness_waits)
+    res = run_live_fixture(timeout=0, poll=30)
+    assert res["result"] == "TIMEOUT", res
+    assert "NOT RUN" not in res["result"]
+    e = Engine()
+    try:
+        row = e._one("SELECT intent, roster_class, scope_json, phase, mode FROM jobs WHERE id=?", (res["job_id"],))
+        assert row["intent"] == "implementation" and row["mode"] == "fixture"
+        assert json.loads(row["scope_json"]) == FIXTURE_SCOPE
+        kinds = sorted(r["kind"] for r in e._all("SELECT kind FROM tasks WHERE job_id=?", (res["job_id"],)))
+        if mode == "enforce":
+            assert row["roster_class"] == "quick" and row["phase"] == "planning" and kinds == ["plan"]
+        else:
+            assert row["roster_class"] == "heavy" and row["phase"] == "research"
+            assert kinds == ["analyze", "explore", "plan", "research"]
+        shadow = e._all("SELECT data_json FROM events WHERE job_id=? AND kind='roster_shadow'", (res["job_id"],))
+        if mode == "shadow":
+            assert len(shadow) == 1
+            data = json.loads(shadow[0]["data_json"])
+            assert data["would_be_class"] == "quick" and data["actual_class"] == "heavy"
+        else:
+            assert shadow == []
+        assert e._one("SELECT COUNT(*) c FROM task_attempts")["c"] == 0
+    finally:
+        e.close()

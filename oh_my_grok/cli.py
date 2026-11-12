@@ -17,10 +17,11 @@ from pathlib import Path
 
 from . import __version__, db, sandbox
 from .config import TEMPLATE_MARKERS, load_policy, load_verifier_profiles
-from .errors import OmgError
+from .errors import OmgError, ValidationError
 from .hooks import _check_perms, hook_status, load_hooks, set_hook, validate_url
 from .paths import CODE_ROOT, get_paths
 from .redact import redact, redact_obj
+from .roster import CLASSES, INTENTS, validate_scope
 from .states import ROLES
 from . import verifier
 
@@ -248,6 +249,15 @@ def cmd_status(args) -> int:
     return EXIT_OK
 
 
+def _load_scope(path: str) -> dict:
+    """Same attestation the MCP submit tool accepts: a complete scope object, no extra keys."""
+    try:
+        raw = json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError):
+        raise ValidationError("scope file must be a JSON object") from None
+    return validate_scope(raw)
+
+
 def cmd_submit(args) -> int:
     goal = Path(args.goal_file).read_text()
     meta = {}
@@ -256,12 +266,20 @@ def cmd_submit(args) -> int:
     # real repositories default to plan_only; implement must be explicit (and the repo allowlisted)
     mode = "fixture" if args.fixture else ("implement" if args.implement else "plan_only")
     key = args.idempotency_key or f"cli:{os.getpid()}:{time.time_ns()}"
+    scope = _load_scope(args.scope_file) if args.scope_file else None
     e = _engine()
-    r = e.submit(goal, key, repo=args.repo, mode=mode, constraints=meta.get("constraints"),
-                 acceptance_criteria=meta.get("acceptance_criteria"), verifier_profile=args.verifier_profile,
-                 actor="omg")
+    try:
+        r = e.submit(goal, key, repo=args.repo, mode=mode, constraints=meta.get("constraints"),
+                     acceptance_criteria=meta.get("acceptance_criteria"), verifier_profile=args.verifier_profile,
+                     actor="omg", intent=args.intent, roster_class=args.roster_class, scope=scope)
+    finally:
+        e.close()
+    if r.get("action") == "answer_directly":
+        _out(args, r, "explanation: no job created; answer the user directly")
+        return EXIT_OK
+    extra = f" intent={r['intent']} roster={r['roster_class']}" if r.get("intent") else ""
     _out(args, r, f"job {r['job_id']} {'created' if r['created'] else 'already exists'} phase={r['phase']} "
-                  f"mode={r['mode']}")
+                  f"mode={r['mode']}{extra}")
     return EXIT_OK
 
 
@@ -689,6 +707,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--criteria-file", help="JSON {constraints:[], acceptance_criteria:[]}")
     sp.add_argument("--verifier-profile")
     sp.add_argument("--idempotency-key")
+    sp.add_argument("--intent", choices=list(INTENTS),
+                    help="explanation records a decision and creates no job; investigation is read-only; "
+                         "implementation needs --scope-file when adaptive_roster=enforce. "
+                         "Omit to keep the original team while the flag is off or shadow")
+    sp.add_argument("--roster-class", choices=list(CLASSES),
+                    help="implementation only, and only when adaptive_roster=enforce; never below the scope floor")
+    sp.add_argument("--scope-file",
+                    help="JSON scope attestation (files_estimate, new_dependency, external_api, "
+                         "security_sensitive, cross_cutting). Required for implementation when "
+                         "adaptive_roster=enforce; unknown keys are rejected")
     plan = sub.add_parser("plan", help="plan commands").add_subparsers(dest="plan_cmd", required=True)
     sp = add("show", cmd_plan_show, "show the current plan revision, hash and Momus review", parent=plan)
     sp.add_argument("job")
