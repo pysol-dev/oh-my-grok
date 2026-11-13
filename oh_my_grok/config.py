@@ -31,6 +31,13 @@ DEFAULT_POLICY = {
     "context7_timeout_seconds": 30,
     "docs_max_per_job": 20,
     "git_max_commits": 50,
+    # Host watchdog (features.watchdog). Defaults keep the service inert until an operator turns it on.
+    "watchdog_interval_seconds": 60,
+    "stall_awaiting_resume_seconds": 600,
+    "watchdog_wake_cap": 3,
+    "watchdog_stale_intervals": 3,
+    "watchdog_log_max_bytes": 1_048_576,
+    "watchdog_log_backups": 3,
     "features": {},
 }
 

@@ -17,6 +17,9 @@ FEATURE_MODES: dict[str, tuple[str, ...]] = {
     "docs_evidence": (OFF, SHADOW, ENFORCE),
     "repo_lease": (OFF, SHADOW, ENFORCE),
     "healing": (OFF, SHADOW, ENFORCE),
+    # Host watchdog. off: the loop records a heartbeat and does not touch the bus.
+    # shadow: reconcile, heal collect, and stall records, no wakes. on: wakes enabled.
+    "watchdog": (OFF, SHADOW, ON),
 }
 
 
