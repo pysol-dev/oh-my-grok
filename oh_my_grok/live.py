@@ -15,6 +15,13 @@ from .states import ROLES
 
 ASYNC_ROLES = [r for r in ROLES if r != "hephaestus"]
 
+# Smallest attestation for the synthetic calc fixture. The real fix is one line in calc/__init__.py
+# (`return a + b`). No new dependency, no external API, no security-sensitive path, and not
+# cross-cutting, so under adaptive_roster=enforce the floor is quick. roster_class is left unset:
+# off and shadow keep the original heavy DAG, and a requested class is refused unless the flag is enforce.
+FIXTURE_SCOPE = {"files_estimate": 1, "new_dependency": False, "external_api": False,
+                 "security_sensitive": False, "cross_cutting": False}
+
 
 def prerequisites(e: Engine) -> list[str]:
     missing = []
@@ -42,7 +49,7 @@ def run_live_fixture(timeout: int = 3600, poll: int = 60) -> dict:
                 "This is an installation smoke test; it authorizes nothing outside the fixture repo.")
         r = e.submit(goal, f"live-fixture:{uuid.uuid4().hex}", mode="fixture",
                      acceptance_criteria=["python -m unittest discover -s tests exits 0 on the final revision"],
-                     actor="omg test live")
+                     actor="omg test live", intent="implementation", scope=FIXTURE_SCOPE)
         job = r["job_id"]
         deadline = time.time() + timeout
         log = []

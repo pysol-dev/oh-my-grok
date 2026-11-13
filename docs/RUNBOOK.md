@@ -132,9 +132,21 @@ Then enter the new pair through `hook serve` (above) or `hook set ROLE`, never v
 `HTTP 401/403: webhook key rejected` until the new pair is stored; then `resume JOB`.
 
 ## 5. Start a job
-- Normally you say "plan this: <goal> in <repo>" to Hephaestus.
-- Fallback: `./omg submit --goal-file goal.md --repo /path/to/repo [--plan-only|--implement|--fixture] [--criteria-file c.txt] [--verifier-profile NAME] [--idempotency-key K]`
+- Normally you say "plan this: <goal> in <repo>" to Hephaestus. Hephaestus classifies the request and calls `omg.submit` with an intent.
+- Fallback: `./omg submit --goal-file goal.md --repo /path/to/repo [--plan-only|--implement|--fixture] [--intent explanation|investigation|implementation] [--scope-file scope.json] [--roster-class quick|standard|heavy] [--criteria-file c.txt] [--verifier-profile NAME] [--idempotency-key K]`
+- With `adaptive_roster` `off` or `shadow`, omitting `--intent` keeps the original full team. `--roster-class` is accepted only when the flag is `enforce`.
+- With `adaptive_roster` `enforce`, `--intent` is required.
+  - `explanation` records the decision and creates no job.
+  - `investigation` is read-only and accepts plan-only mode.
+  - `implementation` requires `--scope-file`: a JSON object with `files_estimate`, `new_dependency`, `external_api`, `security_sensitive`, and `cross_cutting`. Unknown keys are rejected. The engine picks the smallest class; `--roster-class` may only raise it.
+- `scope.json` for a one-file change with no new dependency, no external API, and no security-sensitive or cross-cutting work:
+
+```json
+{"files_estimate": 1, "new_dependency": false, "external_api": false, "security_sensitive": false, "cross_cutting": false}
+```
+
 - Real repos default to plan-only and must be clean git repos (optionally restricted by `repo_allowlist`).
+- Live smoke: `./omg test live --fixture-only [--timeout 3600] [--poll 60] [--json]`. The harness submits the synthetic calc fixture as `intent=implementation` with that one-file scope, then reconciles and observes the database. The same submit is accepted when `adaptive_roster` is `enforce`, `shadow`, or `off`. Real progress still requires bound, verified Grok Bot routines. Missing bindings report NOT RUN.
 
 ## 6. Plan review and approval
 - `./omg plan show JOB` prints the revision, hash, Momus verdict and full plan.

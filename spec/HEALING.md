@@ -76,3 +76,7 @@ Every item has `class`, `source`, and `job_id`. Accept verdicts, a running job w
 - **Slice 5.** A lessons store, and collection from `github_review_bot`.
 
 Until those slices exist, `enforce` and `shadow` have the same effect: a snapshot and an audit event.
+
+## Known gap
+
+Submit-time refusals (`ValidationError` before a job row exists) are not visible to `omg heal collect`. The engine rejects the request before inserting a job, so collect has no row and no event to project. Reserve this as a later collection source. Not implemented.
