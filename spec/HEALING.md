@@ -57,9 +57,23 @@ A second collect on unchanged sources inserts a new snapshot id and the same ite
 | `repair_cycle` | `repair` | If `jobs.repair_cycles>0` and that job has no `repair_cycle` event, one item from the counter: `failures` plus `record="jobs.repair_cycles"`. A later `done` job keeps its counter, so it stays in the corpus. When events exist, the counter is not also emitted. |
 | `review_finding` | `review` | One item per `reviews` row with `verdict='reject'`, including invalidated rows. Body includes `review_id`, `type`, `findings`, `invalidated`, and `revision` / `plan_revision_id` / `task_id` when set. |
 | `repeated_failure` | `repeated` | One item when a job has two or more `repair_cycle` events. Body includes `count` and `event_ids`. |
+| `stall` | `stall` | A non-terminal task on a job whose phase is not `done`, `failed`, `cancelled`, or `blocked`. See below. |
 | `github_review_bot` | — | Reserved. Not emitted. |
 
-Every item has `class`, `source`, and `job_id`. Accept verdicts, a running job with `repair_cycles=0`, and events of other kinds (including `failures_collected`) are not items.
+Every item has `class`, `source`, and `job_id`. Accept verdicts, a running job with `repair_cycles=0`, and events of other kinds (including `failures_collected`) are not items. A stall's identity is its `task_id`. Items that already had an `event_id`, `event_ids`, `review_id`, or `record` still use that, so their hashes do not change.
+
+### Stall items
+
+| Reason | When |
+|---|---|
+| `awaiting_resume` | Status is `awaiting_resume` and `updated_at` is at least `stall_awaiting_resume_seconds` old. Default 600 (10 minutes). |
+| `lease_expired` | Status is `working` and `lease_expires_at` is in the past. A working task whose lease has not expired is not a stall. |
+| `dispatch_stuck` | The current dispatch is `pending`, `sending`, or `retry_wait`, not superseded, and either `lease_until` is in the past or the dispatch row has been idle for `lease_seconds`. |
+| `no_progress` | Any other `queued`, `dispatched`, or `submitted` task, or a `working` task with no lease, idle for `lease_seconds`. Default 1800, the same value as the task lease. |
+
+The body includes `task_id`, `role`, `status`, `reason`, `threshold_seconds`, and `dispatch_id` / `channel` when the task has a current dispatch. It does not include the age. A second collect of the same stall therefore has the same item sha256.
+
+Collect does not wake a Bot, does not insert a dispatch, and does not change the task. `healing` `off` still writes nothing, so a stall that exists is not snapshotted until the flag is `shadow` or `enforce`. Those two modes still only differ by the mode stored on the snapshot. Wakes are not this flag. They belong to the host watchdog (`features.watchdog`, `docs/RUNBOOK.md`).
 
 ## 5. Interfaces
 

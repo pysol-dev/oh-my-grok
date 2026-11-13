@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -22,7 +23,7 @@ def _sha(obj) -> str:
 
 
 def _run(args, env):
-    return subprocess.run([OMG, *args], capture_output=True, text=True, env=env, timeout=60)
+    return subprocess.run([OMG, *args], capture_output=True, text=True, env=env, timeout=60, check=False)
 
 
 def _policy(mode):
@@ -312,3 +313,81 @@ def test_no_healer_role_or_routine():
     assert "healer" not in ROLES
     names = {p.name for p in (ROOT / "routines").glob("*.md")}
     assert not any("heal" in name for name in names)
+
+
+def _iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _touch(conn, task_id, ts, **fields):
+    cols, args = ["updated_at=?"], [_iso(ts)]
+    for key, value in fields.items():
+        cols.append(f"{key}=?")
+        args.append(value)
+    args.append(task_id)
+    conn.execute(f"UPDATE tasks SET {', '.join(cols)} WHERE id=?", args)
+
+
+def _dispatch(conn, job_id, task_id, role, *, now, channel="local", status="accepted", lease_until=None):
+    did = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO dispatch_outbox(id,job_id,task_id,attempt,role,channel,idempotency_key,status,"
+        "next_attempt_at,lease_until,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (did, job_id, task_id, 1, role, channel, "idem-" + did, status, now, lease_until, _iso(now), _iso(now)))
+    conn.execute("UPDATE tasks SET current_dispatch_id=? WHERE id=?", (did, task_id))
+    return did
+
+
+def test_awaiting_resume_uses_a_ten_minute_threshold_and_collect_does_not_wake(eng):
+    now = 1_800_000_000.0
+    jid = _job(eng.conn, phase="running")
+    old = _task(eng.conn, jid, kind="integrate", role="hephaestus", status="awaiting_resume")
+    young = _task(eng.conn, jid, kind="plan", role="hephaestus", status="awaiting_resume")
+    done = _job(eng.conn, phase="done")
+    hidden = _task(eng.conn, done, kind="integrate", role="hephaestus", status="awaiting_resume")
+    _touch(eng.conn, old, now - 600)
+    _touch(eng.conn, young, now - 599)
+    _touch(eng.conn, hidden, now - 86_400)
+    before = _dump(eng.conn, "tasks", "id")
+    out = collect(eng.conn, "shadow", now=now, stall_awaiting_resume_seconds=600, lease_seconds=1800)
+    stalls = [i for i in out["items"] if i["class"] == "stall"]
+    assert [i["payload"]["task_id"] for i in stalls] == [old]
+    body = stalls[0]["payload"]
+    assert body["reason"] == "awaiting_resume" and body["threshold_seconds"] == 600
+    assert body["role"] == "hephaestus" and body["source"] == "stall"
+    assert "age_seconds" not in body
+    assert _dump(eng.conn, "tasks", "id") == before
+    assert _count(eng.conn, "SELECT COUNT(*) FROM dispatch_outbox") == 0
+    again = collect(eng.conn, "shadow", now=now, stall_awaiting_resume_seconds=600, lease_seconds=1800)
+    assert [i["sha256"] for i in again["items"] if i["class"] == "stall"] == [stalls[0]["sha256"]]
+
+
+def test_healing_off_writes_no_stall_snapshot(eng):
+    now = 1_800_000_000.0
+    jid = _job(eng.conn, phase="running")
+    tid = _task(eng.conn, jid, kind="integrate", role="hephaestus", status="awaiting_resume")
+    _touch(eng.conn, tid, now - 3600)
+    with pytest.raises(GateRefused, match="healing is off"):
+        collect(eng.conn, "off", now=now)
+    assert _count(eng.conn, "SELECT COUNT(*) FROM failure_snapshots") == 0
+
+
+def test_lease_threshold_and_open_dispatch(eng):
+    now = 1_800_000_000.0
+    jid = _job(eng.conn, phase="running")
+    idle = _task(eng.conn, jid, kind="implement", role="executor", status="dispatched")
+    fresh = _task(eng.conn, jid, kind="code_review", role="code-reviewer", status="dispatched")
+    held = _task(eng.conn, jid, kind="qa", role="qa-executor", status="working")
+    expired = _task(eng.conn, jid, kind="explore", role="explorer", status="working")
+    stuck = _task(eng.conn, jid, kind="research", role="librarian", status="dispatched")
+    _touch(eng.conn, idle, now - 1800)
+    _touch(eng.conn, fresh, now - 1799)
+    _touch(eng.conn, held, now - 7200, lease_expires_at=now + 10)
+    _touch(eng.conn, expired, now - 5, lease_expires_at=now - 1)
+    _touch(eng.conn, stuck, now - 5)
+    _dispatch(eng.conn, jid, stuck, "librarian", now=now - 5, channel="webhook", status="sending",
+              lease_until=now - 1)
+    out = collect(eng.conn, "enforce", now=now, stall_awaiting_resume_seconds=600, lease_seconds=1800)
+    by_task = {i["payload"]["task_id"]: i["payload"]["reason"] for i in out["items"] if i["class"] == "stall"}
+    assert by_task == {idle: "no_progress", expired: "lease_expired", stuck: "dispatch_stuck"}
+    assert held not in by_task and fresh not in by_task

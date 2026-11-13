@@ -163,7 +163,10 @@ class Engine:
 
         Does not change jobs, tasks, or dispatch, and does not flush the boulder projection. The only new event is
         ``failures_collected``, written by ``healing.collect`` with a null job id."""
-        return healing.collect(self.conn, self.policy["features"]["healing"])
+        pol = self.policy
+        return healing.collect(self.conn, pol["features"]["healing"], now=time.time(),
+                               stall_awaiting_resume_seconds=float(pol["stall_awaiting_resume_seconds"]),
+                               lease_seconds=float(pol["lease_seconds"]))
 
     def heal_show(self, snapshot_id: str | None = None) -> dict:
         return healing.show(self.conn, snapshot_id)
@@ -368,6 +371,32 @@ class Engine:
         """Single source of truth: hooks.json (same reader as `roles list` / `hook list`). hooks_meta is an audit
         trail only, so storing a hook via set_hook directly can never leave dispatch out of sync."""
         return hook_status(self.paths).get(role, False)
+
+    def post_role_hook(self, role: str, body: dict) -> dict:
+        """POST a wake body to the role's stored hook.
+
+        The returned dict has ``posted``, ``accepted``, ``http_status`` and ``error`` only. It never contains the
+        URL, the key, or request headers. Transport errors are scrubbed before they are returned.
+        """
+        try:
+            hook = load_hooks(self.paths).get(role)
+        except OmgError as exc:
+            return {"posted": False, "accepted": False, "http_status": None, "error": redact(exc.message)[:300],
+                    "reason": "hook_unreadable"}
+        if not hook or not hook.get("url") or not hook.get("key"):
+            return {"posted": False, "accepted": False, "http_status": None, "error": None, "reason": "no_hook"}
+        res = self.transport(hook["url"], hook["key"], body, self.policy["http_connect_timeout_seconds"],
+                             self.policy["http_read_timeout_seconds"])
+        err = res.error
+        if err:
+            err = err.replace(hook["url"], "<webhook-url>").replace(hook["key"], "[REDACTED]")
+            err = redact_urls(redact(err))
+            err = re.sub(r"(?i)\b(authorization|bearer)\b[:\s]*\S*", "[REDACTED]", err)[:500]
+        code = res.status
+        accepted = code is not None and 200 <= code < 300
+        if not err and not accepted:
+            err = f"HTTP {code}" if code is not None else "no response"
+        return {"posted": True, "accepted": accepted, "http_status": code, "error": err}
 
     # ------------------------------------------------------------------ submit
     @_flushes

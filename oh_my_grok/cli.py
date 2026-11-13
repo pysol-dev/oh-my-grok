@@ -144,9 +144,18 @@ def cmd_doctor(args) -> int:
                 + (" (run scripts/bootstrap.sh)" if missing else ""))
     except OmgError as e:
         add("lsp_config_valid", False, e.message)
+    try:
+        from . import watchdog
+        wd = watchdog.status(paths)
+        add("watchdog", wd["ok"], wd["detail"])
+    except Exception as ex:  # noqa: BLE001 - doctor reports the failure instead of crashing
+        wd = None
+        add("watchdog", False, redact(str(ex))[:300])
     # informational (do not fail doctor): live wiring is the operator's job
     info = {"hooks_configured": hook_status(paths), "lsp_tools": lsp_info,
             "features_default": load_policy(paths.config_dir)["features"]}
+    if wd is not None:
+        info["watchdog"] = {k: wd[k] for k in ("alive", "pid", "mode", "stale", "heartbeat_age_seconds", "detail")}
     try:
         e = _engine()
         info["bindings"] = [{k: b[k] for k in ("role", "bot_name", "routine_id", "verified_at")}
@@ -538,6 +547,60 @@ def cmd_test(args) -> int:
 
 
 # ---------------------------------------------------------------- adaptive surfaces
+def _watchdog_interval(args) -> float | None:
+    if args.interval is None:
+        return None
+    if args.interval <= 0:
+        raise ValidationError("--interval must be a positive number of seconds")
+    return float(args.interval)
+
+
+def cmd_watchdog_run(args) -> int:
+    from . import watchdog
+    res = watchdog.serve(interval=_watchdog_interval(args), once=args.once)
+    if res.get("already_running"):
+        _out(args, res, f"watchdog already running pid={res.get('pid')}")
+        return EXIT_OK
+    _out(args, res, f"watchdog stopped after {res.get('ticks')} tick(s)")
+    return EXIT_OK
+
+
+def cmd_watchdog_start(args) -> int:
+    from . import watchdog
+    res = watchdog.start(interval=_watchdog_interval(args))
+    if not res.get("ok"):
+        _out(args, res, f"watchdog failed to start: {res.get('error', '')}")
+        return EXIT_INTERNAL
+    state = "already running" if res.get("already_running") else "started"
+    _out(args, res, f"watchdog {state} pid={res.get('pid')}")
+    return EXIT_OK
+
+
+def cmd_watchdog_ensure(args) -> int:
+    return cmd_watchdog_start(args)
+
+
+def cmd_watchdog_stop(args) -> int:
+    from . import watchdog
+    res = watchdog.stop()
+    if not res.get("ok"):
+        _out(args, res, "watchdog did not stop")
+        return EXIT_INTERNAL
+    text = "watchdog already stopped" if res.get("already_stopped") else "watchdog stopped"
+    _out(args, res, text)
+    return EXIT_OK
+
+
+def cmd_watchdog_status(args) -> int:
+    from . import watchdog
+    res = watchdog.status()
+    age = res.get("heartbeat_age_seconds")
+    age_text = "none" if age is None else f"{age:.0f}s"
+    _out(args, res, f"watchdog {res['detail']} mode={res['mode']} alive={res['alive']} "
+                    f"pid={res.get('pid')} heartbeat_age={age_text}")
+    return EXIT_OK if res["alive"] else 3
+
+
 def cmd_features(args) -> int:
     from . import features
     pol = load_policy(get_paths().config_dir)
@@ -775,6 +838,22 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--disabled", action="store_true")
     sp.add_argument("--provenance")
     sp.add_argument("--force", action="store_true")
+    wd = sub.add_parser("watchdog", help="host loop for reconcile, heal collect, and stall wakes").add_subparsers(
+        dest="watchdog_cmd", required=True)
+
+    def _interval(sp):
+        sp.add_argument("--interval", type=float, default=None,
+                        help="seconds between ticks (default: policy watchdog_interval_seconds)")
+
+    sp = add("run", cmd_watchdog_run, "foreground loop; this process is the service", parent=wd)
+    _interval(sp)
+    sp.add_argument("--once", action="store_true", help="run one tick and exit")
+    sp = add("start", cmd_watchdog_start, "daemonize the loop (pidfile and lock; idempotent)", parent=wd)
+    _interval(sp)
+    add("stop", cmd_watchdog_stop, "stop the daemon; a stale pidfile is cleared", parent=wd)
+    add("status", cmd_watchdog_status, "report alive or stale from the pidfile and heartbeat", parent=wd)
+    sp = add("ensure", cmd_watchdog_ensure, "start the daemon only when it is not alive", parent=wd)
+    _interval(sp)
     heal = sub.add_parser("heal", help="project failures into a snapshot (does not change jobs)").add_subparsers(
         dest="heal_cmd", required=True)
     add("collect", cmd_heal_collect, "derive a failure snapshot from the database", parent=heal)
