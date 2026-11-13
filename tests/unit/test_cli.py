@@ -14,6 +14,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 OMG_CLI = str(ROOT / "omg")
 DOCUMENTED = [["features"], ["boulder"], ["receipts"], ["docs"], ["attest"], ["lsp", "status"], ["lsp", "canary"], ["lsp", "check"], ["heal", "collect"], ["heal", "show"], ["doctor"], ["migrate"], ["status"], ["submit"], ["plan", "show"], ["approve"], ["deny"], ["cancel"],
+              ["watchdog", "run"], ["watchdog", "start"], ["watchdog", "stop"], ["watchdog", "status"], ["watchdog", "ensure"],
               ["reconcile"], ["hook", "set"], ["hook", "check"], ["hook", "list"], ["hook", "serve"], ["test"], ["export"],
               ["resume"], ["backup"], ["restore"], ["roles", "list"], ["roles", "bind"], ["roles", "import"]]
 
@@ -41,7 +42,7 @@ def test_top_level_help_lists_all_subcommands():
     r = run(["--help"])
     assert r.returncode == 0
     for c in ["doctor", "migrate", "status", "submit", "plan", "approve", "deny", "cancel", "reconcile", "hook",
-              "test", "export"]:
+              "test", "export", "watchdog"]:
         assert c in r.stdout
 
 
