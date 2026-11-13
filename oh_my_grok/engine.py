@@ -577,12 +577,12 @@ class Engine:
     def _dispatch_task(self, t) -> int:
         role = t["role"]
         b = self.active_binding(role)
+        webhook_ok = bool(b and b["enabled"] and b["routine_id"] and b["verified_at"] and self._hook_ok(role))
         now = self.now()
         attempt = t["attempt_no"] + 1
         did = str(uuid.uuid4())
-        if role == "hephaestus" and not self._hook_ok(role):
-            # No hook in the secrets store: park for in-chat resumption. A stored hook follows the same
-            # webhook path as every other role (enabled binding, verified routine, not busy).
+        if role == "hephaestus" and not webhook_ok:
+            # never self-webhook without a verified resume routine: park for explicit in-chat resumption
             self.conn.execute("INSERT INTO dispatch_outbox(id,job_id,task_id,attempt,role,binding_id,bot_id,channel,"
                               "idempotency_key,status,next_attempt_at,last_error,created_at,updated_at) "
                               "VALUES (?,?,?,?,?,?,?,'local',?,?,?,?,?,?)",

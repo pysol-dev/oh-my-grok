@@ -7,7 +7,8 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from helpers import SECRET_KEY
+import pytest
+from helpers import SECRET_KEY  # pyright: ignore[reportImplicitRelativeImport]
 
 from oh_my_grok import db, watchdog
 from oh_my_grok.engine import Engine
@@ -139,7 +140,8 @@ def test_step_failure_does_not_skip_later_steps(omg_home):
     e = Engine()
     calls = []
 
-    def broken():
+    def broken(job_id: str | None = None, flush: bool = True) -> dict[str, int]:
+        del job_id, flush
         calls.append("reconcile")
         raise RuntimeError("reconcile-broke")
 
@@ -326,6 +328,31 @@ def test_queued_stall_during_approval_is_not_dispatched(omg_home):
         e.close()
 
 
+@pytest.mark.parametrize("mode", ["off", "shadow", "on"])
+@pytest.mark.parametrize("binding", ["absent", "unverified", "disabled"])
+def test_hephaestus_hook_without_a_full_binding_stays_local(omg_home, mode, binding):
+    _policy({"watchdog": mode})
+    e = Engine()
+    try:
+        set_hook(get_paths(), "hephaestus", "https://hooks.invalid/hephaestus", SECRET_KEY)
+        if binding == "unverified":
+            e.bind_role("hephaestus", HEPHAESTUS, "Hephaestus", routine_id="routine-hephaestus",
+                        routine_name="omg-bus-hephaestus", verified=False, provenance="test")
+        elif binding == "disabled":
+            e.bind_role("hephaestus", HEPHAESTUS, "Hephaestus", routine_id="routine-hephaestus",
+                        routine_name="omg-bus-hephaestus", enabled=False, verified=True, provenance="test")
+        jid = _job(e.conn)
+        tid = _task(e.conn, jid, status="queued")
+        with db.tx(e.conn):
+            assert e._dispatch_task(e._one("SELECT * FROM tasks WHERE id=?", (tid,))) == 1
+        row = e._one("SELECT status, current_dispatch_id FROM tasks WHERE id=?", (tid,))
+        assert row["status"] == "awaiting_resume" and row["current_dispatch_id"]
+        channel = e._one("SELECT channel FROM dispatch_outbox WHERE id=?", (row["current_dispatch_id"],))
+        assert channel["channel"] == "local"
+    finally:
+        e.close()
+
+
 def test_hephaestus_hook_follows_the_normal_dispatch_path(omg_home):
     e = Engine()
     try:
@@ -339,12 +366,6 @@ def test_hephaestus_hook_follows_the_normal_dispatch_path(omg_home):
                       (parked["current_dispatch_id"],))["channel"] == "local"
 
         set_hook(get_paths(), "hephaestus", "https://hooks.invalid/hephaestus", SECRET_KEY)
-        unbound = _task(e.conn, jid, kind="plan", status="queued")
-        with db.tx(e.conn):
-            assert e._dispatch_task(e._one("SELECT * FROM tasks WHERE id=?", (unbound,))) == 0
-        row = e._one("SELECT status, block_reason FROM tasks WHERE id=?", (unbound,))
-        assert row["status"] == "queued" and "role binding" in row["block_reason"]
-
         e.bind_role("hephaestus", HEPHAESTUS, "Hephaestus", routine_id="routine-hephaestus",
                     routine_name="omg-bus-hephaestus", verified=True, provenance="test")
         wired = _task(e.conn, jid, kind="integrate", status="queued")
@@ -367,18 +388,26 @@ def test_log_rotates_and_redacts(omg_home):
     policy = load_policy(paths.config_dir)
     policy["watchdog_log_max_bytes"] = 180
     policy["watchdog_log_backups"] = 1
-    logger = watchdog.configure_logging(paths, policy, force=True)
-    register_secret(HOOK_KEY)
-    for i in range(30):
-        logger.info("tick %s %s", i, "x" * 30)
-    logger.info("transport said %s", HOOK_KEY)
-    for handler in logger.handlers:
-        handler.flush()
-    text = (paths.logs_dir / "watchdog.log").read_text()
-    if (paths.logs_dir / "watchdog.log.1").exists():
-        text += (paths.logs_dir / "watchdog.log.1").read_text()
+    previous_umask = os.umask(0o022)
+    try:
+        logger = watchdog.configure_logging(paths, policy, force=True)
+        register_secret(HOOK_KEY)
+        for i in range(30):
+            logger.info("tick %s %s", i, "x" * 30)
+        logger.info("transport said %s", HOOK_KEY)
+        for handler in logger.handlers:
+            handler.flush()
+    finally:
+        os.umask(previous_umask)
+    log_path = paths.logs_dir / "watchdog.log"
+    rotated = paths.logs_dir / "watchdog.log.1"
+    text = log_path.read_text()
+    if rotated.exists():
+        text += rotated.read_text()
     else:
         raise AssertionError("watchdog log did not rotate")
+    assert log_path.stat().st_mode & 0o777 == 0o600
+    assert rotated.stat().st_mode & 0o777 == 0o600
     if HOOK_KEY in text:
         raise AssertionError("secret material leaked into watchdog output")
 

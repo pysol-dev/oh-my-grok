@@ -69,7 +69,7 @@ Every item has `class`, `source`, and `job_id`. Accept verdicts, a running job w
 | `awaiting_resume` | Status is `awaiting_resume` and `updated_at` is at least `stall_awaiting_resume_seconds` old. Default 600 (10 minutes). |
 | `lease_expired` | Status is `working` and `lease_expires_at` is in the past. A working task whose lease has not expired is not a stall. |
 | `dispatch_stuck` | The current dispatch is `pending`, `sending`, or `retry_wait`, not superseded, and either `lease_until` is in the past or the dispatch row has been idle for `lease_seconds`. |
-| `no_progress` | Any other `queued`, `dispatched`, or `submitted` task idle for `lease_seconds`. Default 1800, the same value as the task lease. |
+| `no_progress` | Any other `queued`, `dispatched`, or `submitted` task, or a `working` task with no lease, idle for `lease_seconds`. Default 1800, the same value as the task lease. |
 
 The body includes `task_id`, `role`, `status`, `reason`, `threshold_seconds`, and `dispatch_id` / `channel` when the task has a current dispatch. It does not include the age. A second collect of the same stall therefore has the same item sha256.
 

@@ -297,11 +297,10 @@ or the job is waiting for approval. Backoff, the per-task cap, and an in-flight 
 `stall_detected`, `stall_no_hook`, `stall_wake`, and `stall_wake_capped`. They do not contain webhook URLs, keys, or
 headers.
 
-Hephaestus is webhook-wakeable when `state/secrets/hooks.json` has a hook for that role: new work then follows the
-same binding and verification checks as every other role. With no hook, new Hephaestus work stays
-`awaiting_resume` on the local channel. A stall in that state records `stall_no_hook` and is not POSTed. Adding the
-hook later lets the watchdog wake the task that is already parked; the row stays `awaiting_resume` until something
-claims that same `dispatch_id`.
+New Hephaestus work stays on the local `awaiting_resume` channel unless the binding is enabled, has a routine id,
+is verified, and a hook is stored. A hook by itself does not change that, in any watchdog mode. A stall with no hook
+records `stall_no_hook` and is not POSTed. A stored hook lets the watchdog wake a task that is already parked; the
+row stays `awaiting_resume` until something claims that same `dispatch_id`.
 
 `omg doctor` reports the flag. `off` passes. `shadow` or `on` passes only while the process is alive and the
 heartbeat is fresh; otherwise the check is `stale` and doctor exits 8. `omg watchdog status` prints the same facts

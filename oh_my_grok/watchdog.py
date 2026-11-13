@@ -36,7 +36,7 @@ from .paths import CODE_ROOT, Paths, get_paths
 from .redact import redact, redact_obj
 
 log = logging.getLogger("oh_my_grok.watchdog")
-_LOG_PATH: str | None = None
+_configured_log_path: str | None = None
 
 _HELD: dict[str, int] = {}
 _OPEN_WAKE = ("pending", "sending", "retry_wait")
@@ -45,6 +45,27 @@ _OPEN_WAKE = ("pending", "sending", "retry_wait")
 class _RedactFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         return redact(super().format(record))
+
+
+class _PrivateLogHandler(logging.handlers.RotatingFileHandler):
+    """Rotating log that stays mode 0600. ``open`` applies the process umask, so 0600 is set after every create."""
+
+    def _open(self):
+        stream = super()._open()
+        self._restrict(self.baseFilename)
+        return stream
+
+    def doRollover(self) -> None:
+        super().doRollover()
+        self._restrict(self.baseFilename)
+        self._restrict(self.rotation_filename(self.baseFilename + ".1"))
+
+    @staticmethod
+    def _restrict(name: str) -> None:
+        try:
+            os.chmod(name, 0o600)
+        except OSError:
+            return
 
 
 def _dir(paths: Paths) -> Path:
@@ -186,19 +207,19 @@ def configure_logging(paths: Paths, policy: dict, *, force: bool = False) -> log
     logger = log
     logger.setLevel(logging.INFO)
     logger.propagate = False
-    global _LOG_PATH
+    global _configured_log_path
     path = str(_log_path(paths))
-    if logger.handlers and not force and _LOG_PATH == path:
+    if logger.handlers and not force and _configured_log_path == path:
         return logger
     for handler in list(logger.handlers):
         logger.removeHandler(handler)
         handler.close()
-    file_handler = logging.handlers.RotatingFileHandler(
+    file_handler = _PrivateLogHandler(
         _log_path(paths), maxBytes=int(policy["watchdog_log_max_bytes"]),
         backupCount=int(policy["watchdog_log_backups"]))
     file_handler.setFormatter(_RedactFormatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(file_handler)
-    _LOG_PATH = path
+    _configured_log_path = path
     return logger
 
 
@@ -491,7 +512,9 @@ def start(interval: float | None = None, paths: Paths | None = None) -> dict:
         args.extend(["--interval", str(interval)])
     log_path = _log_path(paths)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(log_path, "ab") as handle:
+    log_fd = os.open(log_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+    os.fchmod(log_fd, 0o600)
+    with os.fdopen(log_fd, "ab") as handle:
         proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=handle, stderr=subprocess.STDOUT,
                                 start_new_session=True, cwd=str(CODE_ROOT), env=os.environ.copy())
     deadline = time.time() + 15
