@@ -264,6 +264,68 @@ def test_wake_errors_do_not_leak_hook_material(omg_home):
         e.close()
 
 
+def test_queued_stall_is_not_dispatched_before_its_dependencies_pass(omg_home):
+    _policy({"watchdog": "on"})
+    transport = Transport()
+    e = Engine(transport=transport)
+    try:
+        jid = _job(e.conn)
+        upstream = _task(e.conn, jid, role="explorer", kind="explore", status="dispatched")
+        waiting = _task(e.conn, jid, role="metis", kind="analyze", status="queued")
+        e.conn.execute("INSERT INTO task_deps(task_id, depends_on) VALUES (?,?)", (waiting, upstream))
+        _touch(e.conn, waiting, NOW - 1800)
+        e.bind_role("metis", "41b28a72-3ece-45b9-9008-000f3fce4da7", "Metis", routine_id="routine-metis",
+                    routine_name="omg-bus-metis", verified=True, provenance="test")
+        set_hook(get_paths(), "metis", "https://hooks.invalid/metis", SECRET_KEY)
+        watchdog.tick(e, now=NOW)
+        row = e._one("SELECT status, current_dispatch_id FROM tasks WHERE id=?", (waiting,))
+        assert row["status"] == "queued" and row["current_dispatch_id"] is None
+        assert transport.n == 0
+        assert _kinds(e.conn, "stall_wake") == []
+    finally:
+        e.close()
+
+
+def test_ready_queued_stall_is_scheduled_when_reconcile_did_not(omg_home):
+    _policy({"watchdog": "on"})
+    transport = Transport()
+    e = Engine(transport=transport)
+    e.reconcile = lambda *a, **k: {}
+    try:
+        jid = _job(e.conn)
+        waiting = _task(e.conn, jid, role="executor", kind="implement", status="queued")
+        _touch(e.conn, waiting, NOW - 1800)
+        e.bind_role("executor", "e3dfae0e-9d90-4358-8e90-2e4c6734b092", "Executor",
+                    routine_id="routine-executor", routine_name="omg-bus-executor", verified=True, provenance="test")
+        set_hook(get_paths(), "executor", "https://hooks.invalid/executor", SECRET_KEY)
+        watchdog.tick(e, now=NOW)
+        row = e._one("SELECT status, current_dispatch_id FROM tasks WHERE id=?", (waiting,))
+        assert row["status"] == "dispatched" and row["current_dispatch_id"]
+        assert transport.n == 1
+        assert transport.bodies[0]["task_id"] == waiting
+    finally:
+        e.close()
+
+
+def test_queued_stall_during_approval_is_not_dispatched(omg_home):
+    _policy({"watchdog": "on"})
+    transport = Transport()
+    e = Engine(transport=transport)
+    try:
+        jid = _job(e.conn, phase="awaiting_approval")
+        waiting = _task(e.conn, jid, role="executor", kind="implement", status="queued")
+        _touch(e.conn, waiting, NOW - 1800)
+        e.bind_role("executor", "e3dfae0e-9d90-4358-8e90-2e4c6734b092", "Executor",
+                    routine_id="routine-executor", routine_name="omg-bus-executor", verified=True, provenance="test")
+        set_hook(get_paths(), "executor", "https://hooks.invalid/executor", SECRET_KEY)
+        watchdog.tick(e, now=NOW)
+        row = e._one("SELECT status, current_dispatch_id FROM tasks WHERE id=?", (waiting,))
+        assert row["status"] == "queued" and row["current_dispatch_id"] is None
+        assert transport.n == 0
+    finally:
+        e.close()
+
+
 def test_hephaestus_hook_follows_the_normal_dispatch_path(omg_home):
     e = Engine()
     try:

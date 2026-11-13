@@ -276,13 +276,15 @@ def _send(engine: Engine, stall: dict) -> dict:
     if task is None:
         return {"posted": False, "reason": "missing"}
     if task["status"] == "queued" and not task["current_dispatch_id"]:
+        # _schedule is the only publisher for queued work: it skips a job that is not running work and a task
+        # whose dependencies have not passed. Calling _dispatch_task here would start that task early.
         with db.tx(engine.conn):
-            published = engine._dispatch_task(task)
-        if not published:
+            engine._schedule(task["job_id"])
+        fresh = engine._one("SELECT status, current_dispatch_id FROM tasks WHERE id=?", (task["id"],))
+        if fresh is None or fresh["status"] == "queued" or not fresh["current_dispatch_id"]:
             return {"posted": False, "reason": "deferred"}
         engine.flush_outbox()
-        fresh = engine._one("SELECT current_dispatch_id FROM tasks WHERE id=?", (task["id"],))
-        return {"posted": True, "enqueued": True, "dispatch_id": fresh["current_dispatch_id"] if fresh else None}
+        return {"posted": True, "enqueued": True, "dispatch_id": fresh["current_dispatch_id"]}
     dispatch_id = task["current_dispatch_id"]
     if not dispatch_id:
         return {"posted": False, "reason": "no_dispatch"}

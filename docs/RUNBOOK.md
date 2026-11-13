@@ -292,7 +292,8 @@ Thresholds (policy keys, code defaults):
 | `watchdog_log_max_bytes`, `watchdog_log_backups` | 1048576, 3 | `state/logs/watchdog.log` rotation. |
 
 A wake is a POST through the same transport the dispatcher uses, with the task's current `dispatch_id`, so a claim
-still matches. Backoff, the per-task cap, and an in-flight webhook row stop a second POST. Events are
+still matches. A queued task is handed back to the scheduler, which still refuses it while a dependency is unfinished
+or the job is waiting for approval. Backoff, the per-task cap, and an in-flight webhook row stop a second POST. Events are
 `stall_detected`, `stall_no_hook`, `stall_wake`, and `stall_wake_capped`. They do not contain webhook URLs, keys, or
 headers.
 
