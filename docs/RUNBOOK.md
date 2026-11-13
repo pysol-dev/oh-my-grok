@@ -263,6 +263,76 @@ separate destructive path.
   User repositories are never touched by the uninstall. Check that no worktree you need lives under `jobs/`
   (fixtures only).
 
+## 13. Watchdog (host service)
+
+Reconcile normally runs only when a Bot routine calls it, and that routine is not a 24/7 process. The watchdog is a
+long-running `omg watchdog run` loop in this checkout's venv. It does not need systemd or cron: PID 1 on this host is
+tini, there is no user bus, and there is no crontab. The process supervises its own loop. `start` daemonizes that
+loop. `ensure` is what a coarse external backstop calls after a reboot.
+
+The flag is `features.watchdog` in the policy file this checkout loads (`config/policy.json`, or `OMG_CONFIG_DIR`).
+It defaults to `off`. Do not commit that file from a live host. Other feature defaults are unchanged.
+
+| Mode | What a tick does |
+|---|---|
+| `off` | Writes a heartbeat. Does not reconcile, collect, detect, or wake. |
+| `shadow` | Reconcile, then `heal collect` (which still obeys `features.healing`), then stall records. No stall wakes. |
+| `on` | Same as `shadow`, and wakes a stalled role when that role has a hook in the secrets store. |
+
+Thresholds (policy keys, code defaults):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `watchdog_interval_seconds` | 60 | Sleep between ticks. `--interval` on `run` / `start` / `ensure` overrides it for that process. |
+| `stall_awaiting_resume_seconds` | 600 | `awaiting_resume` older than this is a stall. |
+| `lease_seconds` | 1800 | Every other open task or dispatch. A `working` task with an unexpired lease is not a stall. |
+| `watchdog_wake_cap` | 3 | Stall wakes recorded per task. Further ticks record one `stall_wake_capped` and do not POST. |
+| `backoff_base_seconds`, `backoff_cap_seconds` | 30, 1800 | Wait before the next wake of the same task: base, then double, until the cap. |
+| `watchdog_stale_intervals` | 3 | Doctor calls the heartbeat stale after this many intervals. |
+| `watchdog_log_max_bytes`, `watchdog_log_backups` | 1048576, 3 | `state/logs/watchdog.log` rotation. |
+
+A wake is a POST through the same transport the dispatcher uses, with the task's current `dispatch_id`, so a claim
+still matches. Backoff, the per-task cap, and an in-flight webhook row stop a second POST. Events are
+`stall_detected`, `stall_no_hook`, `stall_wake`, and `stall_wake_capped`. They do not contain webhook URLs, keys, or
+headers.
+
+Hephaestus is webhook-wakeable when `state/secrets/hooks.json` has a hook for that role: new work then follows the
+same binding and verification checks as every other role. With no hook, new Hephaestus work stays
+`awaiting_resume` on the local channel. A stall in that state records `stall_no_hook` and is not POSTed. Adding the
+hook later lets the watchdog wake the task that is already parked; the row stays `awaiting_resume` until something
+claims that same `dispatch_id`.
+
+`omg doctor` reports the flag. `off` passes. `shadow` or `on` passes only while the process is alive and the
+heartbeat is fresh; otherwise the check is `stale` and doctor exits 8. `omg watchdog status` prints the same facts
+and exits 3 when the process is not running.
+
+```bash
+# edit the host policy (not a committed file): "watchdog": "shadow" or "on" inside features
+cd /workspace/omg
+./omg watchdog run                 # foreground loop; leave it running
+./omg watchdog start               # same loop, daemonized (pidfile + lock under state/watchdog/)
+./omg watchdog status
+./omg watchdog stop
+./omg watchdog ensure              # start only if the lock is not held; recovers a stale pidfile
+```
+
+`start` is idempotent: a second start while the lock is held does not spawn another process. A pidfile whose pid is
+dead is replaced. Logs are `state/logs/watchdog.log` (rotated, mode 0600). The heartbeat is
+`state/watchdog/heartbeat.json`.
+
+Nothing respawns the daemon when the host reboots. Point whatever low-frequency backstop you have at `ensure`. This
+host has no cron and no systemd, so the backstop has to be something you already run after boot (a login script, a
+manual check, another machine). It is safe to call on a timer of any coarse period: if the watchdog is alive,
+`ensure` exits 0 without starting a second copy.
+
+```bash
+# after a host restart, from the checkout the daemon should run in:
+/workspace/omg/omg watchdog ensure
+```
+
+The live checkout is still `/workspace/omo` until cutover. Use that directory, and `omoctl`, until the move. `ensure`
+does not rotate webhook keys and does not edit the policy file.
+
 ## Troubleshooting
 | Symptom | Cause / action |
 |---|---|
