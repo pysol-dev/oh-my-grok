@@ -330,7 +330,9 @@ def test_live_fixture_submits_under_adaptive_roster(omg_home, monkeypatch, mode)
     bound = Harness()
     bound.close()
     monkeypatch.setattr("oh_my_grok.engine.post_json", lambda *a, **k: HttpResult(200, None, None))
-    monkeypatch.setattr("oh_my_grok.live.time.sleep", _fail_if_the_harness_waits)
+    # Patch the harness poll only. ``oh_my_grok.live.time`` is the stdlib module, and
+    # subprocess calls ``time.sleep`` while ``git add`` is still running.
+    monkeypatch.setattr("oh_my_grok.live._pause", _fail_if_the_harness_waits)
     res = run_live_fixture(timeout=0, poll=30)
     assert res["result"] == "TIMEOUT", res
     assert "NOT RUN" not in res["result"]
