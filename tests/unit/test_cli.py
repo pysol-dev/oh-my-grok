@@ -13,7 +13,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 OMG_CLI = str(ROOT / "omg")
-DOCUMENTED = [["features"], ["boulder"], ["receipts"], ["docs"], ["attest"], ["lsp", "status"], ["lsp", "canary"], ["lsp", "check"], ["heal", "collect"], ["heal", "show"], ["doctor"], ["migrate"], ["status"], ["submit"], ["plan", "show"], ["approve"], ["deny"], ["cancel"],
+DOCUMENTED = [["features"], ["boulder"], ["receipts"], ["docs"], ["attest"], ["lsp", "status"], ["lsp", "canary"], ["lsp", "check"], ["heal", "collect"], ["heal", "show"], ["heal", "prune-duplicates"], ["doctor"], ["migrate"], ["status"], ["submit"], ["plan", "show"], ["approve"], ["deny"], ["cancel"],
               ["watchdog", "run"], ["watchdog", "start"], ["watchdog", "stop"], ["watchdog", "status"], ["watchdog", "ensure"],
               ["reconcile"], ["hook", "set"], ["hook", "check"], ["hook", "list"], ["hook", "serve"], ["test"], ["export"],
               ["resume"], ["backup"], ["restore"], ["roles", "list"], ["roles", "bind"], ["roles", "import"]]
@@ -61,7 +61,7 @@ def test_argument_validation_exit_2(args):
 def test_doctor_and_migrate_in_isolated_home(omg_home):
     env = dict(os.environ)
     r = run(["migrate", "--dry-run", "--json"], env=env)
-    assert r.returncode == 0 and json.loads(r.stdout)["pending"] == [1, 2, 3, 4, 5, 6]
+    assert r.returncode == 0 and json.loads(r.stdout)["pending"] == [1, 2, 3, 4, 5, 6, 7]
     assert run(["migrate"], env=env).returncode == 0
     r = run(["doctor", "--json"], env=env)
     d = json.loads(r.stdout)
