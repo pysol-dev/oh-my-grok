@@ -232,11 +232,15 @@ backup on the next open). A missing base revision fails closed.
 `./omg doctor` lists the usable profiles.
 
 ## 10. Backups and migrations
-- `./omg backup --out /path/file.sqlite3` uses the SQLite backup API and an integrity check.
+- `./omg backup --out /path/file.sqlite3` uses the SQLite backup API and an integrity check. That command is unchanged.
+- `./omg backup` (no `--out`) writes one encrypted, signed bundle. Keys come from `./omg backup init-key`
+  (`OMG_BACKUP_PASSPHRASE` in the environment, never as an argument). Restore is `scripts/recover.sh`.
+  The contract, exit codes, and what is not in the bundle are in `spec/DURABILITY.md`. `features.backup`
+  defaults to `off`; doctor checks for it then report SKIP.
 - `./omg migrate --dry-run`, then `./omg migrate`. Migrate takes an automatic backup first when the DB is not
   empty. Migrations are versioned and checksummed.
 - `./omg restore FILE` needs a TTY. Stop all omo activity first. It verifies the backup's integrity before
-  swapping it in, and keeps the old DB.
+  swapping it in, and keeps the old DB. That path restores a raw SQLite snapshot, not an encrypted bundle.
 
 ## 11. Failed / dead-letter dispatches
 - `status` shows the dispatch `status`, `http_status` and `last_error` (redacted).

@@ -20,6 +20,9 @@ FEATURE_MODES: dict[str, tuple[str, ...]] = {
     # Host watchdog. off: the loop records a heartbeat and does not touch the bus.
     # shadow: reconcile, heal collect, and stall records, no wakes. on: wakes enabled.
     "watchdog": (OFF, SHADOW, ON),
+    # Encrypted state bundles. off: no hourly backup; doctor checks SKIP. on: hourly bundle.
+    # Explicit `omg backup` still runs when this is off. See spec/DURABILITY.md.
+    "backup": (OFF, ON),
 }
 
 
