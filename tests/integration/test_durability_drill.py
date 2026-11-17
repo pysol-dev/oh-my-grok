@@ -9,7 +9,10 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 from pathlib import Path
+
+import pytest
 
 from oh_my_grok.engine import Engine
 from oh_my_grok.hooks import set_hook
@@ -21,6 +24,24 @@ OMG = str(ROOT / "omg")
 RECOVER = str(ROOT / "scripts" / "recover.sh")
 HOOK_URL = "https://drill.invalid/hook/ZZDRILLPATHTOKEN"
 HOOK_KEY = "hk_DRILL_SENTINEL_0123456789abcdef"
+
+
+@pytest.fixture(autouse=True)
+def _gpg_agent_per_test(tmp_path, monkeypatch):
+    home = tmp_path / "gnupg-home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setenv("GNUPGHOME", str(home))
+    yield
+    targets = [home]
+    omg = os.environ.get("OMG_HOME")
+    if omg:
+        targets.append(Path(omg) / "state" / "secrets" / "backup-gnupg")
+    short = Path(tempfile.gettempdir()) / f"omg-gnupg-{os.getuid()}"
+    if short.is_dir():
+        targets.extend(path for path in short.iterdir() if path.is_symlink() or path.is_dir())
+    for directory in targets:
+        subprocess.run(["gpgconf", "--homedir", str(directory), "--kill", "gpg-agent"],
+                       capture_output=True, check=False)
 
 
 def _absent(text: str) -> None:
@@ -97,6 +118,14 @@ def test_wipe_and_recover_is_idempotent_and_fails_closed(omg_home, tmp_path, mon
         original_sig = Path(str(bundles[0]) + ".sig").read_bytes()
         assert (store / "kit" / "encryption.sec.asc").is_file()
         assert (store / "kit" / "signing.pub").is_file()
+        assert (store / "kit" / "signing.fpr").is_file()
+        assert not list((store / "bundles").glob("*.manifest.json"))
+        public = json.loads((store / "bundles" / (bundles[0].name + ".public.json")).read_text())
+        assert set(public) == {"bundle", "sha256", "created_at", "generation", "signature"}
+        assert "hooks.json" not in json.dumps(public)
+        local_manifests = list((omg_home / "state" / "backups" / "bundles").glob("*.manifest.json"))
+        assert len(local_manifests) == 1
+        manifest = json.loads(local_manifests[0].read_text())
 
         shutil.rmtree(omg_home / "state")
         shutil.rmtree(omg_home / "jobs")
@@ -120,7 +149,6 @@ def test_wipe_and_recover_is_idempotent_and_fails_closed(omg_home, tmp_path, mon
         assert (get_paths().hooks_path.stat().st_mode & 0o777) == 0o600
         assert _sha(get_paths().logs_dir / "drill.log") == log_hash
         assert (get_paths().jobs_dir / job).is_dir()
-        manifest = json.loads(Path(str(bundles[0]) + ".manifest.json").read_text())
         for rel, meta in manifest["files"].items():
             if rel.endswith(".sqlite3"):
                 continue

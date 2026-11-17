@@ -74,13 +74,15 @@ The command:
 1. Generates an encryption key (ECDSA P-256 primary, ECDH P-256 subkey) inside a mode `0700` temporary GnuPG home. The passphrase is supplied to gpg through a mode `0600` file in that temporary directory.
 2. Exports the encryption **public** key and the **passphrase-protected** secret key into the recovery kit (`state/recovery-kit/` unless `--kit` is set): `encryption.pub`, `encryption.sec.asc`, mode `0600`, directory mode `0700`.
 3. Shreds the temporary home, including the passphrase file. The plaintext encryption private key is not written anywhere else.
-4. Generates a separate Ed25519 signing key with no passphrase **in** `state/secrets/backup-gnupg/` (mode `0700`). Only `signing.pub` is copied into the kit. The signing secret is not exported to a file. When that directory's path is too long for an `AF_UNIX` socket, `gpg` is pointed at a private short symlink to the same directory; the key files stay under `state/secrets/backup-gnupg/`.
+4. Generates a separate Ed25519 signing key with no passphrase **in** `state/secrets/backup-gnupg/` (mode `0700`). `signing.pub` and `signing.fpr` (the fingerprint) are copied into the kit. The same fingerprint is stored in `state/secrets/backup-signing.fpr`. The signing secret is not exported to a file. When that directory's path is too long for an `AF_UNIX` socket, `gpg` is pointed at a private short symlink to the same directory; the key files stay under `state/secrets/backup-gnupg/`.
+
+The passphrase is given to gpg with `--passphrase-fd` and `pinentry-mode loopback`. No passphrase file is created.
 
 The on-box keyring used for hourly backups contains the encryption public key and the signing secret. It does not contain the encryption secret. Decrypting a bundle requires the kit plus the passphrase.
 
 ## 4. `omg backup` and off-box targets
 
-`omg backup` writes `state/backups/bundles/omg-YYYYmmddTHHMMSSZ.tar.gpg` and a detached `.sig` over the ciphertext. Both are mode `0600`. The tar is encrypted to the encryption public key (no passphrase) and signed with the on-box signing key.
+`omg backup` writes `state/backups/bundles/omg-YYYYmmddTHHMMSSffffffZ.tar.gpg` and a detached `.sig` over the ciphertext. Both are mode `0600`. A second bundle in the same microsecond is `...Z-0002.tar.gpg` with a zero-padded sequence, and newer sequences sort after older ones. The tar is encrypted to the encryption public key (no passphrase) and signed with the on-box signing key.
 
 `omg backup push` publishes the newest local bundle. `omg backup` pushes too, unless `--no-push` is set. `omg backup --out PATH` does not push.
 
@@ -96,13 +98,17 @@ Layout:
 <path>/
   bundles/<name>.tar.gpg
   bundles/<name>.tar.gpg.sig
+  bundles/<name>.public.json
   kit/encryption.pub
   kit/encryption.sec.asc
   kit/signing.pub
+  kit/signing.fpr
   LATEST
 ```
 
-`LATEST` names the newest bundle file. The kit copy is the recovery kit (public encryption key, protected encryption secret, signing public key). The signing secret is not copied.
+`LATEST` names the newest bundle file. The kit copy is the recovery kit (public encryption key, protected encryption secret, signing public key, and the pinned signing fingerprint). The signing secret is not copied.
+
+`<name>.public.json` is the only manifest that leaves the box. Its keys are exactly `bundle`, `sha256` (of the ciphertext), `created_at`, `generation` (`max_event_id` and `tail_sha256`), and `signature` (the signature filename). It has no paths, no file list, and no hook or policy metadata. The full `manifest.json` stays inside the encrypted bundle. A local `<name>.manifest.json` may sit next to the ciphertext on the box so doctor can compare lockfiles without the passphrase; that file is not copied to the agent store or uploaded as a release asset.
 
 Retention, applied to the local bundle directory and to each agent-store `bundles/` directory:
 
@@ -113,11 +119,13 @@ Retention, applied to the local bundle directory and to each agent-store `bundle
 
 ### 4.2 Private GitHub repository
 
-`{"type": "github_release", "repo": "owner/name", "checkout": "...", "mirror": "...", "remote": "..."}`. `repo` is required. `checkout` is optional (default `state/backups/github/<owner>__<name>`). `mirror` is an optional local directory of already-downloaded assets, used by tests and by doctor so a check does not have to call `gh`. `remote` is optional and defaults to `https://github.com/<repo>.git`. Tests set it to a local bare repository. A remote that normalizes to the public repository is refused the same way `repo` is.
+`{"type": "github_release", "repo": "owner/name", "checkout": "...", "mirror": "...", "remote": "..."}`. `repo` is required and must be exactly `owner/name`. A URL or an scp path in `repo` is rejected. `checkout` is optional (default `state/backups/github/<owner>__<name>`, mode `0700`). `mirror` is an optional local directory of already-downloaded assets, used by tests and by doctor so a check does not have to call `gh`. `remote` is optional and defaults to `https://github.com/<repo>.git`. Tests set it to a local bare repository.
 
-Git stores **only** the recovery kit (`kit/` plus a README that points at release assets). Bundles are uploaded as assets of a release whose tag is the bundle name without `.tar.gpg`, via `gh release create`. Retention deletes older releases and their tags (`gh release delete --yes --cleanup-tag`). Nothing in this path uses `--force`, `--force-with-lease`, `-f` on `git push`, or a refspec that starts with `+`. A rejected push is a failure. It is not retried with a force. The next publication pushes `HEAD:main` again even when the kit files are already committed, so a commit that never reached the remote is not skipped.
+Before every commit, push, and release upload, publication runs `gh api repos/<owner>/<name>` and continues only when `private` is true. A failed query or any other visibility fails closed and does not commit, push, or upload. The check runs again on every push.
 
-Any target repo, remote URL, or argument that normalizes to `pysol-dev/oh-my-grok` (including `https://github.com/pysol-dev/oh-my-grok.git` and `git@github.com:pysol-dev/oh-my-grok.git`) is refused before a git or `gh` command is run.
+Git stores **only** the recovery kit (`kit/` plus a README that points at release assets). Bundles are release assets. The tag is the bundle name without `.tar.gpg`. A missing release is created with `gh release create`. A release whose ciphertext or signature is missing, or whose size or sha256 does not match the local file, is repaired with `gh release upload --clobber` (that flag replaces an asset; it is not a git force-push). After the upload, the assets are read back. A mismatch is a non-zero failure. Retention deletes older releases and their tags (`gh release delete --yes --cleanup-tag`). Nothing in this path uses `--force`, `--force-with-lease`, `-f` on `git push`, or a refspec that starts with `+`. A rejected push is a failure. It is not retried with a force. The next publication pushes `HEAD:main` again even when the kit files are already committed, so a commit that never reached the remote is not skipped.
+
+Any reference that canonicalizes to `pysol-dev/oh-my-grok` is refused before a git or `gh` command runs. That includes `owner/name` in any case, `github.com/owner/name`, `https://www.github.com/...`, `https://user@github.com/...`, `https://github.com/...git/`, `ssh://git@github.com:22/...`, `ssh://git@ssh.github.com:443/...`, and `git@github.com:owner/name.git`.
 
 ## 5. Watchdog and doctor
 
@@ -132,7 +140,7 @@ Doctor, when `backup=on`:
 |---|---|
 | `backup_age` | there is no local bundle, or the newest bundle's filename timestamp is older than `backup_max_age_seconds` (default 7200, two hourly intervals, so one late tick does not flap) |
 | `backup_offbox` | a configured target does not have the newest local bundle and its signature. No targets configured is a pass, with that fact in the detail. Agent-store targets are checked on disk. A GitHub target with `mirror` is checked on disk. Without `mirror`, doctor asks `gh` and does not force-push |
-| `backup_venv_tools` | `.venv/bin/python` is missing, or `requirements.lock` / `tooling/requirements-tools.lock` no longer match the hashes stored in the newest bundle's manifest. The manifest is not decrypted; the hashes are also stored beside the bundle in `<name>.manifest.json` (mode `0600`, no hook bytes) so doctor can compare without the passphrase. A git SHA difference is reported in the detail and does not by itself fail the check |
+| `backup_venv_tools` | `.venv/bin/python` is missing, or `requirements.lock` / `tooling/requirements-tools.lock` no longer match the hashes stored in the newest bundle's manifest. The full manifest is not decrypted; a local `<name>.manifest.json` (mode `0600`, on the box only) lets doctor compare without the passphrase. A git SHA difference is reported in the detail and does not by itself fail the check |
 
 When `backup=off` those three checks are `SKIP` with `ok` true. Existing doctor output stays OK.
 
@@ -146,11 +154,11 @@ Order:
 
 1. Require `python3`, `gpg`, and `OMG_BACKUP_PASSPHRASE` (present and non-empty; the value is never printed).
 2. Unless `--check`: run `scripts/bootstrap.sh`.
-3. Locate the newest bundle. Search order: `OMG_BACKUP_AGENT_STORE` (primary), each configured agent-store path, `/cursor/stores/user/omg-backups` when that directory exists, the local bundle directory, `OMG_BACKUP_GITHUB_MIRROR`, a configured GitHub `mirror`, then (secondary) a `git clone` plus `gh release download` when `OMG_BACKUP_GITHUB_REPO` is set. The clone is not a force. The public repository is refused.
-4. Verify the detached signature with `signing.pub` from the kit that sits beside that bundle (`OMG_BACKUP_KIT` overrides). A bad signature or a manifest mismatch exits 12 and does not try an older bundle.
-5. Decrypt with the kit's protected secret and the passphrase, into a mode `0700` temporary directory that is shredded before the script exits. The passphrase is passed to gpg through a file descriptor, not argv.
+3. Locate the newest bundle. Candidates are collected from `OMG_BACKUP_AGENT_STORE`, each configured agent-store path, `/cursor/stores/user/omg-backups` when that directory exists, the local bundle directory, `OMG_BACKUP_GITHUB_MIRROR`, a configured GitHub `mirror`, and, when `OMG_BACKUP_GITHUB_REPO` is `owner/name`, a `git clone` plus `gh release download`. The newest timestamp wins. The same timestamp prefers the higher sequence suffix, then the agent store over the local copy over a GitHub mirror. A GitHub release that does not have both a non-empty ciphertext and a non-empty signature is skipped, and the next newest complete release is used. The clone is not a force. The public repository is refused. A bad signature or a manifest mismatch on the chosen bundle still exits 12 and does not fall through to an older bundle.
+4. Verify the detached signature. The signer fingerprint must equal the pin recorded at `init-key` (`signing.fpr` in the kit, and `state/secrets/backup-signing.fpr` when the box still has it). Those two pins must agree when both exist. A `signing.pub` whose fingerprint differs from the pin is not trusted. Any mismatch exits 12.
+5. Decrypt with the kit's protected secret and the passphrase, into a mode `0700` temporary directory that is shredded before the script exits. The passphrase is passed to gpg on `--passphrase-fd` through a pipe (`pinentry-mode loopback`). It is not an argument and it is not written to a file.
 6. Decide, then act (section 6.1).
-7. Unless `--check`: `./omg watchdog ensure` and `./omg doctor`.
+7. Unless `--check`: unset `OMG_BACKUP_PASSPHRASE`, then `./omg watchdog ensure` and `./omg doctor`. The passphrase is also removed from the environment of git, gh, gpg, and shred.
 
 `OMG_HOME` and `OMG_CONFIG_DIR` are honored (`paths.py`). `OMG_DISABLE_TRANSPORT=1` is inherited by `./omg` and by the watchdog it starts. `post_json` returns before it opens a socket or builds a URL, key, or header when that variable is set, so a restored `hooks.json` cannot wake a live bot during a drill.
 

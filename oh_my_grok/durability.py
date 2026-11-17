@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -17,8 +18,10 @@ import sys
 import tarfile
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
 
 from . import db
 from .config import canonical_json, load_policy, sha256_text
@@ -31,7 +34,10 @@ PUBLIC_REPO = "pysol-dev/oh-my-grok"
 DEFAULT_AGENT_STORE = Path("/cursor/stores/user/omg-backups")
 UID_ENCRYPTION = "omg-backup-encryption"
 UID_SIGNING = "omg-backup-signing"
-KIT_FILES = ("encryption.pub", "encryption.sec.asc", "signing.pub")
+KIT_FILES = ("encryption.pub", "encryption.sec.asc", "signing.pub", "signing.fpr")
+_OWNER_NAME = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_BUNDLE_NAME = re.compile(r"^omg-(?P<stamp>\d{8}T\d{6}(?:\d{6})?Z)(?:-(?P<seq>\d+))?\.tar\.gpg$")
+_PUBLIC_MANIFEST_KEYS = ("bundle", "sha256", "created_at", "generation", "signature")
 EVENT_FIELDS = ("id", "ts", "job_id", "task_id", "kind", "actor", "correlation_id", "data_json")
 GITHUB_NOTES = "oh-my-grok encrypted backup. Git holds the recovery kit only; this release is the bundle."
 KIT_README = (
@@ -90,22 +96,66 @@ def mcp_command_record() -> str:
     return f"{py} {server}"
 
 
-def normalize_repo(value: str) -> str:
-    text = (value or "").strip().lower()
-    if text.endswith(".git"):
-        text = text[:-4]
-    for prefix in ("https://github.com/", "http://github.com/", "ssh://git@github.com/", "git@github.com:"):
-        if text.startswith(prefix):
-            text = text[len(prefix):]
-            break
-    return text.strip("/")
+def _owner_name_from_path(path: str) -> str | None:
+    parts = [part for part in path.strip("/").split("/") if part]
+    if len(parts) < 2:
+        return None
+    owner, name = parts[0], parts[1]
+    if name.lower().endswith(".git"):
+        name = name[:-4]
+    if not owner or not name or "/" in owner or "/" in name:
+        return None
+    return f"{owner}/{name}".lower()
+
+
+def canonical_github_repo(value: str) -> str | None:
+    """Map a GitHub reference to ``owner/name``.
+
+    Accepts ``owner/name`` and the URL and scp forms a remote might use
+    (``https://user@host/...``, ``ssh://git@host:port/...``, ``git@host:owner/name.git``,
+    a trailing slash, ``www.`` and ``ssh.`` hostnames). A local filesystem path is not a
+    GitHub repository and returns None.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    if "://" not in raw and ":" in raw:
+        matched = re.match(r"^(?:[^@\s]+@)?([^:\s]+):(.+)$", raw)
+        host = matched.group(1).lower() if matched else ""
+        if matched and host.endswith("github.com"):
+            return _owner_name_from_path(matched.group(2))
+    url_text = raw
+    if "://" not in url_text and "github.com" in url_text.lower():
+        url_text = "https://" + url_text
+    if "://" in url_text:
+        parsed = urlparse(url_text)
+        host = (parsed.hostname or "").lower()
+        if host == "github.com" or host.endswith(".github.com"):
+            return _owner_name_from_path(parsed.path)
+    if _OWNER_NAME.fullmatch(raw):
+        return raw.lower()
+    return None
+
+
+def require_owner_name(repo: str) -> str:
+    """The configured repo field is only ``owner/name``. URLs and scp forms are rejected."""
+    text = (repo or "").strip()
+    if not _OWNER_NAME.fullmatch(text):
+        raise ValidationError("github repo must be owner/name")
+    refuse_public(text)
+    return text
 
 
 def refuse_public(value: str) -> None:
     """Reject the public oh-my-grok repo before any git or gh command runs."""
-    norm = normalize_repo(value)
-    if norm == PUBLIC_REPO or norm.startswith(PUBLIC_REPO + "/"):
+    canon = canonical_github_repo(value)
+    if canon == PUBLIC_REPO or (canon or "").startswith(PUBLIC_REPO + "/"):
         raise ValidationError("refusing backup target that points at the public oh-my-grok repo")
+
+
+def normalize_repo(value: str) -> str:
+    """Canonical owner/name when ``value`` is a GitHub reference, otherwise the trimmed text."""
+    return canonical_github_repo(value) or (value or "").strip()
 
 
 def validate_targets(targets) -> None:
@@ -130,7 +180,7 @@ def validate_targets(targets) -> None:
             repo = target.get("repo")
             if not isinstance(repo, str) or not repo.strip():
                 raise ValidationError("github_release target needs repo")
-            refuse_public(repo)
+            require_owner_name(repo)
             if target.get("remote"):
                 if not isinstance(target["remote"], str):
                     raise ValidationError("github_release remote must be a string")
@@ -142,21 +192,29 @@ def validate_targets(targets) -> None:
             raise ValidationError(f"unknown backup target type {kind!r}")
 
 
-def bundle_epoch(path: Path) -> float | None:
-    """UTC timestamp encoded in omg-YYYYmmddTHHMMSSZ[-n].tar.gpg."""
-    name = path.name
-    if not name.startswith("omg-") or not name.endswith(".tar.gpg"):
+def bundle_sort_key(name: str) -> tuple[float, int] | None:
+    """``(utc timestamp, sequence)``. A higher sequence is newer when the timestamp ties.
+
+    Names are ``omg-YYYYmmddTHHMMSSZ`` or ``omg-YYYYmmddTHHMMSSffffffZ``, optional ``-NNNN``.
+    The sequence is the integer suffix, not the lexical text, so ``-0010`` sorts after ``-0002``.
+    """
+    match = _BUNDLE_NAME.match(name)
+    if not match:
         return None
-    stamp = name[len("omg-"):-len(".tar.gpg")]
-    if "-" in stamp:
-        stamp = stamp.split("-", 1)[0]
-    if len(stamp) != 16 or stamp[8] != "T" or not stamp.endswith("Z"):
-        return None
+    stamp = match.group("stamp")
+    sequence = int(match.group("seq") or "0")
+    fmt = "%Y%m%dT%H%M%S%fZ" if len(stamp) > 16 else "%Y%m%dT%H%M%SZ"
     try:
-        moment = datetime.strptime(stamp, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        moment = datetime.strptime(stamp, fmt).replace(tzinfo=UTC)
     except ValueError:
         return None
-    return moment.timestamp()
+    return (moment.timestamp(), sequence)
+
+
+def bundle_epoch(path: Path) -> float | None:
+    """UTC timestamp encoded in the bundle filename."""
+    key = bundle_sort_key(path.name)
+    return None if key is None else key[0]
 
 
 def bundle_tag(name: str) -> str:
@@ -173,7 +231,8 @@ def _shred_file(path: Path) -> None:
     if not path.exists():
         return
     try:
-        subprocess.run(["shred", "-u", "-n", "1", "--", str(path)], capture_output=True, timeout=60, check=False)
+        subprocess.run(["shred", "-u", "-n", "1", "--", str(path)], capture_output=True, timeout=60,
+                       check=False, env=_scrub_env())
     except OSError:
         pass
     if path.exists():
@@ -298,17 +357,34 @@ def _socket_safe(homedir: Path) -> Path:
     return link
 
 
-def _gpg(homedir: Path, args: list[str], *, passphrase_file: Path | None = None,
-         timeout: int = 180) -> subprocess.CompletedProcess:
+def _gpg(homedir: Path, args: list[str], *, passphrase: str | None = None,
+         timeout: int = 180) -> subprocess.CompletedProcess[str]:
+    """Run gpg. A passphrase is written to ``--passphrase-fd`` and is never a file or an argument."""
     homedir = _socket_safe(homedir)
-    cmd = ["gpg", "--batch", "--yes", "--pinentry-mode", "loopback", "--homedir", str(homedir)]
-    if passphrase_file is not None:
-        cmd.extend(["--passphrase-file", str(passphrase_file)])
-    cmd.extend(args)
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=_gpg_env(), check=False)
+    env = _gpg_env()
+    if passphrase is None:
+        cmd = ["gpg", "--batch", "--yes", "--pinentry-mode", "loopback", "--homedir", str(homedir), *args]
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env, check=False)
+    read_fd, write_fd = os.pipe()
+    os.set_inheritable(read_fd, True)
+    cmd = ["gpg", "--batch", "--yes", "--pinentry-mode", "loopback", "--passphrase-fd", str(read_fd),
+           "--homedir", str(homedir), *args]
+    proc = subprocess.Popen(cmd, pass_fds=(read_fd,), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=env, text=True)
+    os.close(read_fd)
+    try:
+        os.write(write_fd, passphrase.encode("utf-8"))
+    finally:
+        os.close(write_fd)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, stderr = proc.communicate()
+    return subprocess.CompletedProcess(cmd, proc.returncode if proc.returncode is not None else 1, stdout, stderr)
 
 
-def _gpg_ok(cp: subprocess.CompletedProcess, what: str) -> None:
+def _gpg_ok(cp: subprocess.CompletedProcess[str], what: str) -> None:
     if cp.returncode != 0:
         detail = redact((cp.stderr or "").strip())[:300]
         raise ValidationError(f"gpg {what} failed" + (f": {detail}" if detail else ""))
@@ -348,14 +424,7 @@ def _require_passphrase(passphrase: str) -> str:
 
 
 # ---------------------------------------------------------------- keys
-def _write_passphrase_file(directory: Path, passphrase: str) -> Path:
-    path = directory / "passphrase"
-    path.write_bytes(passphrase.encode("utf-8"))
-    os.chmod(path, 0o600)
-    return path
-
-
-def init_keys(paths: Paths, *, passphrase: str, kit: Path | None = None) -> dict:
+def init_keys(paths: Paths, *, passphrase: str, kit: Path | None = None) -> dict[str, str]:
     """Create the encryption keypair and the on-box signing key. One-time."""
     passphrase = _require_passphrase(passphrase)
     paths.ensure()
@@ -373,20 +442,19 @@ def init_keys(paths: Paths, *, passphrase: str, kit: Path | None = None) -> dict
         work = tmp / "gpg"
         work.mkdir(mode=0o700)
         os.chmod(work, 0o700)
-        phrase = _write_passphrase_file(tmp, passphrase)
         batch = tmp / "encryption.batch"
         batch.write_text(
             "Key-Type: ECDSA\nKey-Curve: nistp256\nSubkey-Type: ECDH\nSubkey-Curve: nistp256\n"
             f"Name-Real: {UID_ENCRYPTION}\nExpire-Date: 0\n%commit\n")
         os.chmod(batch, 0o600)
-        _gpg_ok(_gpg(work, ["--generate-key", str(batch)], passphrase_file=phrase), "generate encryption key")
+        _gpg_ok(_gpg(work, ["--generate-key", str(batch)], passphrase=passphrase), "generate encryption key")
         kit.mkdir(parents=True, exist_ok=True)
         os.chmod(kit, 0o700)
         pub = kit / "encryption.pub"
         sec = kit / "encryption.sec.asc"
         _gpg_ok(_gpg(work, ["--armor", "--output", str(pub), "--export", UID_ENCRYPTION]), "export encryption public key")
         _gpg_ok(_gpg(work, ["--armor", "--output", str(sec), "--export-secret-keys", UID_ENCRYPTION],
-                     passphrase_file=phrase), "export encryption secret")
+                     passphrase=passphrase), "export encryption secret")
         os.chmod(pub, 0o600)
         os.chmod(sec, 0o600)
         enc_fpr = _fingerprint(work, UID_ENCRYPTION)
@@ -405,7 +473,9 @@ def init_keys(paths: Paths, *, passphrase: str, kit: Path | None = None) -> dict
         _restrict_tree(home)
         _restrict_tree(kit)
         sign_fpr = _fingerprint(home, UID_SIGNING)
+        _write_mode(kit / "signing.fpr", (sign_fpr + "\n").encode(), 0o600)
         remember_kit(paths, kit)
+        _write_signing_pin(paths, sign_fpr)
         finished = True
         return {"kit": str(kit), "gnupg_home": str(home), "encryption_fingerprint": enc_fpr,
                 "signing_fingerprint": sign_fpr}
@@ -430,20 +500,20 @@ def _require_runtime_keys(paths: Paths) -> Path:
 
 
 # ---------------------------------------------------------------- generation and manifest
-def event_stream(conn: sqlite3.Connection) -> list[dict]:
+def event_stream(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = conn.execute(
         "SELECT id, ts, job_id, task_id, kind, actor, correlation_id, data_json FROM events ORDER BY id ASC"
     ).fetchall()
     return [{field: row[field] for field in EVENT_FIELDS} for row in rows]
 
 
-def generation_of(events: list[dict]) -> dict:
+def generation_of(events: list[dict[str, Any]]) -> dict[str, Any]:
     tail = events[-50:]
     return {"max_event_id": int(events[-1]["id"]) if events else 0,
             "tail_sha256": sha256_text(canonical_json(tail))}
 
 
-def relate_streams(local_events: list[dict], backup_events: list[dict]) -> str:
+def relate_streams(local_events: list[dict[str, Any]], backup_events: list[dict[str, Any]]) -> str:
     """equal, local_prefix (backup is a strict extension), local_newer, or diverged."""
     if local_events == backup_events:
         return "equal"
@@ -460,7 +530,7 @@ def _open_ro(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def inspect_database(path: Path) -> tuple[str, list[dict] | None]:
+def inspect_database(path: Path) -> tuple[str, list[dict[str, Any]] | None]:
     """Return missing, corrupt, or ok plus the event stream when the file is readable."""
     if not path.exists():
         return "missing", None
@@ -508,7 +578,7 @@ def _git_sha() -> str:
     return "unknown"
 
 
-def _environment() -> dict:
+def _environment() -> dict[str, Any]:
     out = {"git_sha": _git_sha()}
     pairs = (("requirements_lock_sha256", CODE_ROOT / "requirements.lock"),
              ("tools_lock_sha256", CODE_ROOT / "tooling" / "requirements-tools.lock"))
@@ -518,7 +588,7 @@ def _environment() -> dict:
     return out
 
 
-def _add_bytes(tree: Path, rel: str, data: bytes, files: dict) -> None:
+def _add_bytes(tree: Path, rel: str, data: bytes, files: dict[str, Any]) -> None:
     dest = tree / rel
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(data)
@@ -526,7 +596,7 @@ def _add_bytes(tree: Path, rel: str, data: bytes, files: dict) -> None:
     files[rel] = {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data), "mode": "0600"}
 
 
-def _add_tree(tree: Path, src_root: Path, prefix: str, files: dict) -> None:
+def _add_tree(tree: Path, src_root: Path, prefix: str, files: dict[str, Any]) -> None:
     if not src_root.exists():
         return
     if src_root.is_symlink():
@@ -559,11 +629,12 @@ def _read_hooks(path: Path) -> bytes | None:
 
 
 def _allocate_name(directory: Path, when: datetime) -> str:
-    base = when.strftime("omg-%Y%m%dT%H%M%SZ")
+    """Microsecond timestamp, then a zero-padded sequence so same-tick names sort chronologically."""
+    base = when.strftime("omg-%Y%m%dT%H%M%S%fZ")
     name = base + ".tar.gpg"
     suffix = 2
     while (directory / name).exists():
-        name = f"{base}-{suffix}.tar.gpg"
+        name = f"{base}-{suffix:04d}.tar.gpg"
         suffix += 1
     return name
 
@@ -580,7 +651,7 @@ def _safe_extract(tar_path: Path, dest: Path) -> None:
         archive.extractall(dest, filter="data")
 
 
-def verify_tree(root: Path, manifest: dict) -> None:
+def verify_tree(root: Path, manifest: dict[str, Any]) -> None:
     if manifest.get("bundle_format") != BUNDLE_FORMAT:
         raise BundleInvalid("unsupported bundle format")
     for key in ("schema_version", "omg_version", "git_sha", "created_at", "mcp_command", "generation", "files"):
@@ -613,11 +684,11 @@ def verify_tree(root: Path, manifest: dict) -> None:
 
 # ---------------------------------------------------------------- bundle build
 def create_bundle(conn: sqlite3.Connection, paths: Paths, *, push: bool = True,
-                  runner=None, now: datetime | None = None) -> dict:
+                  runner=None, now: datetime | None = None) -> dict[str, Any]:
     """Build, encrypt, and sign one bundle. Hook bytes never appear in the returned dict."""
     paths.ensure()
     home = _require_runtime_keys(paths)
-    when = now or datetime.now(timezone.utc)
+    when = now or datetime.now(UTC)
     directory = bundles_dir(paths)
     directory.mkdir(parents=True, exist_ok=True)
     os.chmod(directory, 0o700)
@@ -626,7 +697,7 @@ def create_bundle(conn: sqlite3.Connection, paths: Paths, *, push: bool = True,
     try:
         tree = tmp / "tree"
         tree.mkdir(mode=0o700)
-        files: dict = {}
+        files: dict[str, Any] = {}
         db_name = paths.db_path.name
         if db_name not in ("omg.sqlite3", "omo.sqlite3"):
             raise IntegrityError_("refusing to archive an unexpected database name")
@@ -701,7 +772,7 @@ def create_bundle(conn: sqlite3.Connection, paths: Paths, *, push: bool = True,
         shred_tree(tmp)
     policy = load_policy(paths.config_dir)
     _prune_dir(directory, policy)
-    pushed: list[dict] = []
+    pushed: list[dict[str, Any]] = []
     if push:
         pushed = push_targets(paths, directory / name, runner=runner)
     dest = directory / name
@@ -736,14 +807,14 @@ def newest_bundle(directory: Path) -> Path | None:
         epoch = bundle_epoch(path)
         if epoch is None or not path.is_file() or path.is_symlink():
             continue
-        found.append((epoch, path.name, path))
+        found.append((bundle_sort_key(path.name) or (epoch, 0), path))
     if not found:
         return None
-    found.sort()
-    return found[-1][2]
+    found.sort(key=lambda item: item[0])
+    return found[-1][1]
 
 
-def load_sidecar(bundle: Path) -> dict | None:
+def load_sidecar(bundle: Path) -> dict[str, Any] | None:
     path = Path(str(bundle) + ".manifest.json")
     if not path.is_file() or path.is_symlink():
         return None
@@ -758,25 +829,25 @@ def load_sidecar(bundle: Path) -> dict | None:
 def select_keep(names: list[str], *, keep_hourly: int, keep_daily: int) -> tuple[set[str], set[str]]:
     parsed = []
     for name in names:
-        epoch = bundle_epoch(Path(name))
-        if epoch is None:
+        key = bundle_sort_key(name)
+        if key is None:
             continue
-        parsed.append((epoch, name))
+        parsed.append((key[0], key[1], name))
     parsed.sort()
-    by_date: dict = {}
-    for epoch, name in parsed:
-        by_date[datetime.fromtimestamp(epoch, timezone.utc).date()] = name
+    by_date: dict[date, str] = {}
+    for epoch, _sequence, name in parsed:
+        by_date[datetime.fromtimestamp(epoch, UTC).date()] = name
     daily = {by_date[day] for day in sorted(by_date)[-keep_daily:]}
-    hourly = {name for _, name in parsed[-keep_hourly:]}
+    hourly = {name for _epoch, _sequence, name in parsed[-keep_hourly:]}
     kept = set(daily | hourly)
     if parsed:
-        kept.add(parsed[-1][1])
+        kept.add(parsed[-1][2])
     return kept, daily
 
 
 def apply_size_cap(files: list[Path], kept: set[str], daily: set[str], cap: int) -> set[str]:
     chosen = [path for path in files if path.name in kept]
-    chosen.sort(key=lambda path: bundle_epoch(path) or 0)
+    chosen.sort(key=lambda path: bundle_sort_key(path.name) or (0.0, 0))
 
     def total(group: list[Path]) -> int:
         size = 0
@@ -796,7 +867,7 @@ def apply_size_cap(files: list[Path], kept: set[str], daily: set[str], cap: int)
     return {path.name for path in chosen}
 
 
-def _prune_dir(directory: Path, policy: dict) -> list[str]:
+def _prune_dir(directory: Path, policy: dict[str, Any]) -> list[str]:
     files = [path for path in directory.glob("omg-*.tar.gpg")
              if path.is_file() and not path.is_symlink() and bundle_epoch(path) is not None]
     kept, daily = select_keep([path.name for path in files], keep_hourly=int(policy["backup_keep_hourly"]),
@@ -809,13 +880,14 @@ def _prune_dir(directory: Path, policy: dict) -> list[str]:
         path.unlink()
         Path(str(path) + ".sig").unlink(missing_ok=True)
         Path(str(path) + ".manifest.json").unlink(missing_ok=True)
+        Path(str(path) + ".public.json").unlink(missing_ok=True)
         removed.append(path.name)
     return removed
 
 
 # ---------------------------------------------------------------- command runners
 def _is_repoish(arg: str) -> bool:
-    if not isinstance(arg, str) or arg.startswith("-") or arg.startswith("/"):
+    if not isinstance(arg, str) or arg.startswith(("-", "/")):
         return False
     low = arg.lower()
     if "github.com" in low or low.startswith("git@"):
@@ -836,7 +908,7 @@ def _forbid_force(argv: list[str]) -> None:
             raise ValidationError("refusing force-push")
 
 
-def _invoke(runner, argv: list[str], *, cwd: Path | None = None, env: dict | None = None):
+def _invoke(runner, argv: list[str], *, cwd: Path | None = None, env: dict[str, Any] | None = None):
     _forbid_force(argv)
     for arg in argv:
         if _is_repoish(arg):
@@ -844,8 +916,10 @@ def _invoke(runner, argv: list[str], *, cwd: Path | None = None, env: dict | Non
     return runner(argv, cwd=cwd, env=env)
 
 
-def subprocess_runner(argv, cwd=None, env=None):
-    return subprocess.run(list(argv), cwd=str(cwd) if cwd else None, env=env or _scrub_env(),
+def subprocess_runner(argv, cwd=None, env=None) -> subprocess.CompletedProcess[str]:
+    cleaned = _scrub_env() if env is None else {key: value for key, value in env.items()
+                                                if key != "OMG_BACKUP_PASSPHRASE"}
+    return subprocess.run(list(argv), cwd=str(cwd) if cwd else None, env=cleaned,
                           capture_output=True, text=True, timeout=180, check=False)
 
 
@@ -853,7 +927,7 @@ def default_runner(argv, cwd=None, env=None):
     return _invoke(subprocess_runner, list(argv), cwd=cwd, env=env)
 
 
-def resolve_store(target: dict) -> Path:
+def resolve_store(target: dict[str, Any]) -> Path:
     if target.get("path"):
         return Path(target["path"]).expanduser()
     env = os.environ.get("OMG_BACKUP_AGENT_STORE")
@@ -878,6 +952,40 @@ def _kit_complete(path: Path | None) -> bool:
 
 def kit_pointer_path(paths: Paths) -> Path:
     return paths.secrets_dir / "backup-kit.path"
+
+
+def signing_pin_path(paths: Paths) -> Path:
+    return paths.secrets_dir / "backup-signing.fpr"
+
+
+def _read_fingerprint(path: Path) -> str | None:
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        text = path.read_text().strip().lower()
+    except OSError:
+        return None
+    if len(text) < 16 or any(char not in "0123456789abcdef" for char in text):
+        return None
+    return text
+
+
+def _write_signing_pin(paths: Paths, fingerprint: str) -> None:
+    paths.secrets_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(paths.secrets_dir, 0o700)
+    _write_mode(signing_pin_path(paths), (fingerprint.lower() + "\n").encode(), 0o600)
+
+
+def pinned_signing_fingerprint(paths: Paths, kit: Path) -> str:
+    """The fingerprint recorded at init-key. A kit pubkey that disagrees is not trusted."""
+    local = _read_fingerprint(signing_pin_path(paths))
+    recorded = _read_fingerprint(kit / "signing.fpr")
+    if local and recorded and local != recorded:
+        raise BundleInvalid("signing fingerprint does not match the pinned key")
+    chosen = local or recorded
+    if not chosen:
+        raise BundleInvalid("signing fingerprint is not pinned")
+    return chosen
 
 
 def remember_kit(paths: Paths, kit: Path) -> None:
@@ -906,25 +1014,40 @@ def resolve_kit(paths: Paths) -> Path:
     return kit_dir(paths)
 
 
-def push_agent_store(paths: Paths, bundle: Path, target: dict, policy: dict) -> dict:
+def _write_public_manifest(bundle: Path, dest: Path) -> None:
+    """Off-box manifest: identity of the ciphertext only. No paths, file lists, or hook metadata."""
+    full = load_sidecar(bundle)
+    created = full.get("created_at") if isinstance(full, dict) else None
+    generation = full.get("generation") if isinstance(full, dict) else None
+    if not isinstance(generation, dict):
+        generation = {}
+    body = {
+        "bundle": bundle.name,
+        "sha256": _sha256_file(bundle),
+        "created_at": created,
+        "generation": {"max_event_id": generation.get("max_event_id"),
+                       "tail_sha256": generation.get("tail_sha256")},
+        "signature": bundle.name + ".sig",
+    }
+    if set(body) != set(_PUBLIC_MANIFEST_KEYS):
+        raise IntegrityError_("public manifest has unexpected fields")
+    _write_mode(dest, (json.dumps(body, indent=2, sort_keys=True) + "\n").encode(), 0o600)
+
+
+def push_agent_store(paths: Paths, bundle: Path, target: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
     store = resolve_store(target)
-    try:
-        refuse_public(str(store))
-    except ValidationError:
-        raise
+    refuse_public(str(store))
     bundles = store / "bundles"
     bundles.mkdir(parents=True, exist_ok=True)
     os.chmod(store, 0o700)
     os.chmod(bundles, 0o700)
     _install_file(bundle, bundles / bundle.name)
     sig = Path(str(bundle) + ".sig")
-    side = Path(str(bundle) + ".manifest.json")
     if not sig.is_file():
         raise ValidationError("bundle signature is missing")
     _install_file(sig, bundles / sig.name)
-    if side.is_file():
-        _install_file(side, bundles / side.name)
     _publish_kit(resolve_kit(paths), store / "kit")
+    _write_public_manifest(bundle, bundles / (bundle.name + ".public.json"))
     removed = _prune_dir(bundles, policy)
     latest = newest_bundle(bundles)
     (store / "LATEST").write_text((latest.name if latest else bundle.name) + "\n")
@@ -941,7 +1064,7 @@ def _same_remote(left: str, right: str) -> bool:
     return False
 
 
-def _remote_for(target: dict) -> str:
+def _remote_for(target: dict[str, Any]) -> str:
     remote = target.get("remote") or f"https://github.com/{target['repo']}.git"
     refuse_public(target["repo"])
     refuse_public(remote)
@@ -952,14 +1075,86 @@ def _git(runner, checkout: Path, args: list[str]):
     return _invoke(runner, ["git", "-C", str(checkout), *args])
 
 
-def push_github(paths: Paths, bundle: Path, target: dict, policy: dict, *, runner=None) -> dict:
+def assert_repo_private(repo: str, runner) -> None:
+    """Refuse unless ``gh api`` says the repository is private. A failed query fails closed."""
+    name = require_owner_name(repo)
+    cp = _invoke(runner, ["gh", "api", f"repos/{name}"])
+    if cp.returncode != 0:
+        raise ValidationError("could not verify that the backup repo is private")
+    try:
+        data = json.loads(cp.stdout or "")
+    except json.JSONDecodeError:
+        raise ValidationError("could not verify that the backup repo is private") from None
+    if not isinstance(data, dict) or data.get("private") is not True:
+        raise ValidationError("refusing to publish to a repository that is not private")
+
+
+def _asset_matches(asset: dict[str, Any] | None, path: Path) -> bool:
+    """True when the release asset has this name and the same size or sha256."""
+    if not isinstance(asset, dict) or asset.get("name") != path.name or not path.is_file():
+        return False
+    size = asset.get("size")
+    digest = asset.get("digest") if isinstance(asset.get("digest"), str) else asset.get("sha256")
+    hexdigest = digest.split(":", 1)[-1] if isinstance(digest, str) and digest else ""
+    size_ok = isinstance(size, int) and not isinstance(size, bool) and size == path.stat().st_size
+    sha_ok = bool(hexdigest) and hexdigest == _sha256_file(path)
+    if isinstance(size, int) and not isinstance(size, bool) and not size_ok:
+        return False
+    if hexdigest and not sha_ok:
+        return False
+    return size_ok or sha_ok
+
+
+def _release_assets(repo: str, tag: str, runner) -> dict[str, dict[str, Any]] | None:
+    cp = _invoke(runner, ["gh", "release", "view", tag, "--repo", repo, "--json", "assets"])
+    if cp.returncode != 0:
+        return None
+    try:
+        data = json.loads(cp.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    assets = data.get("assets") if isinstance(data, dict) else None
+    if not isinstance(assets, list):
+        return {}
+    found: dict[str, dict[str, Any]] = {}
+    for item in assets:
+        if isinstance(item, dict) and isinstance(item.get("name"), str):
+            found[str(item["name"])] = item
+    return found
+
+
+def _ensure_release_assets(repo: str, bundle: Path, runner) -> None:
+    assert_repo_private(repo, runner)
+    tag = bundle_tag(bundle.name)
+    signature = Path(str(bundle) + ".sig")
+    assets = _release_assets(repo, tag, runner)
+    complete = assets is not None and _asset_matches(assets.get(bundle.name), bundle) and _asset_matches(
+        assets.get(signature.name), signature)
+    if assets is None:
+        cp = _invoke(runner, ["gh", "release", "create", tag, str(bundle), str(signature), "--repo", repo,
+                              "--title", tag, "--notes", GITHUB_NOTES])
+        if cp.returncode != 0:
+            raise ValidationError("gh release create failed")
+    elif not complete:
+        cp = _invoke(runner, ["gh", "release", "upload", tag, str(bundle), str(signature), "--clobber",
+                              "--repo", repo])
+        if cp.returncode != 0:
+            raise ValidationError("gh release upload failed")
+    checked = _release_assets(repo, tag, runner)
+    if checked is None or not _asset_matches(checked.get(bundle.name), bundle) or not _asset_matches(
+            checked.get(signature.name), signature):
+        raise ValidationError("release assets do not match the local bundle")
+
+
+def push_github(paths: Paths, bundle: Path, target: dict[str, Any], policy: dict[str, Any], *, runner=None) -> dict[str, Any]:
     runner = runner or subprocess_runner
-    repo = target["repo"]
-    refuse_public(repo)
+    repo = require_owner_name(target["repo"])
+    assert_repo_private(repo, runner)
     remote = _remote_for(target)
     checkout = Path(target["checkout"]) if target.get("checkout") else (
         paths.state_dir / "backups" / "github" / repo.replace("/", "__"))
     checkout.mkdir(parents=True, exist_ok=True)
+    os.chmod(checkout, 0o700)
     if not (checkout / ".git").is_dir():
         cp = _invoke(runner, ["git", "init", "-b", "main", str(checkout)])
         if cp.returncode != 0:
@@ -989,22 +1184,16 @@ def push_github(paths: Paths, bundle: Path, target: dict, policy: dict, *, runne
         if cp.returncode != 0:
             raise ValidationError("git commit of the recovery kit failed")
     # A commit can succeed while the push fails. The next run has a clean tree and must still push.
+    assert_repo_private(repo, runner)
     cp = _git(runner, checkout, ["push", "origin", "HEAD:main"])
     if cp.returncode != 0:
         raise ValidationError("git push of the recovery kit failed")
-    tag = bundle_tag(bundle.name)
-    sig = Path(str(bundle) + ".sig")
-    view = _invoke(runner, ["gh", "release", "view", tag, "--repo", repo, "--json", "assets"])
-    if view.returncode != 0:
-        cp = _invoke(runner, ["gh", "release", "create", tag, str(bundle), str(sig), "--repo", repo,
-                              "--title", tag, "--notes", GITHUB_NOTES])
-        if cp.returncode != 0:
-            raise ValidationError("gh release create failed")
+    _ensure_release_assets(repo, bundle, runner)
     pruned = _prune_github_releases(repo, policy, runner)
-    return {"type": "github_release", "ok": True, "repo": repo, "tag": tag, "pruned": pruned}
+    return {"type": "github_release", "ok": True, "repo": repo, "tag": bundle_tag(bundle.name), "pruned": pruned}
 
 
-def _prune_github_releases(repo: str, policy: dict, runner) -> list[str]:
+def _prune_github_releases(repo: str, policy: dict[str, Any], runner) -> list[str]:
     refuse_public(repo)
     cp = _invoke(runner, ["gh", "release", "list", "--repo", repo, "--limit", "400", "--json", "tagName"])
     if cp.returncode != 0:
@@ -1049,7 +1238,7 @@ def github_has_bundle(repo: str, bundle_name: str, runner) -> bool:
     return bundle_name in names and (bundle_name + ".sig") in names
 
 
-def push_targets(paths: Paths, bundle: Path, *, runner=None) -> list[dict]:
+def push_targets(paths: Paths, bundle: Path, *, runner=None) -> list[dict[str, Any]]:
     policy = load_policy(paths.config_dir)
     results = []
     for target in policy["backup_targets"]:
@@ -1065,7 +1254,7 @@ def push_targets(paths: Paths, bundle: Path, *, runner=None) -> list[dict]:
     return results
 
 
-def target_has_bundle(target: dict, bundle_name: str, *, runner=None) -> bool:
+def target_has_bundle(target: dict[str, Any], bundle_name: str, *, runner=None) -> bool:
     runner = runner or subprocess_runner
     sig_name = bundle_name + ".sig"
     if target["type"] == "agent_store":
@@ -1078,7 +1267,7 @@ def target_has_bundle(target: dict, bundle_name: str, *, runner=None) -> bool:
 
 
 # ---------------------------------------------------------------- hourly and doctor
-def hourly_backup(conn: sqlite3.Connection, paths: Paths, *, now: float | None = None, runner=None) -> dict:
+def hourly_backup(conn: sqlite3.Connection, paths: Paths, *, now: float | None = None, runner=None) -> dict[str, Any]:
     policy = load_policy(paths.config_dir)
     if policy["features"]["backup"] != "on":
         return {"skipped": True, "reason": "backup off"}
@@ -1096,7 +1285,7 @@ def hourly_backup(conn: sqlite3.Connection, paths: Paths, *, now: float | None =
     return {"skipped": False, "bundle": created["name"], "bytes": created["bytes"], "pushed": created["pushed"]}
 
 
-def _age_detail(bundle: Path | None, policy: dict, now: float) -> dict:
+def _age_detail(bundle: Path | None, policy: dict[str, Any], now: float) -> dict[str, Any]:
     if bundle is None:
         return {"check": "backup_age", "ok": False, "status": "FAIL", "detail": "no local bundle"}
     epoch = bundle_epoch(bundle)
@@ -1109,7 +1298,7 @@ def _age_detail(bundle: Path | None, policy: dict, now: float) -> dict:
             "detail": f"age_seconds={int(age)} max={int(limit)} bundle={bundle.name}"}
 
 
-def _venv_detail(bundle: Path | None) -> dict:
+def _venv_detail(bundle: Path | None) -> dict[str, Any]:
     if bundle is None:
         return {"check": "backup_venv_tools", "ok": False, "status": "FAIL", "detail": "no local bundle"}
     manifest = load_sidecar(bundle)
@@ -1119,7 +1308,8 @@ def _venv_detail(bundle: Path | None) -> dict:
     problems = []
     if not venv_py.is_file():
         problems.append("venv python missing")
-    env = manifest.get("environment") if isinstance(manifest.get("environment"), dict) else {}
+    raw_env = manifest.get("environment")
+    env = raw_env if isinstance(raw_env, dict) else {}
     current = _environment()
     for key, label in (("requirements_lock_sha256", "requirements.lock"),
                        ("tools_lock_sha256", "tooling/requirements-tools.lock")):
@@ -1136,7 +1326,7 @@ def _venv_detail(bundle: Path | None) -> dict:
     return {"check": "backup_venv_tools", "ok": ok, "status": "PASS" if ok else "FAIL", "detail": detail}
 
 
-def doctor_report(paths: Paths, *, now: float | None = None, runner=None) -> list[dict]:
+def doctor_report(paths: Paths, *, now: float | None = None, runner=None) -> list[dict[str, Any]]:
     policy = load_policy(paths.config_dir)
     if policy["features"]["backup"] != "on":
         return [
@@ -1170,14 +1360,15 @@ def doctor_report(paths: Paths, *, now: float | None = None, runner=None) -> lis
     return checks
 
 
-def status_report(paths: Paths, *, now: float | None = None) -> dict:
+def status_report(paths: Paths, *, now: float | None = None) -> dict[str, Any]:
     """Read-only. Does not open hooks.json and does not create a bundle."""
     policy = load_policy(paths.config_dir)
     moment = time.time() if now is None else now
     bundle = newest_bundle(bundles_dir(paths))
     age = None
-    if bundle is not None and bundle_epoch(bundle) is not None:
-        age = moment - bundle_epoch(bundle)
+    epoch = bundle_epoch(bundle) if bundle is not None else None
+    if epoch is not None:
+        age = moment - epoch
     return {"feature": policy["features"]["backup"], "latest": None if bundle is None else bundle.name,
             "age_seconds": None if age is None else int(age),
             "targets": [target["type"] for target in policy["backup_targets"]]}
@@ -1254,11 +1445,11 @@ def locate_bundle(paths: Paths, *, runner=None) -> tuple[Path, Path, list[Path]]
         bundle = newest_bundle(directory)
         if bundle is None:
             continue
-        epoch = bundle_epoch(bundle) or 0
-        ranked.append((epoch, rank, bundle, kit))
+        key = bundle_sort_key(bundle.name) or (0.0, 0)
+        ranked.append((key[0], key[1], rank, bundle, kit))
     repo = os.environ.get("OMG_BACKUP_GITHUB_REPO")
     if repo:
-        refuse_public(repo)
+        require_owner_name(repo)
         work = _private_dir()
         try:
             bundle, kit = fetch_github_release(repo, work, runner or subprocess_runner)
@@ -1272,7 +1463,8 @@ def locate_bundle(paths: Paths, *, runner=None) -> tuple[Path, Path, list[Path]]
             held_kit = hold / "kit"
             if _kit_complete(kit):
                 _publish_kit(kit, held_kit)
-            ranked.append((bundle_epoch(held_bundle) or 0, 10, held_bundle, held_kit))
+            held_key = bundle_sort_key(held_bundle.name) or (0.0, 0)
+            ranked.append((held_key[0], held_key[1], 10, held_bundle, held_kit))
         finally:
             shred_tree(work)
     if not ranked:
@@ -1280,7 +1472,7 @@ def locate_bundle(paths: Paths, *, runner=None) -> tuple[Path, Path, list[Path]]
             shred_tree(directory)
         raise NoBundle("no backup bundle found")
     ranked.sort()
-    _epoch, _rank, bundle, kit = ranked[-1]
+    _epoch, _sequence, _rank, bundle, kit = ranked[-1]
     if not _kit_complete(kit):
         for candidate in _kit_candidates(paths):
             if _kit_complete(candidate):
@@ -1293,16 +1485,29 @@ def locate_bundle(paths: Paths, *, runner=None) -> tuple[Path, Path, list[Path]]
     return bundle, kit, owned
 
 
+def _listed_asset_present(asset: dict[str, Any] | None) -> bool:
+    if not isinstance(asset, dict):
+        return False
+    size = asset.get("size")
+    if isinstance(size, int) and not isinstance(size, bool):
+        return size > 0
+    digest = asset.get("digest") or asset.get("sha256")
+    return isinstance(digest, str) and bool(digest)
+
+
 def fetch_github_release(repo: str, work: Path, runner) -> tuple[Path, Path]:
-    """Clone the kit and download the newest release assets. Never force-pushes. Tests pass a fake runner."""
-    refuse_public(repo)
-    remote = f"https://github.com/{repo}.git"
+    """Clone the kit and download the newest release that has both ciphertext and signature.
+
+    A release with a missing or empty asset is skipped. The next newest complete release is used.
+    """
+    name = require_owner_name(repo)
+    remote = f"https://github.com/{name}.git"
     refuse_public(remote)
     checkout = work / "repo"
     cp = _invoke(runner, ["git", "clone", "--depth", "1", "--", remote, str(checkout)])
     if cp.returncode != 0:
         raise NoBundle("could not clone the private backup repo")
-    cp = _invoke(runner, ["gh", "release", "list", "--repo", repo, "--limit", "100", "--json", "tagName"])
+    cp = _invoke(runner, ["gh", "release", "list", "--repo", name, "--limit", "100", "--json", "tagName"])
     if cp.returncode != 0:
         raise NoBundle("could not list backup releases")
     try:
@@ -1312,29 +1517,41 @@ def fetch_github_release(repo: str, work: Path, runner) -> tuple[Path, Path]:
     tags = []
     for row in rows:
         tag = row.get("tagName") or ""
-        epoch = bundle_epoch(Path(tag + ".tar.gpg"))
-        if epoch is not None:
-            tags.append((epoch, tag))
+        key = bundle_sort_key(tag + ".tar.gpg")
+        if key is not None:
+            tags.append((key, tag))
     if not tags:
         raise NoBundle("private repo has no backup releases")
     tags.sort()
-    tag = tags[-1][1]
-    assets = work / "assets"
-    assets.mkdir(mode=0o700)
-    cp = _invoke(runner, ["gh", "release", "download", tag, "--repo", repo, "--dir", str(assets),
-                          "--pattern", "omg-*"])
-    if cp.returncode != 0:
-        raise NoBundle("could not download the backup release")
-    bundle = assets / f"{tag}.tar.gpg"
-    if not bundle.is_file():
-        raise NoBundle("downloaded release has no bundle")
-    return bundle, checkout / "kit"
+    assets_root = work / "assets"
+    assets_root.mkdir(mode=0o700)
+    for _key, tag in reversed(tags):
+        listed = _release_assets(name, tag, runner)
+        bundle_name = f"{tag}.tar.gpg"
+        signature_name = bundle_name + ".sig"
+        if not listed or not _listed_asset_present(listed.get(bundle_name)) or not _listed_asset_present(
+                listed.get(signature_name)):
+            continue
+        dest = assets_root / tag
+        dest.mkdir(mode=0o700)
+        cp = _invoke(runner, ["gh", "release", "download", tag, "--repo", name, "--dir", str(dest),
+                              "--pattern", "omg-*"])
+        bundle = dest / bundle_name
+        signature = dest / signature_name
+        if cp.returncode != 0 or not bundle.is_file() or not signature.is_file():
+            continue
+        if not _asset_matches(listed.get(bundle_name), bundle) or not _asset_matches(listed.get(signature_name), signature):
+            continue
+        return bundle, checkout / "kit"
+    raise NoBundle("private repo has no release with a complete bundle and signature")
 
 
-def verify_signature(bundle: Path, kit: Path) -> None:
+def verify_signature(bundle: Path, kit: Path, expected_fingerprint: str) -> None:
+    """Verify the detached signature and require the pinned signing fingerprint."""
     sig = Path(str(bundle) + ".sig")
     if not sig.is_file() or sig.is_symlink() or bundle.is_symlink():
         raise BundleInvalid("bundle signature is missing")
+    expected = expected_fingerprint.strip().lower()
     tmp = _private_dir()
     try:
         home = tmp / "gpg"
@@ -1343,26 +1560,36 @@ def verify_signature(bundle: Path, kit: Path) -> None:
         cp = _gpg(home, ["--import", str(kit / "signing.pub")])
         if cp.returncode != 0:
             raise BundleInvalid("could not import the signing public key")
-        cp = _gpg(home, ["--trust-model", "always", "--verify", str(sig), str(bundle)])
+        imported = _fingerprint(home, UID_SIGNING).lower()
+        if imported != expected:
+            raise BundleInvalid("signing fingerprint does not match the pinned key")
+        cp = _gpg(home, ["--status-fd", "1", "--trust-model", "always", "--verify", str(sig), str(bundle)])
         if cp.returncode != 0:
+            raise BundleInvalid("bundle signature is not valid")
+        signed_by = ""
+        for line in (cp.stdout or "").splitlines():
+            if line.startswith("[GNUPG:] VALIDSIG "):
+                parts = line.split()
+                if len(parts) >= 3:
+                    signed_by = parts[2].lower()
+                    break
+        if signed_by != expected:
             raise BundleInvalid("bundle signature is not valid")
     finally:
         shred_tree(tmp)
 
 
 def decrypt_bundle(bundle: Path, kit: Path, dest_tar: Path, passphrase: str) -> None:
-    passphrase = _require_passphrase(passphrase) if len(passphrase) >= 12 else passphrase
     register_secret(passphrase)
     tmp = _private_dir()
     try:
-        phrase = _write_passphrase_file(tmp, passphrase)
         home = tmp / "gpg"
         home.mkdir(mode=0o700)
         os.chmod(home, 0o700)
-        cp = _gpg(home, ["--import", str(kit / "encryption.sec.asc")], passphrase_file=phrase)
+        cp = _gpg(home, ["--import", str(kit / "encryption.sec.asc")], passphrase=passphrase)
         if cp.returncode != 0:
             raise DecryptFailed("could not import the encryption secret")
-        cp = _gpg(home, ["--output", str(dest_tar), "--decrypt", str(bundle)], passphrase_file=phrase)
+        cp = _gpg(home, ["--output", str(dest_tar), "--decrypt", str(bundle)], passphrase=passphrase)
         if cp.returncode != 0 or not dest_tar.is_file():
             raise DecryptFailed("could not decrypt bundle")
         os.chmod(dest_tar, 0o600)
@@ -1438,7 +1665,7 @@ def _write_mode(dest: Path, data: bytes, mode: int) -> None:
         del data
 
 
-def apply_snapshot(tree: Path, paths: Paths, manifest: dict, bundle: Path) -> None:
+def apply_snapshot(tree: Path, paths: Paths, manifest: dict[str, Any], bundle: Path) -> None:
     databases = [path for path in (tree / "state").glob("*.sqlite3") if path.is_file() and not path.is_symlink()]
     if len(databases) != 1:
         raise BundleInvalid("bundle must contain exactly one sqlite database")
@@ -1495,7 +1722,7 @@ def _relation(paths: Paths, snapshot_db: Path) -> str:
     return relate_streams(local_events, remote_events)
 
 
-def _emit(payload: dict) -> None:
+def _emit(payload: dict[str, Any]) -> None:
     print(json.dumps(redact_obj(payload), indent=2, sort_keys=True))
 
 
@@ -1518,7 +1745,7 @@ def run_recover(*, check: bool, passphrase: str, runner=None) -> int:
             print(redact(exc.message), file=sys.stderr)
             return EXIT_VERIFY
         try:
-            verify_signature(bundle, kit)
+            verify_signature(bundle, kit, pinned_signing_fingerprint(paths, kit))
         except BundleInvalid as exc:
             print(redact(exc.message), file=sys.stderr)
             return EXIT_VERIFY

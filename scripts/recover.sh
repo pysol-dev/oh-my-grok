@@ -46,7 +46,7 @@ if [ -z "${OMG_BACKUP_PASSPHRASE:-}" ]; then
 fi
 
 if [ "$CHECK" = 0 ]; then
-  "$ROOT/scripts/bootstrap.sh" || exit 8
+  env -u OMG_BACKUP_PASSPHRASE "$ROOT/scripts/bootstrap.sh" || exit 8
 fi
 
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
@@ -58,6 +58,7 @@ set +e
 python3 -m oh_my_grok.recover "${args[@]}"
 rc=$?
 set -e
+unset OMG_BACKUP_PASSPHRASE
 if [ "$rc" -ne 0 ]; then
   exit "$rc"
 fi
