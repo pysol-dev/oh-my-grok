@@ -996,6 +996,14 @@ def test_github_remote_schemes_are_only_https_and_ssh(tmp_path):
         "file://127.0.0.1/tmp/bare.git",
         "file://localhost/tmp/../bare.git",
         "file://user@localhost/tmp/bare.git",
+        f"https://github.com/{repo}.git;params",
+        f"https://github.com/{repo}.git;",
+        f"https://github.com/{repo}.git?",
+        f"https://github.com/{repo}.git#",
+        "https://github.com/example%2fprivate-backups.git",
+        "https://github.com/example%2Fprivate-backups.git",
+        f"ssh://git@github.com/{repo}.git;params",
+        "ssh://git@github.com/example%2fprivate-backups.git",
     )
     for remote in rejected:
         with pytest.raises(ValidationError):
@@ -1027,6 +1035,12 @@ def test_push_rebuilds_the_github_url_and_refuses_dot_segments(omg_home, tmp_pat
             envs.append(env)
             if "config" in argv and "insteadof" in argv:
                 return subprocess.CompletedProcess(argv, 1, "", "")
+            if "get-url" in argv and "--push" in argv:
+                checkout = argv[argv.index("-C") + 1]
+                url = ("ssh://git@github.com/Example/Private-Backups.git"
+                       if str(checkout).endswith("ssh-co")
+                       else "https://github.com/Example/Private-Backups.git")
+                return subprocess.CompletedProcess(argv, 0, url + "\n", "")
             return subprocess.CompletedProcess(argv, 0, "", "")
         gh = _fake_gh(argv, releases)
         if gh is not None:
@@ -1039,8 +1053,8 @@ def test_push_rebuilds_the_github_url_and_refuses_dot_segments(omg_home, tmp_pat
     durability.push_github(paths, bundle, {"type": "github_release", "repo": repo, "remote": decorated,
                                            "checkout": str(tmp_path / "https-co")}, policy, runner=runner)
     added = [cmd for cmd in calls if cmd[0] == "git" and "remote" in cmd and "add" in cmd]
-    assert added == [["git", "-C", str(tmp_path / "https-co"), "remote", "add", "origin",
-                      "https://github.com/Example/Private-Backups.git"]]
+    assert added == [["git", "-c", "core.hooksPath=/dev/null", "-C", str(tmp_path / "https-co"),
+                      "remote", "add", "origin", "https://github.com/Example/Private-Backups.git"]]
     assert all(env is not None and env.get("GIT_CONFIG_GLOBAL") == "/dev/null" and env.get("GIT_CONFIG_NOSYSTEM") == "1"
                for env in envs)
     assert all("GIT_CONFIG_COUNT" not in (env or {}) for env in envs)
@@ -1125,3 +1139,102 @@ def test_recover_documents_the_internal_error_exit():
     table = text.split("### 6.2 Exit codes", 1)[1].split("## 7.", 1)[0]
     assert "| 1 |" in table
     assert "internal error" in table.lower()
+    header = (ROOT / "scripts" / "recover.sh").read_text().split("set -euo pipefail", 1)[0]
+    assert "internal error" in header.lower()
+
+
+def _kit_and_remotes(tmp_path):
+    """Two bare repos and a kit. The hook, when a test adds one, only writes a marker file."""
+    paths = get_paths()
+    kit = durability.kit_dir(paths)
+    kit.mkdir(parents=True)
+    for name in KIT_FILES:
+        (kit / name).write_text("kit-" + name + "\n")
+    intended = tmp_path / "intended.git"
+    decoy = tmp_path / "decoy.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(intended)], check=True, capture_output=True)
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(decoy)], check=True, capture_output=True)
+    bundle = tmp_path / "omg-20261117T100000Z.tar.gpg"
+    bundle.write_bytes(b"cipher")
+    (tmp_path / (bundle.name + ".sig")).write_bytes(b"sig")
+    return paths, kit, intended, decoy, bundle
+
+
+def _push_with_real_git(paths, bundle, intended, checkout, releases):
+    def runner(argv, cwd=None, env=None):
+        if argv[0] == "git":
+            return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=60, check=False)
+        gh = _fake_gh(argv, releases)
+        if gh is not None:
+            return gh
+        raise AssertionError(argv)
+
+    policy = {"backup_keep_hourly": 4, "backup_keep_daily": 2, "backup_size_cap_bytes": 1_000_000}
+    return durability.push_github(
+        paths, bundle, {"type": "github_release", "repo": "example/private-backups", "remote": str(intended),
+                        "checkout": str(checkout)}, policy, runner=runner)
+
+
+def _has_head(repo: Path) -> bool:
+    return subprocess.run(["git", "--git-dir", str(repo), "rev-parse", "HEAD"],
+                          capture_output=True, check=False).returncode == 0
+
+
+def test_git_config_parameters_cannot_redirect_the_kit_push(omg_home, tmp_path, monkeypatch):
+    paths, _kit, intended, decoy, bundle = _kit_and_remotes(tmp_path)
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", f"'url.{decoy}.pushinsteadof'='{intended}'")
+    seen = {}
+    releases: dict[str, list[Path]] = {}
+
+    def runner(argv, cwd=None, env=None):
+        if argv[0] == "git":
+            seen["env"] = env
+            return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=60, check=False)
+        gh = _fake_gh(argv, releases)
+        if gh is not None:
+            return gh
+        raise AssertionError(argv)
+
+    result = durability.push_github(
+        paths, bundle, {"type": "github_release", "repo": "example/private-backups", "remote": str(intended),
+                        "checkout": str(tmp_path / "checkout")},
+        {"backup_keep_hourly": 4, "backup_keep_daily": 2, "backup_size_cap_bytes": 1_000_000}, runner=runner)
+    assert result["ok"] is True
+    assert seen["env"] is not None and "GIT_CONFIG_PARAMETERS" not in seen["env"]
+    assert _has_head(intended)
+    assert not _has_head(decoy)
+
+
+def test_pushurl_cannot_redirect_the_kit_push(omg_home, tmp_path):
+    paths, kit, intended, decoy, bundle = _kit_and_remotes(tmp_path)
+    checkout = tmp_path / "checkout"
+    releases: dict[str, list[Path]] = {}
+    result = _push_with_real_git(paths, bundle, intended, checkout, releases)
+    assert result["ok"] is True and _has_head(intended) and not _has_head(decoy)
+    subprocess.run(["git", "-C", str(checkout), "remote", "set-url", "--push", "origin", str(decoy)],
+                   check=True, capture_output=True)
+    (kit / "signing.pub").write_text("kit-signing.pub\nchanged\n")
+    again = _push_with_real_git(paths, bundle, intended, checkout, releases)
+    assert again["ok"] is True
+    assert not _has_head(decoy)
+    pushed = subprocess.run(["git", "-C", str(checkout), "remote", "get-url", "--push", "origin"],
+                            check=True, capture_output=True, text=True).stdout.strip()
+    assert pushed == str(intended)
+
+
+def test_pre_push_hook_cannot_run_during_publication(omg_home, tmp_path):
+    """The hook only writes a marker. It must not call git or start another process."""
+    paths, kit, intended, decoy, bundle = _kit_and_remotes(tmp_path)
+    checkout = tmp_path / "checkout"
+    releases: dict[str, list[Path]] = {}
+    first = _push_with_real_git(paths, bundle, intended, checkout, releases)
+    assert first["ok"] is True
+    marker = tmp_path / "hook-marker"
+    hook = checkout / ".git" / "hooks" / "pre-push"
+    hook.write_text(f"#!/bin/sh\nprintf x >> {marker}\nexit 0\n")
+    os.chmod(hook, 0o700)
+    (kit / "signing.pub").write_text("kit-signing.pub\nchanged\n")
+    again = _push_with_real_git(paths, bundle, intended, checkout, releases)
+    assert again["ok"] is True
+    assert not marker.exists()
+    assert not _has_head(decoy)

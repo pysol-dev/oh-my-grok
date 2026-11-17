@@ -7,6 +7,7 @@
 #
 # Exit codes (spec/DURABILITY.md):
 #   0  restored, already current, or local state is newer (nothing overwritten)
+#   1  internal error caught by python3 -m oh_my_grok.recover; a traceback is not printed
 #   2  usage, or python3 / gpg / OMG_BACKUP_PASSPHRASE missing
 #   8  scripts/bootstrap.sh failed
 #  10  no bundle found
@@ -28,7 +29,7 @@ for arg in "$@"; do
   case "$arg" in
     --check) CHECK=1 ;;
     -h|--help)
-      sed -n '2,22p' "$0"
+      sed -n '2,23p' "$0"
       exit 0
       ;;
     *)

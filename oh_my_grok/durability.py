@@ -97,22 +97,33 @@ def mcp_command_record() -> str:
 
 
 def _path_segments(path: str) -> list[str] | None:
-    """Segments of a percent-decoded path. ``.``, ``..``, and empty segments are rejected.
+    """Segments split on raw slashes, then percent-decoded.
 
-    One leading slash and one trailing slash are the URL's own delimiters. Anything else
-    (including ``%2e%2e`` and ``%2f``) is part of the path git would collapse.
+    ``%2f`` is not a separator. A segment that decodes to empty, ``.``, ``..``, or another
+    slash is rejected. One leading slash and one trailing slash are the URL's delimiters.
     """
-    parts = unquote(path or "").split("/")
-    if parts and parts[0] == "":
-        parts = parts[1:]
-    if parts and parts[-1] == "":
-        parts = parts[:-1]
-    if not parts or any(part in ("", ".", "..") for part in parts):
+    raw_parts = (path or "").split("/")
+    if raw_parts and raw_parts[0] == "":
+        raw_parts = raw_parts[1:]
+    if raw_parts and raw_parts[-1] == "":
+        raw_parts = raw_parts[:-1]
+    if not raw_parts:
         return None
+    parts = []
+    for raw in raw_parts:
+        decoded = unquote(raw)
+        if decoded in ("", ".", "..") or "/" in decoded:
+            return None
+        parts.append(decoded)
     return parts
 
 
 def _owner_name_from_path(path: str) -> str | None:
+    """Repository name from a URL path.
+
+    A local filesystem path does not come through here. ``canonical_push_url`` returns
+    that path unchanged (the local-path pass-through) and never rebuilds it as a GitHub URL.
+    """
     parts = _path_segments(path)
     if parts is None or len(parts) != 2:
         return None
@@ -133,14 +144,15 @@ def canonical_github_repo(value: str) -> str | None:
     """``owner/name`` when ``value`` is an https or ssh URL for github.com exactly, else None.
 
     Trailing dots on the host and a ``.git`` suffix on the repository name are ignored.
-    The path must be exactly ``/owner/name[.git][/]`` after percent-decoding. ``.``, ``..``,
-    and empty segments are rejected rather than collapsed. ``http``, ``git``,
+    Segments are split on raw slashes and then percent-decoded, and must be exactly
+    ``/owner/name[.git][/]``. ``.``, ``..``, empty segments, and a segment containing ``%2f``
+    are rejected. ``;``, ``?``, and ``#`` are rejected even when empty. ``http``, ``git``,
     ``persistent-https``, scp-like ``git@host:path``, and a schemeless ``github.com/owner/name``
     are not github remotes. ``www.github.com``, ``ssh.github.com``, aliases, and IP literals
     are not github.com. A local filesystem path returns None.
     """
     raw = (value or "").strip()
-    if not raw:
+    if not raw or any(mark in raw for mark in (";", "?", "#")):
         return None
     if "://" not in raw:
         if _OWNER_NAME.fullmatch(raw):
@@ -162,7 +174,7 @@ def _file_url_path(value: str) -> str | None:
     ``file:owner/name.git`` (no slashes) is scp syntax for a host named ``file`` and is rejected.
     """
     text = (value or "").strip()
-    if not text.lower().startswith("file://"):
+    if not text.lower().startswith("file://") or any(mark in text for mark in (";", "?", "#")):
         return None
     parsed = urlparse(text)
     if (parsed.scheme or "").lower() != "file":
@@ -443,8 +455,9 @@ def _git_publish_env() -> dict[str, str]:
     """
     env = _scrub_env()
     for key in list(env):
-        if (key == "GIT_CONFIG_COUNT" or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
-                or key in {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"}):
+        if (key in {"GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL",
+                    "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"}
+                or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))):
             env.pop(key, None)
     env["GIT_CONFIG_GLOBAL"] = "/dev/null"
     env["GIT_CONFIG_NOSYSTEM"] = "1"
@@ -1227,7 +1240,9 @@ def _remote_for(target: dict[str, Any]) -> str:
 
 
 def _git(runner, checkout: Path, args: list[str]):
-    return _invoke(runner, ["git", "-C", str(checkout), *args], env=_git_publish_env())
+    """One publication git command. Hooks and inherited URL rewrites are disabled."""
+    return _invoke(runner, ["git", "-c", "core.hooksPath=/dev/null", "-C", str(checkout), *args],
+                   env=_git_publish_env())
 
 
 def _refuse_git_redirect(runner, checkout: Path) -> None:
@@ -1237,6 +1252,23 @@ def _refuse_git_redirect(runner, checkout: Path) -> None:
         raise ValidationError("could not verify that git will not redirect the kit push")
     if cp.returncode == 0 and (cp.stdout or "").strip():
         raise ValidationError("refusing git push: url rewrite would send the kit elsewhere")
+
+
+def _require_canonical_push_url(runner, checkout: Path, remote: str) -> None:
+    """``git remote get-url --push`` must be the rebuilt URL. A different pushurl is removed."""
+    def current() -> str | None:
+        cp = _git(runner, checkout, ["remote", "get-url", "--push", "origin"])
+        if cp.returncode != 0:
+            return None
+        return (cp.stdout or "").strip()
+
+    if current() == remote:
+        return
+    unset = _git(runner, checkout, ["config", "--unset-all", "remote.origin.pushurl"])
+    if unset.returncode not in (0, 5):
+        raise ValidationError("refusing git push: push URL would send the kit elsewhere")
+    if current() != remote:
+        raise ValidationError("refusing git push: push URL would send the kit elsewhere")
 
 
 def assert_repo_private(repo: str, runner) -> None:
@@ -1320,7 +1352,8 @@ def push_github(paths: Paths, bundle: Path, target: dict[str, Any], policy: dict
     checkout.mkdir(parents=True, exist_ok=True)
     os.chmod(checkout, 0o700)
     if not (checkout / ".git").is_dir():
-        cp = _invoke(runner, ["git", "init", "-b", "main", str(checkout)], env=_git_publish_env())
+        cp = _invoke(runner, ["git", "-c", "core.hooksPath=/dev/null", "init", "-b", "main", str(checkout)],
+                     env=_git_publish_env())
         if cp.returncode != 0:
             raise ValidationError("git init of the recovery checkout failed")
         cp = _git(runner, checkout, ["remote", "add", "origin", remote])
@@ -1350,14 +1383,16 @@ def push_github(paths: Paths, bundle: Path, target: dict[str, Any], policy: dict
     _git(runner, checkout, ["add", "--", "kit", "README.md"])
     status = _git(runner, checkout, ["status", "--porcelain", "--", "kit", "README.md"])
     if (status.stdout or "").strip():
-        cp = _invoke(runner, ["git", "-C", str(checkout), "-c", "user.name=omg-backup",
-                              "-c", "user.email=omg-backup@localhost", "commit", "-m", "update recovery kit"],
+        cp = _invoke(runner, ["git", "-c", "core.hooksPath=/dev/null", "-C", str(checkout),
+                              "-c", "user.name=omg-backup", "-c", "user.email=omg-backup@localhost",
+                              "commit", "-m", "update recovery kit"],
                      env=_git_publish_env())
         if cp.returncode != 0:
             raise ValidationError("git commit of the recovery kit failed")
     # A commit can succeed while the push fails. The next run has a clean tree and must still push.
     assert_repo_private(repo, runner)
     _refuse_git_redirect(runner, checkout)
+    _require_canonical_push_url(runner, checkout, remote)
     cp = _git(runner, checkout, ["push", "origin", "HEAD:main"])
     if cp.returncode != 0:
         raise ValidationError("git push of the recovery kit failed")
