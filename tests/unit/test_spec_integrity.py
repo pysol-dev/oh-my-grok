@@ -17,3 +17,13 @@ def test_sibling_spec_records_original_hash_and_every_supersession():
     assert ORIGINAL_SHA256 in text
     for n in range(1, 10):
         assert f"SUP-{n}" in text
+
+
+def test_durability_spec_pins_implementation_bytes():
+    """Durability work must not edit spec/IMPLEMENTATION.md. The pin is the bytes, not a copy of the text."""
+    text = (ROOT / "spec" / "DURABILITY.md").read_text()
+    assert ORIGINAL_SHA256 in text
+    data = (ROOT / "spec" / "IMPLEMENTATION.md").read_bytes()
+    assert hashlib.sha256(data).hexdigest() == ORIGINAL_SHA256
+    recorded = (ROOT / "spec" / "IMPLEMENTATION.md.sha256").read_text().split()[0]
+    assert recorded == ORIGINAL_SHA256

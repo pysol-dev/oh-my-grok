@@ -38,6 +38,13 @@ DEFAULT_POLICY = {
     "watchdog_stale_intervals": 3,
     "watchdog_log_max_bytes": 1_048_576,
     "watchdog_log_backups": 3,
+    # Encrypted durability bundles (features.backup). Defaults keep the hourly step off.
+    "backup_interval_seconds": 3600,
+    "backup_max_age_seconds": 7200,
+    "backup_keep_hourly": 48,
+    "backup_keep_daily": 14,
+    "backup_size_cap_bytes": 1_073_741_824,
+    "backup_targets": [],
     "features": {},
 }
 
@@ -85,7 +92,20 @@ def load_policy(config_dir: Path) -> dict:
             raise ValidationError(f"unknown policy keys: {sorted(unknown)}")
         pol.update(data)
     pol["features"] = features.normalize(pol.get("features"))
+    _validate_backup_policy(pol)
     return pol
+
+
+def _validate_backup_policy(pol: dict) -> None:
+    for key in ("backup_interval_seconds", "backup_max_age_seconds", "backup_keep_hourly",
+                "backup_keep_daily", "backup_size_cap_bytes"):
+        value = pol[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValidationError(f"{key} must be a positive integer")
+    if not isinstance(pol.get("backup_targets"), list):
+        raise ValidationError("backup_targets must be a list")
+    from .durability import validate_targets
+    validate_targets(pol["backup_targets"])
 
 
 _PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")

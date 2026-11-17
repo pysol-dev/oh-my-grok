@@ -64,8 +64,10 @@ def cmd_doctor(args) -> int:
     paths = get_paths()
     checks = []
 
-    def add(name, ok, detail=""):
-        checks.append({"check": name, "ok": bool(ok), "detail": detail})
+    def add(name, ok, detail="", status=None):
+        if status is None:
+            status = "PASS" if ok else "FAIL"
+        checks.append({"check": name, "ok": bool(ok), "status": status, "detail": detail})
 
     add("python>=3.11", sys.version_info >= (3, 11), sys.version.split()[0])
     try:
@@ -151,6 +153,12 @@ def cmd_doctor(args) -> int:
     except Exception as ex:  # noqa: BLE001 - doctor reports the failure instead of crashing
         wd = None
         add("watchdog", False, redact(str(ex))[:300])
+    try:
+        from . import durability
+        for item in durability.doctor_report(paths):
+            add(item["check"], item["ok"], item.get("detail", ""), status=item.get("status"))
+    except Exception as ex:  # noqa: BLE001 - doctor reports the failure instead of crashing
+        add("backup_age", False, redact(str(ex))[:300])
     # informational (do not fail doctor): live wiring is the operator's job
     info = {"hooks_configured": hook_status(paths), "lsp_tools": lsp_info,
             "features_default": load_policy(paths.config_dir)["features"]}
@@ -172,7 +180,7 @@ def cmd_doctor(args) -> int:
         op = {"state": "NOT OPERATIONAL: evidence could not be read (" + redact(str(ex))[:100] + ")", "criteria": {}}
     info["operational_criteria"] = op["criteria"]
     data = {"ok": ok, "version": __version__, "checks": checks, "info": info, "live_status": op["state"]}
-    lines = [f"{'PASS' if c['ok'] else 'FAIL'}  {c['check']}  {c['detail']}" for c in checks]
+    lines = [f"{c.get('status') or ('PASS' if c['ok'] else 'FAIL')}  {c['check']}  {c['detail']}" for c in checks]
     lines.append("hooks configured: " + ", ".join(f"{r}={v}" for r, v in info["hooks_configured"].items()))
     lines.append(data["live_status"])
     lines.append("doctor: " + ("OK" if ok else "PROBLEMS FOUND"))
@@ -200,9 +208,59 @@ def cmd_migrate(args) -> int:
 
 
 def cmd_backup(args) -> int:
+    if getattr(args, "out", None):
+        e = _engine()
+        try:
+            p = db.backup(e.conn, Path(args.out))
+        finally:
+            e.close()
+        _out(args, {"backup": str(p)}, f"backup written (integrity ok): {p}")
+        return EXIT_OK
+    return cmd_backup_bundle(args)
+
+
+def _passphrase() -> str:
+    phrase = os.environ.get("OMG_BACKUP_PASSPHRASE")
+    if not phrase:
+        raise ValidationError("OMG_BACKUP_PASSPHRASE is not set")
+    return phrase
+
+
+def cmd_backup_init_key(args) -> int:
+    from . import durability
+    paths = get_paths()
+    kit = Path(args.kit) if getattr(args, "kit", None) else None
+    info = durability.init_keys(paths, passphrase=_passphrase(), kit=kit)
+    _out(args, info, f"recovery kit {info['kit']}")
+    return EXIT_OK
+
+
+def cmd_backup_bundle(args) -> int:
+    from . import durability
     e = _engine()
-    p = db.backup(e.conn, Path(args.out))
-    _out(args, {"backup": str(p)}, f"backup written (integrity ok): {p}")
+    try:
+        info = durability.create_bundle(e.conn, e.paths, push=not getattr(args, "no_push", False))
+    finally:
+        e.close()
+    _out(args, info, f"bundle {info['name']} ({info['bytes']} bytes, integrity ok)")
+    return EXIT_OK
+
+
+def cmd_backup_push(args) -> int:
+    from . import durability
+    paths = get_paths()
+    bundle = durability.newest_bundle(durability.bundles_dir(paths))
+    if bundle is None:
+        raise durability.NoBundle("no local bundle to push")
+    pushed = durability.push_targets(paths, bundle)
+    _out(args, {"bundle": bundle.name, "pushed": pushed}, f"pushed {bundle.name}")
+    return EXIT_OK
+
+
+def cmd_backup_status(args) -> int:
+    from . import durability
+    info = durability.status_report(get_paths())
+    _out(args, info, f"backup={info['feature']} latest={info['latest'] or 'none'}")
     return EXIT_OK
 
 
@@ -824,8 +882,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("export", cmd_export, "write a sanitized evidence pack")
     sp.add_argument("job")
     sp.add_argument("--out", required=True)
-    sp = add("backup", cmd_backup, "consistent SQLite backup (backup API + integrity check)")
-    sp.add_argument("--out", required=True)
+    sp = add("backup", cmd_backup, "encrypted durability bundle; --out writes a raw SQLite snapshot instead")
+    sp.add_argument("--out", help="write a raw integrity-checked SQLite snapshot to this path")
+    sp.add_argument("--no-push", action="store_true", help="do not publish the bundle to configured targets")
+    backup_cmds = sp.add_subparsers(dest="backup_cmd")
+    sp = add("init-key", cmd_backup_init_key, "create the encryption keypair and the on-box signing key",
+             parent=backup_cmds)
+    sp.add_argument("--kit", help="recovery kit directory (default: state/recovery-kit)")
+    add("push", cmd_backup_push, "publish the newest local bundle to configured targets", parent=backup_cmds)
+    add("status", cmd_backup_status, "report backup flag, newest bundle age, and target types", parent=backup_cmds)
     sp = add("restore", cmd_restore, "restore a backup (interactive TTY; stop omg processes first)")
     sp.add_argument("src")
     hook = sub.add_parser("hook", help="webhook secrets").add_subparsers(dest="hook_cmd", required=True)

@@ -16,7 +16,7 @@ OMG_CLI = str(ROOT / "omg")
 DOCUMENTED = [["features"], ["boulder"], ["receipts"], ["docs"], ["attest"], ["lsp", "status"], ["lsp", "canary"], ["lsp", "check"], ["heal", "collect"], ["heal", "show"], ["heal", "prune-duplicates"], ["doctor"], ["migrate"], ["status"], ["submit"], ["plan", "show"], ["approve"], ["deny"], ["cancel"],
               ["watchdog", "run"], ["watchdog", "start"], ["watchdog", "stop"], ["watchdog", "status"], ["watchdog", "ensure"],
               ["reconcile"], ["hook", "set"], ["hook", "check"], ["hook", "list"], ["hook", "serve"], ["test"], ["export"],
-              ["resume"], ["backup"], ["restore"], ["roles", "list"], ["roles", "bind"], ["roles", "import"]]
+              ["resume"], ["backup"], ["backup", "init-key"], ["backup", "push"], ["backup", "status"], ["restore"], ["roles", "list"], ["roles", "bind"], ["roles", "import"]]
 
 
 def run(args, env=None, input_=None):

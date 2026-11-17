@@ -401,6 +401,9 @@ def tick(engine: Engine, *, now: float | None = None, interval: float | None = N
             "heal_collect": _step(lambda: _heal(engine)),
             "stalls": _step(lambda: _stalls(engine, policy, moment, wake=mode == features.ON)),
         }
+    # backup is its own flag. The watchdog loop is the clock; off skips this step and does not
+    # change reconcile, heal, or stalls.
+    outcomes["backup"] = _step(lambda: _backup_step(engine))
     for name, step in outcomes.items():
         if not step.get("ok"):
             log.error("step %s failed: %s", name, step.get("error", ""))
@@ -408,6 +411,13 @@ def tick(engine: Engine, *, now: float | None = None, interval: float | None = N
         "unix": moment, "ts": db.utcnow(), "mode": mode, "interval_seconds": step_interval, "steps": outcomes})
     log.info("tick mode=%s %s", mode, " ".join(_tick_label(name, step) for name, step in outcomes.items()))
     return payload
+
+
+def _backup_step(engine: Engine) -> dict:
+    from . import durability
+    if engine.policy["features"].get("backup") != features.ON:
+        return {"skipped": True, "reason": "backup off"}
+    return durability.hourly_backup(engine.conn, engine.paths)
 
 
 def _stalls(engine: Engine, policy: dict, now: float, *, wake: bool) -> dict:

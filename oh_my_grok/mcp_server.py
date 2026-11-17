@@ -1,6 +1,7 @@
 """stdio MCP server 'omg' (official `mcp` SDK, MCPServer API).
 
-Tools (exactly): submit, claim, context, checkpoint, complete, status, reconcile, cancel, escalate, docs, heal.
+Tools (exactly): submit, claim, context, checkpoint, complete, status, reconcile, cancel, escalate, docs, heal,
+backup_status.
 There are deliberately NO approve / ship / mark_done / shell / secret tools: approval is human-only via omg.
 stdout carries MCP protocol only; all logging goes to stderr and is redacted.
 Run:  <python> <code root>/oh_my_grok/mcp_server.py   (the exact command: `omg mcp-command`)
@@ -28,7 +29,7 @@ from oh_my_grok.paths import env_get  # noqa: E402
 from oh_my_grok.redact import redact, redact_obj, redact_urls  # noqa: E402
 
 TOOL_NAMES = ("submit", "claim", "context", "checkpoint", "complete", "status", "reconcile", "cancel", "escalate",
-              "docs", "heal")
+              "docs", "heal", "backup_status")
 UUID = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 Id = Annotated[str, Field(pattern=UUID, description="UUID")]
 
@@ -234,6 +235,15 @@ def docs(job_id: Id, query: Annotated[str, Field(min_length=1, max_length=2000)]
          task_id: Annotated[str | None, Field(pattern=UUID)] = None) -> dict[str, Any]:
     return _call(lambda e: e.docs(job_id, query, library_name, library_id, task_id,
                                   actor=(e._task(job_id, task_id)["role"] if task_id else "librarian")))
+
+
+@server.tool(description="Report the backup feature mode, the newest local bundle name and age, and the configured "
+                         "target types. Does not read hooks and does not create a bundle.")
+def backup_status() -> dict[str, Any]:
+    def run(e: Engine) -> dict[str, Any]:
+        from oh_my_grok.durability import status_report
+        return status_report(e.paths)
+    return _call(run)
 
 
 def main():

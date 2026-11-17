@@ -1,0 +1,1240 @@
+"""Durability bundles: keys, encryption, retention, off-box fakes, restore decisions.
+
+Hook bytes and the passphrase are asserted by absence. A failure says that secret material
+appeared; it does not print the material.
+"""
+import io
+import json
+import os
+import subprocess
+import tarfile
+import tempfile
+from contextlib import redirect_stdout
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+from oh_my_grok import durability, features
+from oh_my_grok.durability import (
+    EXIT_CHECK_BEHIND,
+    EXIT_DIVERGED,
+    EXIT_OK,
+    EXIT_VERIFY,
+    KIT_FILES,
+    relate_streams,
+    run_recover,
+)
+from oh_my_grok.engine import Engine
+from oh_my_grok.errors import Conflict, ValidationError
+from oh_my_grok.hooks import set_hook
+from oh_my_grok.paths import CODE_ROOT, get_paths
+from oh_my_grok.transport import HttpResult, post_json
+
+ROOT = Path(__file__).resolve().parents[2]
+OMG = str(ROOT / "omg")
+PASSPHRASE = "test-only-passphrase-0123456789"
+HOOK_URL = "https://durability.invalid/hook/ZZDURABILITYPATH"
+HOOK_KEY = "hk_DURABILITY_SENTINEL_0123456789"
+
+
+def _gh_assets(paths: list[Path]) -> str:
+    assets = [{"name": path.name, "size": path.stat().st_size} for path in paths]
+    return json.dumps({"assets": assets})
+
+
+def _remember_release(argv, releases: dict[str, list[Path]]) -> subprocess.CompletedProcess[str]:
+    tag = argv[3]
+    files = []
+    for arg in argv[4:]:
+        if str(arg).startswith("--"):
+            break
+        files.append(Path(arg))
+    releases[tag] = files
+    return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+def _fake_gh(argv, releases: dict[str, list[Path]]) -> subprocess.CompletedProcess[str] | None:
+    """Handle gh for a private repo. Returns None when argv is not gh."""
+    if not argv or argv[0] != "gh":
+        return None
+    if argv[:2] == ["gh", "api"]:
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"private": True, "visibility": "private"}), "")
+    if argv[:3] == ["gh", "release", "view"]:
+        tag = argv[3]
+        if tag not in releases:
+            return subprocess.CompletedProcess(argv, 1, "", "missing")
+        return subprocess.CompletedProcess(argv, 0, _gh_assets(releases[tag]), "")
+    if argv[:3] in (["gh", "release", "create"], ["gh", "release", "upload"]):
+        return _remember_release(argv, releases)
+    if argv[:3] == ["gh", "release", "list"]:
+        return subprocess.CompletedProcess(argv, 0, json.dumps([{"tagName": tag} for tag in releases]), "")
+    if argv[:3] == ["gh", "release", "delete"]:
+        releases.pop(argv[3], None)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    return None
+
+
+@pytest.fixture(autouse=True)
+def _gpg_agent_per_test(tmp_path, monkeypatch):
+    """Each test gets its own GNUPGHOME, and agents started for that home are stopped."""
+    home = tmp_path / "gnupg-home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setenv("GNUPGHOME", str(home))
+    yield
+    targets = [home]
+    omg = os.environ.get("OMG_HOME")
+    if omg:
+        targets.append(Path(omg) / "state" / "secrets" / "backup-gnupg")
+    short = Path(tempfile.gettempdir()) / f"omg-gnupg-{os.getuid()}"
+    if short.is_dir():
+        targets.extend(path for path in short.iterdir() if path.is_symlink() or path.is_dir())
+    for directory in targets:
+        subprocess.run(["gpgconf", "--homedir", str(directory), "--kill", "gpg-agent"],
+                       capture_output=True, check=False)
+    agent_env = os.environ.copy()
+    agent_env["GNUPGHOME"] = str(home)
+    agent_env.pop("OMG_BACKUP_PASSPHRASE", None)
+    subprocess.run(["gpgconf", "--kill", "gpg-agent"], env=agent_env, capture_output=True, check=False)
+
+
+def _absent(blob, needle: str) -> None:
+    raw = blob if isinstance(blob, bytes) else str(blob).encode()
+    if needle.encode() in raw:
+        raise AssertionError("secret material appeared in command output")
+
+
+def _policy(**extra):
+    path = Path(os.environ["OMG_CONFIG_DIR"]) / "policy.json"
+    data = json.loads(path.read_text())
+    data.update(extra)
+    path.write_text(json.dumps(data))
+
+
+def _init(monkeypatch):
+    monkeypatch.setenv("OMG_BACKUP_PASSPHRASE", PASSPHRASE)
+    return durability.init_keys(get_paths(), passphrase=PASSPHRASE)
+
+
+def _seed():
+    engine = Engine(transport=lambda *a, **k: HttpResult(200, None, None))
+    job = engine.submit("Fix calc.add in the synthetic fixture", "durability-seed-0001", mode="fixture",
+                        acceptance_criteria=["unittest suite exits 0"])
+    set_hook(get_paths(), "explorer", HOOK_URL, HOOK_KEY)
+    (get_paths().logs_dir / "drill.log").write_text("drill-log\n")
+    engine.close()
+    return job["job_id"]
+
+
+def _capture(fn):
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        code = fn()
+    return code, buf.getvalue()
+
+
+def test_disable_transport_returns_before_any_request(monkeypatch):
+    monkeypatch.setenv("OMG_DISABLE_TRANSPORT", "1")
+    result = post_json(HOOK_URL, HOOK_KEY, {"job_id": "x"}, 1, 1)
+    assert result.status is None and result.error == "transport disabled"
+    _absent(result.error, HOOK_KEY)
+    _absent(result.error, "ZZDURABILITYPATH")
+
+
+def test_public_repository_is_refused_before_a_command_runs(omg_home):
+    bypasses = (
+        "pysol-dev/oh-my-grok",
+        "PYSOL-DEV/OH-MY-GROK",
+        "github.com/pysol-dev/oh-my-grok",
+        "https://github.com/pysol-dev/oh-my-grok.git/",
+        "https://www.github.com/pysol-dev/oh-my-grok",
+        "https://user@github.com/pysol-dev/oh-my-grok.git",
+        "ssh://git@github.com:22/pysol-dev/oh-my-grok.git",
+        "ssh://git@ssh.github.com:443/pysol-dev/oh-my-grok.git",
+        "git@github.com:pysol-dev/oh-my-grok.git",
+        "ssh://git@github.com/pysol-dev/oh-my-grok",
+        "https://github.com./pysol-dev/oh-my-grok.git",
+    )
+    not_a_github_url = {
+        "github.com/pysol-dev/oh-my-grok",
+        "git@github.com:pysol-dev/oh-my-grok.git",
+    }
+    for value in bypasses:
+        with pytest.raises(ValidationError):
+            durability.refuse_public(value)
+        with pytest.raises(ValidationError):
+            durability.validate_remote(value, "example/private-backups")
+        canon = durability.canonical_github_repo(value)
+        if value in not_a_github_url or "www.github.com" in value or "ssh.github.com" in value:
+            assert canon is None
+        else:
+            assert canon == "pysol-dev/oh-my-grok"
+    with pytest.raises(ValidationError):
+        durability.require_owner_name("https://github.com/example/private.git")
+    with pytest.raises(ValidationError):
+        durability.require_owner_name("github.com/pysol-dev/oh-my-grok")
+    assert durability.require_owner_name("Example/Private-Backups") == "Example/Private-Backups"
+    calls = []
+
+    def runner(argv, cwd=None, env=None):
+        calls.append(list(argv))
+        raise AssertionError("runner invoked")
+
+    bundle = get_paths().state_dir / "unused.tar.gpg"
+    with pytest.raises(ValidationError):
+        durability.push_github(get_paths(), bundle, {"type": "github_release", "repo": "pysol-dev/oh-my-grok"},
+                               {"backup_keep_hourly": 48, "backup_keep_daily": 14}, runner=runner)
+    assert calls == []
+    _policy(backup_targets=[{"type": "github_release", "repo": "https://github.com/pysol-dev/oh-my-grok"}])
+    with pytest.raises(ValidationError):
+        Engine()
+
+
+def test_recover_refuses_the_public_repo_before_clone(omg_home, monkeypatch):
+    calls = []
+
+    def runner(argv, cwd=None, env=None):
+        calls.append(list(argv))
+        raise AssertionError("runner invoked")
+
+    monkeypatch.setenv("OMG_BACKUP_GITHUB_REPO", "git@github.com:pysol-dev/oh-my-grok.git")
+    with pytest.raises(ValidationError):
+        durability.locate_bundle(get_paths(), runner=runner)
+    assert calls == []
+    durability.refuse_public("example/omg-private-backups")
+    durability.refuse_public("https://github.com/example/omg-private-backups.git")
+
+
+def test_retention_keeps_hourly_and_daily_anchors(tmp_path):
+    directory = tmp_path / "bundles"
+    directory.mkdir()
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    names = []
+    for day in range(5):
+        for hour in (12, 18):
+            moment = base + timedelta(days=day, hours=hour)
+            name = moment.strftime("omg-%Y%m%dT%H%M%SZ.tar.gpg")
+            path = directory / name
+            path.write_bytes(b"x" * (1000 if hour == 12 else 10))
+            (directory / (name + ".sig")).write_bytes(b"s" * 20)
+            names.append(name)
+    policy = {"backup_keep_hourly": 2, "backup_keep_daily": 3, "backup_size_cap_bytes": 10_000_000}
+    removed = durability._prune_dir(directory, policy)
+    kept = {path.name for path in directory.glob("omg-*.tar.gpg")}
+    newest = max(names)
+    assert newest in kept and newest not in removed
+    assert len(kept) == 4  # 2 hourly (newest day 12:00 and 18:00 are not both hourly; newest 2) + dailies
+    # newest two are day 4 at 18:00 and day 4 at 12:00. Daily anchors are the newest of the last 3 days,
+    # which is day 4 18:00, day 3 18:00, day 2 18:00. Union adds day 3 and day 2 at 18:00.
+    assert "omg-20260105T180000Z.tar.gpg" in kept
+    assert "omg-20260104T180000Z.tar.gpg" in kept
+    assert "omg-20260103T180000Z.tar.gpg" in kept
+    assert "omg-20260102T180000Z.tar.gpg" not in kept
+    # size cap drops the oldest non-protected file and never the newest
+    for path in directory.glob("omg-*.tar.gpg"):
+        path.write_bytes(b"y" * 500)
+        Path(str(path) + ".sig").write_bytes(b"s" * 500)
+    policy["backup_size_cap_bytes"] = 1200
+    durability._prune_dir(directory, policy)
+    survived = {path.name for path in directory.glob("omg-*.tar.gpg")}
+    assert newest in survived
+    assert len(survived) < len(kept)
+    total = sum(path.stat().st_size for path in directory.iterdir())
+    assert total <= 1200 or survived == {newest}
+
+
+def test_doctor_skips_when_backup_is_off_and_fails_age_when_on(omg_home):
+    paths = get_paths()
+    skipped = {item["check"]: item for item in durability.doctor_report(paths)}
+    assert skipped["backup_age"]["status"] == "SKIP" and skipped["backup_age"]["ok"] is True
+    assert skipped["backup_offbox"]["status"] == "SKIP"
+    assert skipped["backup_venv_tools"]["status"] == "SKIP"
+    _policy(features={"backup": "on"})
+    missing = {item["check"]: item for item in durability.doctor_report(paths)}
+    assert missing["backup_age"]["ok"] is False
+    directory = durability.bundles_dir(paths)
+    directory.mkdir(parents=True)
+    old = directory / "omg-20200101T000000Z.tar.gpg"
+    old.write_bytes(b"old")
+    (directory / (old.name + ".sig")).write_bytes(b"sig")
+    env = durability._environment()
+    sidecar = {
+        "git_sha": env["git_sha"],
+        "environment": {k: env[k] for k in ("requirements_lock_sha256", "tools_lock_sha256") if k in env},
+        "mcp_command": durability.mcp_command_record(),
+    }
+    Path(str(old) + ".manifest.json").write_text(json.dumps(sidecar))
+    aged = {item["check"]: item for item in durability.doctor_report(paths, now=1_800_000_000)}
+    assert aged["backup_age"]["ok"] is False
+    assert aged["backup_offbox"]["ok"] is True  # no targets configured
+    fresh_name = datetime.now(UTC).strftime("omg-%Y%m%dT%H%M%SZ.tar.gpg")
+    fresh = directory / fresh_name
+    fresh.write_bytes(b"new")
+    Path(str(fresh) + ".manifest.json").write_text(json.dumps(sidecar))
+    current = {item["check"]: item for item in durability.doctor_report(paths)}
+    assert current["backup_age"]["ok"] is True
+    assert current["backup_venv_tools"]["ok"] is True
+    bad = json.loads(Path(str(fresh) + ".manifest.json").read_text())
+    bad["environment"]["requirements_lock_sha256"] = "0" * 64
+    Path(str(fresh) + ".manifest.json").write_text(json.dumps(bad))
+    drifted = {item["check"]: item for item in durability.doctor_report(paths)}
+    assert drifted["backup_venv_tools"]["ok"] is False
+    store = paths.state_dir / "offbox"
+    _policy(features={"backup": "on"}, backup_targets=[{"type": "agent_store", "path": str(store)}])
+    absent = {item["check"]: item for item in durability.doctor_report(paths)}
+    assert absent["backup_offbox"]["ok"] is False
+    dest = store / "bundles"
+    dest.mkdir(parents=True)
+    (dest / fresh.name).write_bytes(b"new")
+    (dest / (fresh.name + ".sig")).write_bytes(b"sig")
+    present = {item["check"]: item for item in durability.doctor_report(paths)}
+    assert present["backup_offbox"]["ok"] is True
+
+
+def test_hourly_step_is_independent_of_the_watchdog_flag(omg_home):
+    from oh_my_grok import watchdog
+    engine = Engine()
+    try:
+        off = watchdog.tick(engine)
+        assert off["steps"]["reconcile"]["skipped"] is True
+        assert off["steps"]["backup"]["skipped"] is True and off["steps"]["backup"]["reason"] == "backup off"
+    finally:
+        engine.close()
+    _policy(features={"watchdog": "off", "backup": "on"})
+    set_hook(get_paths(), "explorer", HOOK_URL, HOOK_KEY)
+    engine = Engine()
+    try:
+        failed = watchdog.tick(engine)
+    finally:
+        engine.close()
+    assert failed["steps"]["reconcile"]["skipped"] is True
+    assert failed["steps"]["backup"]["ok"] is False
+    _absent(json.dumps(failed), HOOK_KEY)
+    _absent(json.dumps(failed), "ZZDURABILITYPATH")
+    directory = durability.bundles_dir(get_paths())
+    directory.mkdir(parents=True, exist_ok=True)
+    name = datetime.now(UTC).strftime("omg-%Y%m%dT%H%M%SZ.tar.gpg")
+    (directory / name).write_bytes(b"cipher")
+    engine = Engine()
+    try:
+        fresh = durability.hourly_backup(engine.conn, engine.paths)
+    finally:
+        engine.close()
+    assert fresh["skipped"] is True and fresh["reason"] == "fresh" and fresh["bundle"] == name
+
+
+def test_github_push_uses_a_local_remote_and_never_force(omg_home, tmp_path):
+    paths = get_paths()
+    kit = durability.kit_dir(paths)
+    kit.mkdir(parents=True)
+    for name in KIT_FILES:
+        (kit / name).write_text("kit-file-" + name + "\n")
+        os.chmod(kit / name, 0o600)
+    bundle = tmp_path / "omg-20261117T010203Z.tar.gpg"
+    bundle.write_bytes(b"ciphertext")
+    (tmp_path / (bundle.name + ".sig")).write_bytes(b"signature")
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare)], check=True, capture_output=True)
+    releases = {}
+    calls = []
+
+    def runner(argv, cwd=None, env=None):
+        calls.append(list(argv))
+        if argv[0] == "git":
+            return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=60, check=False)
+        gh = _fake_gh(argv, releases)
+        if gh is not None:
+            if argv[:3] == ["gh", "release", "delete"]:
+                assert "--force" not in argv
+            return gh
+        raise AssertionError(argv)
+
+    target = {"type": "github_release", "repo": "example/omg-private-backups", "remote": str(bare),
+              "checkout": str(tmp_path / "checkout")}
+    policy = {"backup_keep_hourly": 48, "backup_keep_daily": 14, "backup_size_cap_bytes": 1_000_000}
+    result = durability.push_github(paths, bundle, target, policy, runner=runner)
+    assert result["ok"] is True and result["tag"] == "omg-20261117T010203Z"
+    assert [path.name for path in releases[result["tag"]]] == [bundle.name, bundle.name + ".sig"]
+    assert (tmp_path / "checkout").stat().st_mode & 0o777 == 0o700
+    pushes = [cmd for cmd in calls if cmd and cmd[0] == "git" and "push" in cmd]
+    assert pushes and all("--force" not in cmd and "-f" not in cmd and not any(a.startswith("+") for a in cmd)
+                          for cmd in pushes)
+    adds = [cmd for cmd in calls if cmd and cmd[0] == "git" and "add" in cmd]
+    assert adds and all(not any(str(a).endswith(".tar.gpg") for a in cmd) for cmd in adds)
+    assert (tmp_path / "checkout" / "kit" / "encryption.sec.asc").is_file()
+    assert "PRIVATE" not in (tmp_path / "checkout" / "README.md").read_text()
+    # A non-fast-forward is a failure and is not retried with --force.
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", str(bare), str(other)], check=True, capture_output=True)
+    (other / "README.md").write_text("diverged\n")
+    subprocess.run(["git", "-C", str(other), "add", "README.md"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(other), "-c", "user.name=t", "-c", "user.email=t@localhost",
+                    "commit", "-m", "diverge"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(other), "push", "origin", "HEAD:main"], check=True, capture_output=True)
+    head_before = subprocess.run(["git", "-C", str(bare), "rev-parse", "HEAD"], check=True, capture_output=True,
+                                 text=True).stdout.strip()
+    (kit / "signing.pub").write_text("kit-file-signing.pub\nchanged\n")
+    with pytest.raises(ValidationError):
+        durability.push_github(paths, bundle, target, policy, runner=runner)
+    head_after = subprocess.run(["git", "-C", str(bare), "rev-parse", "HEAD"], check=True, capture_output=True,
+                                text=True).stdout.strip()
+    assert head_after == head_before
+    assert not any("--force" in cmd or (cmd[0] == "git" and "-f" in cmd) for cmd in calls)
+
+
+def test_a_rejected_kit_push_is_retried_on_the_next_publication(omg_home, tmp_path):
+    paths = get_paths()
+    kit = durability.kit_dir(paths)
+    kit.mkdir(parents=True)
+    for name in KIT_FILES:
+        (kit / name).write_text("kit-" + name + "\n")
+        os.chmod(kit / name, 0o600)
+    bundle = tmp_path / "omg-20261117T030405Z.tar.gpg"
+    bundle.write_bytes(b"ciphertext")
+    (tmp_path / (bundle.name + ".sig")).write_bytes(b"signature")
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare)], check=True, capture_output=True)
+    releases = {}
+    pushes = []
+
+    def runner(argv, cwd=None, env=None):
+        if argv[0] == "git" and "push" in argv:
+            pushes.append(list(argv))
+            if len(pushes) == 1:
+                return subprocess.CompletedProcess(argv, 1, "", "rejected")
+        if argv[0] == "git":
+            return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=60, check=False)
+        gh = _fake_gh(argv, releases)
+        if gh is not None:
+            return gh
+        raise AssertionError(argv)
+
+    target = {"type": "github_release", "repo": "example/omg-private-backups", "remote": str(bare),
+              "checkout": str(tmp_path / "checkout")}
+    policy = {"backup_keep_hourly": 48, "backup_keep_daily": 14, "backup_size_cap_bytes": 1_000_000}
+    with pytest.raises(ValidationError, match="git push"):
+        durability.push_github(paths, bundle, target, policy, runner=runner)
+    unborn = subprocess.run(["git", "-C", str(bare), "rev-parse", "--verify", "HEAD"], capture_output=True, check=False)
+    assert unborn.returncode != 0
+    result = durability.push_github(paths, bundle, target, policy, runner=runner)
+    assert result["ok"] is True
+    assert len(pushes) == 2
+    assert all("--force" not in cmd and "-f" not in cmd for cmd in pushes)
+    listed = subprocess.run(["git", "-C", str(bare), "ls-tree", "-r", "--name-only", "HEAD"],
+                            check=True, capture_output=True, text=True)
+    assert "kit/encryption.sec.asc" in listed.stdout.split()
+    assert "kit/signing.pub" in listed.stdout.split()
+
+
+def test_custom_init_kit_is_the_directory_publication_copies(omg_home, monkeypatch, tmp_path):
+    custom = tmp_path / "custom-kit"
+    monkeypatch.setenv("OMG_BACKUP_PASSPHRASE", PASSPHRASE)
+    info = durability.init_keys(get_paths(), passphrase=PASSPHRASE, kit=custom)
+    assert Path(info["kit"]).resolve() == custom.resolve()
+    assert Path(durability.kit_pointer_path(get_paths()).read_text().strip()) == custom.resolve()
+    assert durability.resolve_kit(get_paths()).resolve() == custom.resolve()
+    assert not durability._kit_complete(durability.kit_dir(get_paths()))
+    default = durability.kit_dir(get_paths())
+    default.mkdir(parents=True)
+    for name in KIT_FILES:
+        (default / name).write_text("wrong-kit-" + name)
+    bundle = tmp_path / "omg-20261117T040506Z.tar.gpg"
+    bundle.write_bytes(b"ciphertext")
+    (tmp_path / (bundle.name + ".sig")).write_bytes(b"sig")
+    Path(str(bundle) + ".manifest.json").write_text(json.dumps({
+        "files": {"state/secrets/hooks.json": {"sha256": "abc", "bytes": 3}},
+        "mcp_command": "/tmp/secret-box/python",
+        "created_at": "2026-11-17T00:00:00.000000Z",
+        "generation": {"max_event_id": 4, "tail_sha256": "ab"},
+    }))
+    store = tmp_path / "store"
+    policy = {"backup_keep_hourly": 48, "backup_keep_daily": 14, "backup_size_cap_bytes": 1_000_000}
+    durability.push_agent_store(get_paths(), bundle,
+                                {"type": "agent_store", "path": str(store)}, policy)
+    for name in KIT_FILES:
+        assert durability._sha256_file(store / "kit" / name) == durability._sha256_file(custom / name)
+    assert b"PRIVATE KEY" not in (store / "kit" / "signing.pub").read_bytes()
+    assert b"wrong-kit-" not in (store / "kit" / "encryption.pub").read_bytes()
+    assert not list((store / "bundles").glob("*.manifest.json"))
+    public = json.loads((store / "bundles" / (bundle.name + ".public.json")).read_text())
+    assert set(public) == {"bundle", "sha256", "created_at", "generation", "signature"}
+    published = json.dumps(public)
+    assert "hooks.json" not in published and "secret-box" not in published
+    assert public["sha256"] == durability._sha256_file(bundle)
+    assert public["generation"] == {"max_event_id": 4, "tail_sha256": "ab"}
+
+
+def test_raw_sqlite_backup_still_writes_a_database(omg_home, tmp_path):
+    env = os.environ.copy()
+    dest = tmp_path / "snap.sqlite3"
+    result = subprocess.run([OMG, "backup", "--out", str(dest), "--json"], capture_output=True, text=True,
+                            env=env, timeout=120, check=False)
+    assert result.returncode == 0, result.stderr
+    assert dest.is_file() and (dest.stat().st_mode & 0o077) == 0
+
+
+def test_keys_bundle_and_restore_decisions(omg_home, monkeypatch):
+    gpg_commands = []
+    real_run = subprocess.run
+    real_popen = subprocess.Popen
+
+    def spy_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd and cmd[0] == "gpg":
+            gpg_commands.append(list(cmd))
+        return real_run(cmd, *args, **kwargs)
+
+    def spy_popen(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd and cmd[0] == "gpg":
+            gpg_commands.append(list(cmd))
+        return real_popen(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", spy_run)
+    monkeypatch.setattr(subprocess, "Popen", spy_popen)
+    info = _init(monkeypatch)
+    kit = Path(info["kit"])
+    assert (kit.stat().st_mode & 0o777) == 0o700
+    for name in KIT_FILES:
+        path = kit / name
+        assert (path.stat().st_mode & 0o777) == 0o600
+        _absent(path.read_bytes(), PASSPHRASE)
+    assert b"PRIVATE KEY" not in (kit / "signing.pub").read_bytes()
+    assert b"PRIVATE KEY" not in (kit / "encryption.pub").read_bytes()
+    secrets = " ".join(durability._secret_uids(durability.gnupg_home(get_paths())))
+    assert "omg-backup-signing" in secrets
+    assert "omg-backup-encryption" not in secrets
+    with pytest.raises(Conflict):
+        durability.init_keys(get_paths(), passphrase=PASSPHRASE)
+    _seed()
+    hooks_hash_before = durability._sha256_file(get_paths().hooks_path)
+    engine = Engine(transport=lambda *a, **k: HttpResult(200, None, None))
+    try:
+        created = durability.create_bundle(engine.conn, engine.paths, push=False)
+    finally:
+        engine.close()
+    _absent(json.dumps(created), HOOK_KEY)
+    _absent(json.dumps(created), "ZZDURABILITYPATH")
+    _absent(json.dumps(created), PASSPHRASE)
+    bundle = Path(created["path"])
+    sidecar = json.loads(Path(str(bundle) + ".manifest.json").read_text())
+    assert sidecar["mcp_command"] == f"{CODE_ROOT / '.venv' / 'bin' / 'python'} {CODE_ROOT / 'oh_my_grok' / 'mcp_server.py'}"
+    assert sidecar["generation"]["max_event_id"] >= 1
+    assert sidecar["schema_version"] >= 1
+    assert features.normalize({})["backup"] == "off"
+
+    db_path = get_paths().db_path
+    db_path.unlink()
+    for suffix in ("-wal", "-shm"):
+        Path(str(db_path) + suffix).unlink(missing_ok=True)
+    code, text = _capture(lambda: run_recover(check=True, passphrase=PASSPHRASE))
+    assert code == EXIT_CHECK_BEHIND and "would_restore" in text
+    assert not db_path.exists()
+    _absent(text, HOOK_KEY)
+
+    code, text = _capture(lambda: run_recover(check=False, passphrase=PASSPHRASE))
+    assert code == EXIT_OK and "restored" in text
+    health, events = durability.inspect_database(db_path)
+    assert health == "ok" and events is not None
+    assert durability._sha256_file(get_paths().hooks_path) == hooks_hash_before
+    assert (get_paths().hooks_path.stat().st_mode & 0o777) == 0o600
+    _absent(text, HOOK_KEY)
+    _absent(text, PASSPHRASE)
+
+    before = durability._sha256_file(db_path)
+    code, text = _capture(lambda: run_recover(check=False, passphrase=PASSPHRASE))
+    assert code == EXIT_OK and json.loads(text)["action"] == "noop"
+    assert durability._sha256_file(db_path) == before
+
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.execute("INSERT INTO events (ts, kind, data_json) VALUES ('t', 'note', '{\"added\":true}')")
+    conn.commit()
+    conn.close()
+    code, text = _capture(lambda: run_recover(check=False, passphrase=PASSPHRASE))
+    assert code == EXIT_OK and json.loads(text)["relation"] == "local_newer"
+    health, events = durability.inspect_database(db_path)
+    assert health == "ok" and events is not None
+    assert any(row["kind"] == "note" for row in events)
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE events SET data_json='{\"diverged\":true}' WHERE id=(SELECT MIN(id) FROM events)")
+    conn.commit()
+    mutated = conn.execute("SELECT data_json FROM events ORDER BY id ASC LIMIT 1").fetchone()[0]
+    conn.close()
+    code, text = _capture(lambda: run_recover(check=False, passphrase=PASSPHRASE))
+    assert code == EXIT_DIVERGED
+    conn = sqlite3.connect(db_path)
+    assert conn.execute("SELECT data_json FROM events ORDER BY id ASC LIMIT 1").fetchone()[0] == mutated
+    conn.close()
+
+    db_path.write_bytes(b"not a database")
+    code, _text = _capture(lambda: run_recover(check=False, passphrase=PASSPHRASE))
+    assert code == EXIT_OK
+    health, events = durability.inspect_database(db_path)
+    assert health == "ok" and events is not None and not any(row["kind"] == "note" for row in events)
+    digest = durability._sha256_file(db_path)
+    pin = (kit / "signing.fpr").read_text()
+    (kit / "signing.fpr").write_text("ab" * 20 + "\n")
+    code, _text = _capture(lambda: run_recover(check=False, passphrase=PASSPHRASE))
+    assert code == EXIT_VERIFY
+    assert durability._sha256_file(db_path) == digest
+    (kit / "signing.fpr").write_text(pin)
+    local_pin = durability.signing_pin_path(get_paths())
+    saved_pin = local_pin.read_text()
+    local_pin.write_text("cd" * 20 + "\n")
+    code, _text = _capture(lambda: run_recover(check=False, passphrase=PASSPHRASE))
+    assert code == EXIT_VERIFY
+    assert durability._sha256_file(db_path) == digest
+    local_pin.write_text(saved_pin)
+
+    original = bundle.read_bytes()
+    original_sig = Path(str(bundle) + ".sig").read_bytes()
+    flipped = bytearray(original)
+    flipped[-1] ^= 0x01
+    bundle.write_bytes(bytes(flipped))
+    digest = durability._sha256_file(db_path)
+    code, _text = _capture(lambda: run_recover(check=False, passphrase=PASSPHRASE))
+    assert code == EXIT_VERIFY
+    assert durability._sha256_file(db_path) == digest
+    bundle.write_bytes(original)
+    Path(str(bundle) + ".sig").write_bytes(b"not-a-signature")
+    code, _text = _capture(lambda: run_recover(check=False, passphrase=PASSPHRASE))
+    assert code == EXIT_VERIFY
+    assert durability._sha256_file(db_path) == digest
+    Path(str(bundle) + ".sig").write_bytes(original_sig)
+    code, _text = _capture(lambda: run_recover(check=False, passphrase="wrong-passphrase-0123456789"))
+    assert code == durability.EXIT_DECRYPT
+    assert durability._sha256_file(db_path) == digest
+    flat = [arg for cmd in gpg_commands for arg in cmd]
+    assert "--passphrase-fd" in flat
+    assert "--passphrase-file" not in flat
+    assert PASSPHRASE not in flat
+
+
+def test_job_scripts_keep_owner_execute_and_secrets_stay_private(tmp_path):
+    jobs = tmp_path / "jobs"
+    script = jobs / "abc" / "worktree" / "run.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/bin/sh\necho ok\n")
+    os.chmod(script, 0o755)
+    note = jobs / "abc" / "note.txt"
+    note.write_text("note")
+    os.chmod(note, 0o644)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "app.log").write_text("log")
+    os.chmod(logs / "app.log", 0o755)
+    tree = tmp_path / "tree"
+    files: dict[str, dict[str, str]] = {}
+    durability._add_tree(tree, jobs, "jobs", files, allow_execute=True)
+    durability._add_tree(tree, logs, "state/logs", files, allow_execute=False)
+    tar_path = tmp_path / "bundle.tar"
+    with tarfile.open(tar_path, "w") as archive:
+        for dirpath, _dirnames, filenames in os.walk(tree):
+            for filename in filenames:
+                path = Path(dirpath) / filename
+                archive.add(path, arcname=path.relative_to(tree).as_posix(), recursive=False)
+    extracted = tmp_path / "extracted"
+    durability._safe_extract(tar_path, extracted)
+    restored_jobs = tmp_path / "restored-jobs"
+    restored_logs = tmp_path / "restored-logs"
+    durability._replace_tree(restored_jobs, extracted / "jobs", allow_execute=True)
+    durability._replace_tree(restored_logs, extracted / "state" / "logs", allow_execute=False)
+    assert (restored_jobs / "abc" / "worktree" / "run.sh").stat().st_mode & 0o777 == 0o700
+    assert (restored_jobs / "abc" / "note.txt").stat().st_mode & 0o777 == 0o600
+    assert (restored_logs / "app.log").stat().st_mode & 0o777 == 0o600
+    assert files["jobs/abc/worktree/run.sh"]["mode"] == "0700"
+    assert files["state/logs/app.log"]["mode"] == "0600"
+
+
+def test_explicit_kit_overrides_a_complete_source_kit(omg_home, monkeypatch, tmp_path):
+    paths = get_paths()
+    paths.ensure()
+    directory = durability.bundles_dir(paths)
+    directory.mkdir(parents=True, exist_ok=True)
+    bundle = directory / "omg-20261117T010203Z.tar.gpg"
+    bundle.write_bytes(b"cipher")
+    (directory / (bundle.name + ".sig")).write_bytes(b"sig")
+    local = durability.kit_dir(paths)
+    local.mkdir(parents=True, exist_ok=True)
+    override = tmp_path / "override-kit"
+    override.mkdir()
+    for name in KIT_FILES:
+        (local / name).write_text("local-" + name)
+        (override / name).write_text("override-" + name)
+    monkeypatch.setenv("OMG_BACKUP_KIT", str(override))
+    _found, kit, _owned = durability.locate_bundle(paths)
+    assert kit.resolve() == override.resolve()
+    assert (kit / "signing.pub").read_text() == "override-signing.pub"
+    (override / "signing.fpr").unlink()
+    with pytest.raises(durability.BundleInvalid):
+        durability.locate_bundle(paths)
+
+
+def test_event_stream_prefix_is_strict():
+    base = [{"id": 1, "kind": "a"}, {"id": 2, "kind": "b"}]
+    assert relate_streams(base, base) == "equal"
+    assert relate_streams(base[:1], base) == "local_prefix"
+    assert relate_streams(base, base[:1]) == "local_newer"
+    changed = [dict(base[0], kind="nope"), base[1]]
+    assert relate_streams(changed, base) == "diverged"
+    assert relate_streams([], base) == "local_prefix"
+    assert relate_streams([], []) == "equal"
+
+
+def test_same_timestamp_suffixes_sort_by_integer_sequence():
+    older = durability.bundle_sort_key("omg-20261117T010203000000Z.tar.gpg")
+    second = durability.bundle_sort_key("omg-20261117T010203000000Z-0002.tar.gpg")
+    tenth = durability.bundle_sort_key("omg-20261117T010203000000Z-0010.tar.gpg")
+    assert older is not None and second is not None and tenth is not None
+    assert older < second < tenth
+    # Lexical order would put -10 before -2. The sequence is the integer.
+    lexical_trap_low = durability.bundle_sort_key("omg-20261117T010203Z-2.tar.gpg")
+    lexical_trap_high = durability.bundle_sort_key("omg-20261117T010203Z-10.tar.gpg")
+    assert lexical_trap_low is not None and lexical_trap_high is not None
+    assert lexical_trap_low < lexical_trap_high
+
+
+def test_publication_refuses_a_repo_that_is_not_private(omg_home, tmp_path):
+    calls = []
+
+    def runner(argv, cwd=None, env=None):
+        calls.append(list(argv))
+        if argv[:2] == ["gh", "api"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"private": False}), "")
+        raise AssertionError(argv)
+
+    bundle = tmp_path / "omg-20261117T050607Z.tar.gpg"
+    bundle.write_bytes(b"cipher")
+    (tmp_path / (bundle.name + ".sig")).write_text("sig")
+    with pytest.raises(ValidationError, match="not private"):
+        durability.push_github(get_paths(), bundle, {"type": "github_release", "repo": "example/public-backups",
+                                                     "remote": str(tmp_path / "bare.git"),
+                                                     "checkout": str(tmp_path / "co")},
+                               {"backup_keep_hourly": 1, "backup_keep_daily": 1, "backup_size_cap_bytes": 1000},
+                               runner=runner)
+    assert not any(cmd[0] == "git" for cmd in calls)
+
+    def failing(argv, cwd=None, env=None):
+        calls.append(list(argv))
+        if argv[:2] == ["gh", "api"]:
+            return subprocess.CompletedProcess(argv, 1, "", "unavailable")
+        raise AssertionError(argv)
+
+    calls.clear()
+    with pytest.raises(ValidationError, match="could not verify"):
+        durability.push_github(get_paths(), bundle, {"type": "github_release", "repo": "example/public-backups",
+                                                     "checkout": str(tmp_path / "co2")},
+                               {"backup_keep_hourly": 1, "backup_keep_daily": 1, "backup_size_cap_bytes": 1000},
+                               runner=failing)
+    assert not any(cmd[0] == "git" for cmd in calls)
+
+
+def test_incomplete_release_is_reuploaded_and_checked(omg_home, tmp_path):
+    paths = get_paths()
+    kit = durability.kit_dir(paths)
+    kit.mkdir(parents=True)
+    for name in KIT_FILES:
+        (kit / name).write_text("kit-" + name + "\n")
+    bundle = tmp_path / "omg-20261117T060708Z.tar.gpg"
+    bundle.write_bytes(b"ciphertext-bytes")
+    signature = tmp_path / (bundle.name + ".sig")
+    signature.write_bytes(b"signature-bytes")
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare)], check=True, capture_output=True)
+    tag = "omg-20261117T060708Z"
+    state = {"assets": [{"name": bundle.name, "size": 1}]}
+    uploads = []
+
+    def runner(argv, cwd=None, env=None):
+        if argv[:2] == ["gh", "api"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"private": True, "visibility": "private"}), "")
+        if argv[0] == "git":
+            return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=60, check=False)
+        if argv[:3] == ["gh", "release", "view"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"assets": state["assets"]}), "")
+        if argv[:3] == ["gh", "release", "upload"]:
+            uploads.append(list(argv))
+            state["assets"] = [{"name": bundle.name, "size": bundle.stat().st_size},
+                               {"name": signature.name, "size": signature.stat().st_size}]
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:3] == ["gh", "release", "list"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps([{"tagName": tag}]), "")
+        if argv[:3] == ["gh", "release", "delete"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        raise AssertionError(argv)
+
+    result = durability.push_github(
+        paths, bundle, {"type": "github_release", "repo": "example/private-backups", "remote": str(bare),
+                        "checkout": str(tmp_path / "checkout")},
+        {"backup_keep_hourly": 4, "backup_keep_daily": 2, "backup_size_cap_bytes": 1_000_000}, runner=runner)
+    assert result["ok"] is True
+    assert uploads and "--clobber" in uploads[0]
+    assert not any(cmd[0] == "git" and "--force" in cmd for cmd in uploads)
+
+    state["assets"] = [{"name": bundle.name, "size": 1}]
+
+    def still_wrong(argv, cwd=None, env=None):
+        if argv[:2] == ["gh", "api"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"private": True, "visibility": "private"}), "")
+        if argv[0] == "git":
+            return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=60, check=False)
+        if argv[:3] == ["gh", "release", "view"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"assets": state["assets"]}), "")
+        if argv[:3] == ["gh", "release", "upload"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:3] == ["gh", "release", "list"]:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        raise AssertionError(argv)
+
+    with pytest.raises(ValidationError, match="do not match"):
+        durability.push_github(
+            paths, bundle, {"type": "github_release", "repo": "example/private-backups", "remote": str(bare),
+                            "checkout": str(tmp_path / "checkout")},
+            {"backup_keep_hourly": 4, "backup_keep_daily": 2, "backup_size_cap_bytes": 1_000_000}, runner=still_wrong)
+
+
+def test_github_recovery_skips_a_release_without_both_assets(tmp_path):
+    newer = "omg-20261117T020000Z"
+    older = "omg-20261117T010000Z"
+    older_bytes = b"older-bundle"
+    older_sig = b"older-sig"
+
+    def runner(argv, cwd=None, env=None):
+        if argv[:2] == ["git", "clone"]:
+            Path(argv[-1]).mkdir(parents=True, exist_ok=True)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:3] == ["gh", "release", "list"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps([
+                {"tagName": newer}, {"tagName": older}]), "")
+        if argv[:3] == ["gh", "release", "view"]:
+            tag = argv[3]
+            if tag == newer:
+                assets = [{"name": newer + ".tar.gpg", "size": 4}]
+            else:
+                assets = [{"name": older + ".tar.gpg", "size": len(older_bytes)},
+                          {"name": older + ".tar.gpg.sig", "size": len(older_sig)}]
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"assets": assets}), "")
+        if argv[:3] == ["gh", "release", "download"]:
+            tag = argv[3]
+            dest = Path(argv[argv.index("--dir") + 1])
+            dest.mkdir(parents=True, exist_ok=True)
+            if tag == older:
+                (dest / (older + ".tar.gpg")).write_bytes(older_bytes)
+                (dest / (older + ".tar.gpg.sig")).write_bytes(older_sig)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        raise AssertionError(argv)
+
+    bundle, _kit = durability.fetch_github_release("example/private-backups", tmp_path / "work", runner)
+    assert bundle.name == older + ".tar.gpg"
+    assert bundle.read_bytes() == older_bytes
+
+
+def test_child_processes_do_not_receive_the_passphrase(monkeypatch, tmp_path):
+    monkeypatch.setenv("OMG_BACKUP_PASSPHRASE", PASSPHRASE)
+    seen = {}
+
+    def spy(argv, **kwargs):
+        seen["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    real = subprocess.run
+    monkeypatch.setattr(durability.subprocess, "run", spy)
+    durability.subprocess_runner(["true"])
+    assert seen["env"] is not None and "OMG_BACKUP_PASSPHRASE" not in seen["env"]
+    monkeypatch.setattr(durability.subprocess, "run", real)
+    target = tmp_path / "secret-file"
+    target.write_text("data")
+    durability._shred_file(target)
+    script = (ROOT / "scripts" / "recover.sh").read_text()
+    assert script.index("unset OMG_BACKUP_PASSPHRASE") < script.index('"$ROOT/omg" watchdog ensure')
+
+
+def test_remote_fails_closed_unless_it_is_local_or_this_github_repo(tmp_path):
+    repo = "example/private-backups"
+    refused = (
+        "https://github.com./pysol-dev/oh-my-grok.git",
+        "github-alias:pysol-dev/oh-my-grok.git",
+        "https://192.0.2.1/pysol-dev/oh-my-grok.git",
+        "git@192.0.2.1:pysol-dev/oh-my-grok.git",
+        "https://www.github.com/example/private-backups.git",
+        "ssh://git@ssh.github.com:443/example/private-backups.git",
+        "https://github.com/someone/else.git",
+        "git@github.com:pysol-dev/oh-my-grok.git",
+        "not a remote",
+    )
+    for remote in refused:
+        with pytest.raises(ValidationError):
+            durability.validate_remote(remote, repo)
+    local = tmp_path / "bare.git"
+    local.mkdir()
+    assert durability.validate_remote(str(local), repo) == str(local)
+    assert durability.validate_remote(f"file://{local}", repo) == f"file://{local}"
+    allowed = "https://github.com/Example/Private-Backups.git"
+    assert durability.validate_remote(allowed, "Example/Private-Backups") == allowed
+    dotted = "https://github.com./example/private-backups.git/"
+    assert durability.canonical_github_repo(dotted) == repo
+    assert durability.validate_remote(dotted, repo) == dotted
+
+
+def test_private_repo_cannot_push_its_kit_to_another_repository(omg_home, tmp_path):
+    """Momus test_5c: a private repo whose remote names a different public repository."""
+    calls = []
+
+    def runner(argv, cwd=None, env=None):
+        calls.append(list(argv))
+        if argv[:2] == ["gh", "api"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(
+                {"private": True, "visibility": "private"}), "")
+        raise AssertionError(argv)
+
+    bundle = tmp_path / "omg-20261117T070809Z.tar.gpg"
+    bundle.write_bytes(b"cipher")
+    (tmp_path / (bundle.name + ".sig")).write_bytes(b"sig")
+    policy = {"backup_keep_hourly": 1, "backup_keep_daily": 1, "backup_size_cap_bytes": 1000}
+    for remote in ("https://github.com/pysol-dev/oh-my-grok.git", "https://github.com/someone/public.git",
+                   "github-alias:example/private-backups.git", "https://198.51.100.8/example/private-backups.git"):
+        calls.clear()
+        with pytest.raises(ValidationError):
+            durability.push_github(get_paths(), bundle,
+                                   {"type": "github_release", "repo": "example/private-backups", "remote": remote,
+                                    "checkout": str(tmp_path / "co")},
+                                   policy, runner=runner)
+        assert not any(cmd and cmd[0] == "git" for cmd in calls)
+        assert not any(cmd[:2] == ["gh", "api"] for cmd in calls)
+
+
+def test_internal_visibility_is_not_private(omg_home, tmp_path):
+    calls = []
+
+    def runner(argv, cwd=None, env=None):
+        calls.append(list(argv))
+        if argv[:2] == ["gh", "api"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(
+                {"private": True, "visibility": "internal"}), "")
+        raise AssertionError(argv)
+
+    bundle = tmp_path / "omg-20261117T080910Z.tar.gpg"
+    bundle.write_bytes(b"cipher")
+    (tmp_path / (bundle.name + ".sig")).write_bytes(b"sig")
+    with pytest.raises(ValidationError, match="not private"):
+        durability.push_github(get_paths(), bundle,
+                               {"type": "github_release", "repo": "example/internal-backups",
+                                "remote": str(tmp_path / "bare.git"), "checkout": str(tmp_path / "co")},
+                               {"backup_keep_hourly": 1, "backup_keep_daily": 1, "backup_size_cap_bytes": 1000},
+                               runner=runner)
+    assert not any(cmd and cmd[0] == "git" for cmd in calls)
+
+
+def test_foreign_signing_key_name_exits_12(omg_home, monkeypatch, tmp_path):
+    monkeypatch.setenv("OMG_BACKUP_PASSPHRASE", PASSPHRASE)
+    durability.init_keys(get_paths(), passphrase=PASSPHRASE)
+    engine = Engine(transport=lambda *a, **k: HttpResult(200, None, None))
+    try:
+        durability.create_bundle(engine.conn, engine.paths, push=False)
+    finally:
+        engine.close()
+    other = tmp_path / "other-gpg"
+    other.mkdir(mode=0o700)
+    try:
+        batch = tmp_path / "other.batch"
+        batch.write_text("Key-Type: EdDSA\nKey-Curve: ed25519\nName-Real: not-the-omg-signer\n"
+                         "Expire-Date: 0\n%no-protection\n%commit\n")
+        generated = durability._gpg(other, ["--generate-key", str(batch)])
+        assert generated.returncode == 0, generated.stderr
+        exported = tmp_path / "other.pub"
+        exported_key = durability._gpg(other, ["--armor", "--output", str(exported), "--export", "not-the-omg-signer"])
+        assert exported_key.returncode == 0, exported_key.stderr
+        kit = durability.kit_dir(get_paths())
+        (kit / "signing.pub").write_bytes(exported.read_bytes())
+        db_path = get_paths().db_path
+        digest = durability._sha256_file(db_path)
+        code, text = _capture(lambda: durability.run_recover(check=False, passphrase=PASSPHRASE))
+        assert code == EXIT_VERIFY
+        assert "list-keys failed" not in text
+        assert durability._sha256_file(db_path) == digest
+    finally:
+        subprocess.run(["gpgconf", "--homedir", str(other), "--kill", "gpg-agent"],
+                       capture_output=True, check=False)
+        agent_env = os.environ.copy()
+        agent_env["GNUPGHOME"] = str(other)
+        agent_env.pop("OMG_BACKUP_PASSPHRASE", None)
+        subprocess.run(["gpgconf", "--kill", "gpg-agent"], env=agent_env, capture_output=True, check=False)
+
+
+def test_dot_segments_cannot_name_the_configured_repo():
+    """Momus test_10: git collapses /../.. onto the public repository. The parser must not."""
+    repo = "example/private-backups"
+    attacks = (
+        f"https://github.com/{repo}/../../pysol-dev/oh-my-grok.git",
+        f"https://github.com/{repo}/%2e%2e/%2e%2e/pysol-dev/oh-my-grok.git",
+        f"https://github.com/{repo}.git/../../pysol-dev/oh-my-grok.git",
+        f"https://github.com/{repo}/%2e%2e%2f%2e%2e%2fpysol-dev/oh-my-grok.git",
+        f"ssh://git@github.com/{repo}.git/../../pysol-dev/oh-my-grok.git",
+        f"git@github.com:{repo}/../../pysol-dev/oh-my-grok.git",
+        f"ssh://git@github.com/{repo}/%2e%2e/%2e%2e/pysol-dev/oh-my-grok.git",
+        "https://github.com/example//private-backups.git",
+        "https://github.com/example/./private-backups.git",
+        "https://github.com/example/private-backups.git/.",
+    )
+    for remote in attacks:
+        assert durability.canonical_github_repo(remote) is None
+        with pytest.raises(ValidationError):
+            durability.validate_remote(remote, repo)
+
+
+def test_github_remote_schemes_are_only_https_and_ssh(tmp_path):
+    repo = "example/private-backups"
+    rejected = (
+        f"http://github.com/{repo}.git",
+        f"git://github.com/{repo}.git",
+        f"persistent-https://github.com/{repo}.git",
+        f"git@github.com:{repo}.git",
+        f"github.com/{repo}.git",
+        repo,
+        f"file:{repo}.git",
+        "file://github.com/example/private-backups.git",
+        "file://127.0.0.1/tmp/bare.git",
+        "file://localhost/tmp/../bare.git",
+        "file://user@localhost/tmp/bare.git",
+        f"https://github.com/{repo}.git;params",
+        f"https://github.com/{repo}.git;",
+        f"https://github.com/{repo}.git?",
+        f"https://github.com/{repo}.git#",
+        "https://github.com/example%2fprivate-backups.git",
+        "https://github.com/example%2Fprivate-backups.git",
+        f"ssh://git@github.com/{repo}.git;params",
+        "ssh://git@github.com/example%2fprivate-backups.git",
+    )
+    for remote in rejected:
+        with pytest.raises(ValidationError):
+            durability.validate_remote(remote, repo)
+    local = tmp_path / "bare.git"
+    local.mkdir()
+    assert durability._file_url_path(f"file://{local}") == str(local)
+    assert durability._file_url_path(f"file://localhost{local}") == str(local)
+    assert durability.validate_remote(f"file://{local}", repo) == f"file://{local}"
+    assert durability.validate_remote(f"file://localhost{local}", repo) == f"file://localhost{local}"
+
+
+def test_push_rebuilds_the_github_url_and_refuses_dot_segments(omg_home, tmp_path):
+    paths = get_paths()
+    kit = durability.kit_dir(paths)
+    kit.mkdir(parents=True)
+    for name in KIT_FILES:
+        (kit / name).write_text("kit-" + name + "\n")
+    bundle = tmp_path / "omg-20261117T090000Z.tar.gpg"
+    bundle.write_bytes(b"cipher")
+    (tmp_path / (bundle.name + ".sig")).write_bytes(b"sig")
+    calls = []
+    envs = []
+    releases: dict[str, list[Path]] = {}
+
+    def runner(argv, cwd=None, env=None):
+        calls.append(list(argv))
+        if argv[0] == "git":
+            envs.append(env)
+            if "config" in argv and "insteadof" in argv:
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            if "get-url" in argv and "--push" in argv:
+                checkout = argv[argv.index("-C") + 1]
+                url = ("ssh://git@github.com/Example/Private-Backups.git"
+                       if str(checkout).endswith("ssh-co")
+                       else "https://github.com/Example/Private-Backups.git")
+                return subprocess.CompletedProcess(argv, 0, url + "\n", "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        gh = _fake_gh(argv, releases)
+        if gh is not None:
+            return gh
+        raise AssertionError(argv)
+
+    policy = {"backup_keep_hourly": 1, "backup_keep_daily": 1, "backup_size_cap_bytes": 1000}
+    repo = "Example/Private-Backups"
+    decorated = "https://user:token@github.com./Example/Private-Backups.git/"
+    durability.push_github(paths, bundle, {"type": "github_release", "repo": repo, "remote": decorated,
+                                           "checkout": str(tmp_path / "https-co")}, policy, runner=runner)
+    added = [cmd for cmd in calls if cmd[0] == "git" and "remote" in cmd and "add" in cmd]
+    assert added == [["git", "-c", "core.hooksPath=/dev/null", "-C", str(tmp_path / "https-co"),
+                      "remote", "add", "origin", "https://github.com/Example/Private-Backups.git"]]
+    assert all(env is not None and env.get("GIT_CONFIG_GLOBAL") == "/dev/null" and env.get("GIT_CONFIG_NOSYSTEM") == "1"
+               for env in envs)
+    assert all("GIT_CONFIG_COUNT" not in (env or {}) for env in envs)
+    assert not any("user:token" in " ".join(cmd) or "github.com." in " ".join(cmd) for cmd in calls if cmd[0] == "git")
+
+    calls.clear()
+    ssh_remote = "ssh://attacker@github.com:443/Example/Private-Backups.git"
+    durability.push_github(paths, bundle, {"type": "github_release", "repo": repo, "remote": ssh_remote,
+                                           "checkout": str(tmp_path / "ssh-co")}, policy, runner=runner)
+    added = [cmd for cmd in calls if cmd[0] == "git" and "remote" in cmd and "add" in cmd]
+    assert added[0][-1] == "ssh://git@github.com/Example/Private-Backups.git"
+    assert "attacker@" not in added[0][-1]
+
+    for remote in (f"https://github.com/{repo}/../../pysol-dev/oh-my-grok.git",
+                   f"https://github.com/{repo}/%2e%2e/%2e%2e/pysol-dev/oh-my-grok.git",
+                   f"ssh://git@github.com/{repo}.git/../../pysol-dev/oh-my-grok.git",
+                   f"git@github.com:{repo}/../../pysol-dev/oh-my-grok.git"):
+        calls.clear()
+        with pytest.raises(ValidationError):
+            durability.push_github(paths, bundle, {"type": "github_release", "repo": repo, "remote": remote,
+                                                   "checkout": str(tmp_path / "nope")}, policy, runner=runner)
+        assert not any(cmd[0] == "git" for cmd in calls)
+        assert not any("pysol-dev/oh-my-grok" in " ".join(cmd) for cmd in calls)
+
+
+def test_url_insteadof_cannot_redirect_the_kit_push(omg_home, tmp_path, monkeypatch):
+    intended = tmp_path / "intended.git"
+    decoy = tmp_path / "decoy.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(intended)], check=True, capture_output=True)
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(decoy)], check=True, capture_output=True)
+    config = tmp_path / "redirect.gitconfig"
+    config.write_text(f'[url "{decoy}"]\n\tinsteadOf = {intended}\n')
+    system = tmp_path / "system.gitconfig"
+    system.write_text(f'[url "{decoy}"]\n\tpushInsteadOf = {intended}\n')
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(system))
+    monkeypatch.delenv("GIT_CONFIG_NOSYSTEM", raising=False)
+    paths = get_paths()
+    kit = durability.kit_dir(paths)
+    kit.mkdir(parents=True)
+    for name in KIT_FILES:
+        (kit / name).write_text("kit-" + name + "\n")
+    bundle = tmp_path / "omg-20261117T091500Z.tar.gpg"
+    bundle.write_bytes(b"cipher")
+    (tmp_path / (bundle.name + ".sig")).write_bytes(b"sig")
+    releases = {}
+
+    def runner(argv, cwd=None, env=None):
+        if argv[0] == "git":
+            return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=60, check=False)
+        gh = _fake_gh(argv, releases)
+        if gh is not None:
+            return gh
+        raise AssertionError(argv)
+
+    checkout = tmp_path / "checkout"
+    result = durability.push_github(
+        paths, bundle, {"type": "github_release", "repo": "example/private-backups", "remote": str(intended),
+                        "checkout": str(checkout)},
+        {"backup_keep_hourly": 4, "backup_keep_daily": 2, "backup_size_cap_bytes": 1_000_000}, runner=runner)
+    assert result["ok"] is True
+    intended_head = subprocess.run(["git", "--git-dir", str(intended), "rev-parse", "HEAD"],
+                                   capture_output=True, check=False)
+    decoy_head = subprocess.run(["git", "--git-dir", str(decoy), "rev-parse", "HEAD"],
+                                capture_output=True, check=False)
+    assert intended_head.returncode == 0
+    assert decoy_head.returncode != 0
+    subprocess.run(["git", "-C", str(checkout), "config", f"url.{decoy}.pushInsteadOf", str(intended)],
+                   check=True, capture_output=True)
+    with pytest.raises(ValidationError, match="elsewhere"):
+        durability.push_github(
+            paths, bundle, {"type": "github_release", "repo": "example/private-backups", "remote": str(intended),
+                            "checkout": str(checkout)},
+            {"backup_keep_hourly": 4, "backup_keep_daily": 2, "backup_size_cap_bytes": 1_000_000}, runner=runner)
+    decoy_after = subprocess.run(["git", "--git-dir", str(decoy), "rev-parse", "HEAD"],
+                                 capture_output=True, check=False)
+    assert decoy_after.returncode != 0
+
+
+def test_recover_documents_the_internal_error_exit():
+    text = (ROOT / "spec" / "DURABILITY.md").read_text()
+    table = text.split("### 6.2 Exit codes", 1)[1].split("## 7.", 1)[0]
+    assert "| 1 |" in table
+    assert "internal error" in table.lower()
+    header = (ROOT / "scripts" / "recover.sh").read_text().split("set -euo pipefail", 1)[0]
+    assert "internal error" in header.lower()
+
+
+def _kit_and_remotes(tmp_path):
+    """Two bare repos and a kit. The hook, when a test adds one, only writes a marker file."""
+    paths = get_paths()
+    kit = durability.kit_dir(paths)
+    kit.mkdir(parents=True)
+    for name in KIT_FILES:
+        (kit / name).write_text("kit-" + name + "\n")
+    intended = tmp_path / "intended.git"
+    decoy = tmp_path / "decoy.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(intended)], check=True, capture_output=True)
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(decoy)], check=True, capture_output=True)
+    bundle = tmp_path / "omg-20261117T100000Z.tar.gpg"
+    bundle.write_bytes(b"cipher")
+    (tmp_path / (bundle.name + ".sig")).write_bytes(b"sig")
+    return paths, kit, intended, decoy, bundle
+
+
+def _push_with_real_git(paths, bundle, intended, checkout, releases):
+    def runner(argv, cwd=None, env=None):
+        if argv[0] == "git":
+            return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=60, check=False)
+        gh = _fake_gh(argv, releases)
+        if gh is not None:
+            return gh
+        raise AssertionError(argv)
+
+    policy = {"backup_keep_hourly": 4, "backup_keep_daily": 2, "backup_size_cap_bytes": 1_000_000}
+    return durability.push_github(
+        paths, bundle, {"type": "github_release", "repo": "example/private-backups", "remote": str(intended),
+                        "checkout": str(checkout)}, policy, runner=runner)
+
+
+def _has_head(repo: Path) -> bool:
+    return subprocess.run(["git", "--git-dir", str(repo), "rev-parse", "HEAD"],
+                          capture_output=True, check=False).returncode == 0
+
+
+def test_git_config_parameters_cannot_redirect_the_kit_push(omg_home, tmp_path, monkeypatch):
+    paths, _kit, intended, decoy, bundle = _kit_and_remotes(tmp_path)
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", f"'url.{decoy}.pushinsteadof'='{intended}'")
+    seen = {}
+    releases: dict[str, list[Path]] = {}
+
+    def runner(argv, cwd=None, env=None):
+        if argv[0] == "git":
+            seen["env"] = env
+            return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=60, check=False)
+        gh = _fake_gh(argv, releases)
+        if gh is not None:
+            return gh
+        raise AssertionError(argv)
+
+    result = durability.push_github(
+        paths, bundle, {"type": "github_release", "repo": "example/private-backups", "remote": str(intended),
+                        "checkout": str(tmp_path / "checkout")},
+        {"backup_keep_hourly": 4, "backup_keep_daily": 2, "backup_size_cap_bytes": 1_000_000}, runner=runner)
+    assert result["ok"] is True
+    assert seen["env"] is not None and "GIT_CONFIG_PARAMETERS" not in seen["env"]
+    assert _has_head(intended)
+    assert not _has_head(decoy)
+
+
+def test_pushurl_cannot_redirect_the_kit_push(omg_home, tmp_path):
+    paths, kit, intended, decoy, bundle = _kit_and_remotes(tmp_path)
+    checkout = tmp_path / "checkout"
+    releases: dict[str, list[Path]] = {}
+    result = _push_with_real_git(paths, bundle, intended, checkout, releases)
+    assert result["ok"] is True and _has_head(intended) and not _has_head(decoy)
+    subprocess.run(["git", "-C", str(checkout), "remote", "set-url", "--push", "origin", str(decoy)],
+                   check=True, capture_output=True)
+    (kit / "signing.pub").write_text("kit-signing.pub\nchanged\n")
+    again = _push_with_real_git(paths, bundle, intended, checkout, releases)
+    assert again["ok"] is True
+    assert not _has_head(decoy)
+    pushed = subprocess.run(["git", "-C", str(checkout), "remote", "get-url", "--push", "origin"],
+                            check=True, capture_output=True, text=True).stdout.strip()
+    assert pushed == str(intended)
+
+
+def test_pre_push_hook_cannot_run_during_publication(omg_home, tmp_path):
+    """The hook only writes a marker. It must not call git or start another process."""
+    paths, kit, intended, decoy, bundle = _kit_and_remotes(tmp_path)
+    checkout = tmp_path / "checkout"
+    releases: dict[str, list[Path]] = {}
+    first = _push_with_real_git(paths, bundle, intended, checkout, releases)
+    assert first["ok"] is True
+    marker = tmp_path / "hook-marker"
+    hook = checkout / ".git" / "hooks" / "pre-push"
+    hook.write_text(f"#!/bin/sh\nprintf x >> {marker}\nexit 0\n")
+    os.chmod(hook, 0o700)
+    (kit / "signing.pub").write_text("kit-signing.pub\nchanged\n")
+    again = _push_with_real_git(paths, bundle, intended, checkout, releases)
+    assert again["ok"] is True
+    assert not marker.exists()
+    assert not _has_head(decoy)
