@@ -71,9 +71,9 @@ The passphrase is read only from the environment variable `OMG_BACKUP_PASSPHRASE
 
 The command:
 
-1. Generates an encryption key (ECDSA P-256 primary, ECDH P-256 subkey) inside a mode `0700` temporary GnuPG home. The passphrase is supplied to gpg through a mode `0600` file in that temporary directory.
+1. Generates an encryption key (ECDSA P-256 primary, ECDH P-256 subkey) inside a mode `0700` temporary GnuPG home. The passphrase is supplied to gpg on `--passphrase-fd` through a pipe. It is not written to a file.
 2. Exports the encryption **public** key and the **passphrase-protected** secret key into the recovery kit (`state/recovery-kit/` unless `--kit` is set): `encryption.pub`, `encryption.sec.asc`, mode `0600`, directory mode `0700`.
-3. Shreds the temporary home, including the passphrase file. The plaintext encryption private key is not written anywhere else.
+3. Shreds the temporary home. The plaintext encryption private key is not written anywhere else.
 4. Generates a separate Ed25519 signing key with no passphrase **in** `state/secrets/backup-gnupg/` (mode `0700`). `signing.pub` and `signing.fpr` (the fingerprint) are copied into the kit. The same fingerprint is stored in `state/secrets/backup-signing.fpr`. The signing secret is not exported to a file. When that directory's path is too long for an `AF_UNIX` socket, `gpg` is pointed at a private short symlink to the same directory; the key files stay under `state/secrets/backup-gnupg/`.
 
 The passphrase is given to gpg with `--passphrase-fd` and `pinentry-mode loopback`. No passphrase file is created.
@@ -155,7 +155,7 @@ Order:
 1. Require `python3`, `gpg`, and `OMG_BACKUP_PASSPHRASE` (present and non-empty; the value is never printed).
 2. Unless `--check`: run `scripts/bootstrap.sh`.
 3. Locate the newest bundle. Candidates are collected from `OMG_BACKUP_AGENT_STORE`, each configured agent-store path, `/cursor/stores/user/omg-backups` when that directory exists, the local bundle directory, `OMG_BACKUP_GITHUB_MIRROR`, a configured GitHub `mirror`, and, when `OMG_BACKUP_GITHUB_REPO` is `owner/name`, a `git clone` plus `gh release download`. The newest timestamp wins. The same timestamp prefers the higher sequence suffix, then the agent store over the local copy over a GitHub mirror. A GitHub release that does not have both a non-empty ciphertext and a non-empty signature is skipped, and the next newest complete release is used. The clone is not a force. The public repository is refused. A bad signature or a manifest mismatch on the chosen bundle still exits 12 and does not fall through to an older bundle.
-4. Verify the detached signature. The signer fingerprint must equal the pin recorded at `init-key` (`signing.fpr` in the kit, and `state/secrets/backup-signing.fpr` when the box still has it). Those two pins must agree when both exist. A `signing.pub` whose fingerprint differs from the pin is not trusted. Any mismatch exits 12.
+4. Verify the detached signature. `OMG_BACKUP_KIT`, when set, is the kit used even if the bundle's source already has a complete kit. An incomplete or symlinked override fails closed. Otherwise the kit beside the chosen bundle is used, then the other kit locations. The signer fingerprint must equal the pin recorded at `init-key` (`signing.fpr` in the kit, and `state/secrets/backup-signing.fpr` when the box still has it). Those two pins must agree when both exist. A `signing.pub` whose fingerprint differs from the pin is not trusted. Any mismatch exits 12.
 5. Decrypt with the kit's protected secret and the passphrase, into a mode `0700` temporary directory that is shredded before the script exits. The passphrase is passed to gpg on `--passphrase-fd` through a pipe (`pinentry-mode loopback`). It is not an argument and it is not written to a file.
 6. Decide, then act (section 6.1).
 7. Unless `--check`: unset `OMG_BACKUP_PASSPHRASE`, then `./omg watchdog ensure` and `./omg doctor`. The passphrase is also removed from the environment of git, gh, gpg, and shred.
@@ -175,7 +175,7 @@ Compare the local database with the snapshot:
 | snapshot stream is a strict prefix of the local stream (local is newer and consistent) | no-op, exit 0, local files unchanged |
 | anything else (diverged) | exit 11, nothing changed |
 
-Restore replaces the database (SQLite backup API onto a temporary file, then `rename`; stale `-wal` and `-shm` siblings are removed first), replaces `jobs/` and `state/logs/`, writes `config/policy.json` when the snapshot has one, and writes `hooks.json` as mode `0600` inside the `0700` secrets directory when the snapshot has one. A snapshot that has no `hooks.json` does not delete a local one. The bundle ciphertext, signature, and sidecar manifest are installed into the local bundle directory so the box keeps the snapshot it just trusted.
+Restore replaces the database (SQLite backup API onto a temporary file, then `rename`; stale `-wal` and `-shm` siblings are removed first), replaces `jobs/` and `state/logs/`, writes `config/policy.json` when the snapshot has one, and writes `hooks.json` as mode `0600` inside the `0700` secrets directory when the snapshot has one. Files under `jobs/` keep the owner-execute bit when the archived file had it (`0700`). Group and other permission bits are not restored. Logs, policy, the database, and `hooks.json` stay `0600`. A snapshot that has no `hooks.json` does not delete a local one. The bundle ciphertext, signature, and sidecar manifest are installed into the local bundle directory so the box keeps the snapshot it just trusted.
 
 `--check` performs steps 3–6 in a temporary directory and does not modify `OMG_HOME`, the config directory, or the jobs tree. It does not run bootstrap, watchdog, or doctor.
 

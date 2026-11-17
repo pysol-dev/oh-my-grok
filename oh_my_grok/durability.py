@@ -588,15 +588,23 @@ def _environment() -> dict[str, Any]:
     return out
 
 
-def _add_bytes(tree: Path, rel: str, data: bytes, files: dict[str, Any]) -> None:
+def _owner_mode(path: Path, *, allow_execute: bool) -> int:
+    """Owner read/write, plus owner-execute when the source is executable. Group and other stay off."""
+    mode = 0o600
+    if allow_execute and (path.stat().st_mode & stat.S_IXUSR):
+        mode |= stat.S_IXUSR
+    return mode
+
+
+def _add_bytes(tree: Path, rel: str, data: bytes, files: dict[str, Any], *, mode: int = 0o600) -> None:
     dest = tree / rel
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(data)
-    os.chmod(dest, 0o600)
-    files[rel] = {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data), "mode": "0600"}
+    os.chmod(dest, mode)
+    files[rel] = {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data), "mode": f"{mode:04o}"}
 
 
-def _add_tree(tree: Path, src_root: Path, prefix: str, files: dict[str, Any]) -> None:
+def _add_tree(tree: Path, src_root: Path, prefix: str, files: dict[str, Any], *, allow_execute: bool = False) -> None:
     if not src_root.exists():
         return
     if src_root.is_symlink():
@@ -614,7 +622,7 @@ def _add_tree(tree: Path, src_root: Path, prefix: str, files: dict[str, Any]) ->
                 data = path.read_bytes()
             except OSError:
                 raise IntegrityError_(f"could not read {rel}") from None
-            _add_bytes(tree, rel, data, files)
+            _add_bytes(tree, rel, data, files, mode=_owner_mode(path, allow_execute=allow_execute))
 
 
 def _read_hooks(path: Path) -> bytes | None:
@@ -726,8 +734,8 @@ def create_bundle(conn: sqlite3.Connection, paths: Paths, *, push: bool = True,
                 _add_bytes(tree, "config/policy.json", policy.read_bytes(), files)
             except OSError:
                 raise IntegrityError_("could not read config/policy.json") from None
-        _add_tree(tree, paths.jobs_dir, "jobs", files)
-        _add_tree(tree, paths.logs_dir, "state/logs", files)
+        _add_tree(tree, paths.jobs_dir, "jobs", files, allow_execute=True)
+        _add_tree(tree, paths.logs_dir, "state/logs", files, allow_execute=False)
         hooks = _read_hooks(paths.hooks_path)
         if hooks is not None:
             _add_bytes(tree, "state/secrets/hooks.json", hooks, files)
@@ -1473,7 +1481,15 @@ def locate_bundle(paths: Paths, *, runner=None) -> tuple[Path, Path, list[Path]]
         raise NoBundle("no backup bundle found")
     ranked.sort()
     _epoch, _sequence, _rank, bundle, kit = ranked[-1]
-    if not _kit_complete(kit):
+    override = os.environ.get("OMG_BACKUP_KIT")
+    if override:
+        chosen = Path(override)
+        if chosen.is_symlink() or not _kit_complete(chosen):
+            for directory in owned:
+                shred_tree(directory)
+            raise BundleInvalid("OMG_BACKUP_KIT is not a complete recovery kit")
+        kit = chosen
+    elif not _kit_complete(kit):
         for candidate in _kit_candidates(paths):
             if _kit_complete(candidate):
                 kit = candidate
@@ -1619,7 +1635,7 @@ def _restore_database(src: Path, dest: Path) -> None:
             sidecar.unlink()
 
 
-def _replace_tree(dest: Path, src: Path) -> None:
+def _replace_tree(dest: Path, src: Path, *, allow_execute: bool = False) -> None:
     if dest.is_symlink():
         raise IntegrityError_(f"refusing to replace symlink {dest.name}")
     if dest.exists():
@@ -1645,7 +1661,7 @@ def _replace_tree(dest: Path, src: Path) -> None:
                 raise IntegrityError_(f"could not read {(relative / name).as_posix()}") from None
             out = target / name
             out.write_bytes(data)
-            os.chmod(out, 0o600)
+            os.chmod(out, _owner_mode(source, allow_execute=allow_execute))
             del data
 
 
@@ -1679,8 +1695,8 @@ def apply_snapshot(tree: Path, paths: Paths, manifest: dict[str, Any], bundle: P
     other = "omo.sqlite3" if src.name == "omg.sqlite3" else "omg.sqlite3"
     _remove_db_family(paths.state_dir / other)
     _restore_database(src, paths.state_dir / src.name)
-    _replace_tree(paths.jobs_dir, tree / "jobs")
-    _replace_tree(paths.logs_dir, tree / "state" / "logs")
+    _replace_tree(paths.jobs_dir, tree / "jobs", allow_execute=True)
+    _replace_tree(paths.logs_dir, tree / "state" / "logs", allow_execute=False)
     policy_src = tree / "config" / "policy.json"
     if policy_src.is_file() and not policy_src.is_symlink():
         try:

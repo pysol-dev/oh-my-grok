@@ -7,6 +7,7 @@ import io
 import json
 import os
 import subprocess
+import tarfile
 import tempfile
 from contextlib import redirect_stdout
 from datetime import UTC, datetime, timedelta
@@ -592,6 +593,66 @@ def test_keys_bundle_and_restore_decisions(omg_home, monkeypatch):
     assert "--passphrase-fd" in flat
     assert "--passphrase-file" not in flat
     assert PASSPHRASE not in flat
+
+
+def test_job_scripts_keep_owner_execute_and_secrets_stay_private(tmp_path):
+    jobs = tmp_path / "jobs"
+    script = jobs / "abc" / "worktree" / "run.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/bin/sh\necho ok\n")
+    os.chmod(script, 0o755)
+    note = jobs / "abc" / "note.txt"
+    note.write_text("note")
+    os.chmod(note, 0o644)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "app.log").write_text("log")
+    os.chmod(logs / "app.log", 0o755)
+    tree = tmp_path / "tree"
+    files: dict = {}
+    durability._add_tree(tree, jobs, "jobs", files, allow_execute=True)
+    durability._add_tree(tree, logs, "state/logs", files, allow_execute=False)
+    tar_path = tmp_path / "bundle.tar"
+    with tarfile.open(tar_path, "w") as archive:
+        for dirpath, _dirnames, filenames in os.walk(tree):
+            for filename in filenames:
+                path = Path(dirpath) / filename
+                archive.add(path, arcname=path.relative_to(tree).as_posix(), recursive=False)
+    extracted = tmp_path / "extracted"
+    durability._safe_extract(tar_path, extracted)
+    restored_jobs = tmp_path / "restored-jobs"
+    restored_logs = tmp_path / "restored-logs"
+    durability._replace_tree(restored_jobs, extracted / "jobs", allow_execute=True)
+    durability._replace_tree(restored_logs, extracted / "state" / "logs", allow_execute=False)
+    assert (restored_jobs / "abc" / "worktree" / "run.sh").stat().st_mode & 0o777 == 0o700
+    assert (restored_jobs / "abc" / "note.txt").stat().st_mode & 0o777 == 0o600
+    assert (restored_logs / "app.log").stat().st_mode & 0o777 == 0o600
+    assert files["jobs/abc/worktree/run.sh"]["mode"] == "0700"
+    assert files["state/logs/app.log"]["mode"] == "0600"
+
+
+def test_explicit_kit_overrides_a_complete_source_kit(omg_home, monkeypatch, tmp_path):
+    paths = get_paths()
+    paths.ensure()
+    directory = durability.bundles_dir(paths)
+    directory.mkdir(parents=True, exist_ok=True)
+    bundle = directory / "omg-20261117T010203Z.tar.gpg"
+    bundle.write_bytes(b"cipher")
+    (directory / (bundle.name + ".sig")).write_bytes(b"sig")
+    local = durability.kit_dir(paths)
+    local.mkdir(parents=True, exist_ok=True)
+    override = tmp_path / "override-kit"
+    override.mkdir()
+    for name in KIT_FILES:
+        (local / name).write_text("local-" + name)
+        (override / name).write_text("override-" + name)
+    monkeypatch.setenv("OMG_BACKUP_KIT", str(override))
+    _found, kit, _owned = durability.locate_bundle(paths)
+    assert kit.resolve() == override.resolve()
+    assert (kit / "signing.pub").read_text() == "override-signing.pub"
+    (override / "signing.fpr").unlink()
+    with pytest.raises(durability.BundleInvalid):
+        durability.locate_bundle(paths)
 
 
 def test_event_stream_prefix_is_strict():
