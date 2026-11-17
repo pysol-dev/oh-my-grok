@@ -21,7 +21,7 @@ import time
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from . import db
 from .config import canonical_json, load_policy, sha256_text
@@ -96,14 +96,30 @@ def mcp_command_record() -> str:
     return f"{py} {server}"
 
 
-def _owner_name_from_path(path: str) -> str | None:
-    parts = [part for part in path.strip("/").split("/") if part]
-    if len(parts) < 2:
+def _path_segments(path: str) -> list[str] | None:
+    """Segments of a percent-decoded path. ``.``, ``..``, and empty segments are rejected.
+
+    One leading slash and one trailing slash are the URL's own delimiters. Anything else
+    (including ``%2e%2e`` and ``%2f``) is part of the path git would collapse.
+    """
+    parts = unquote(path or "").split("/")
+    if parts and parts[0] == "":
+        parts = parts[1:]
+    if parts and parts[-1] == "":
+        parts = parts[:-1]
+    if not parts or any(part in ("", ".", "..") for part in parts):
         return None
-    owner, name = parts[0], parts[1]
+    return parts
+
+
+def _owner_name_from_path(path: str) -> str | None:
+    parts = _path_segments(path)
+    if parts is None or len(parts) != 2:
+        return None
+    owner, name = parts
     if name.lower().endswith(".git"):
         name = name[:-4]
-    if not owner or not name or "/" in owner or "/" in name:
+    if not owner or not name or not _OWNER_NAME.fullmatch(f"{owner}/{name}"):
         return None
     return f"{owner}/{name}".lower()
 
@@ -114,37 +130,56 @@ def _exact_github_host(host: str) -> bool:
 
 
 def canonical_github_repo(value: str) -> str | None:
-    """``owner/name`` when ``value`` names github.com exactly, else None.
+    """``owner/name`` when ``value`` is an https or ssh URL for github.com exactly, else None.
 
-    Trailing dots on the host, a ``.git`` suffix, and extra slashes are ignored.
-    ``www.github.com``, ``ssh.github.com``, host aliases, and IP literals are not github.com.
-    A local filesystem path returns None.
+    Trailing dots on the host and a ``.git`` suffix on the repository name are ignored.
+    The path must be exactly ``/owner/name[.git][/]`` after percent-decoding. ``.``, ``..``,
+    and empty segments are rejected rather than collapsed. ``http``, ``git``,
+    ``persistent-https``, scp-like ``git@host:path``, and a schemeless ``github.com/owner/name``
+    are not github remotes. ``www.github.com``, ``ssh.github.com``, aliases, and IP literals
+    are not github.com. A local filesystem path returns None.
     """
     raw = (value or "").strip()
     if not raw:
         return None
-    if "://" not in raw and ":" in raw and not raw.startswith(("/", ".")):
-        matched = re.match(r"^(?:[^@\s]+@)?([^:\s]+):(.+)$", raw)
-        if matched and _exact_github_host(matched.group(1)):
-            return _owner_name_from_path(matched.group(2))
+    if "://" not in raw:
+        if _OWNER_NAME.fullmatch(raw):
+            return raw.lower()
         return None
-    url_text = raw
-    if "://" not in url_text and url_text.lower().startswith("github.com/"):
-        url_text = "https://" + url_text
-    if "://" in url_text:
-        parsed = urlparse(url_text)
-        if (parsed.scheme or "").lower() == "file":
-            return None
-        if parsed.hostname and _exact_github_host(parsed.hostname):
-            return _owner_name_from_path(parsed.path)
+    parsed = urlparse(raw)
+    if parsed.query or parsed.fragment:
         return None
-    if _OWNER_NAME.fullmatch(raw):
-        return raw.lower()
-    return None
+    if (parsed.scheme or "").lower() not in {"https", "ssh"}:
+        return None
+    if not parsed.hostname or not _exact_github_host(parsed.hostname):
+        return None
+    return _owner_name_from_path(parsed.path)
+
+
+def _file_url_path(value: str) -> str | None:
+    """Absolute path of a ``file://`` URL with an empty or localhost host, else None.
+
+    ``file:owner/name.git`` (no slashes) is scp syntax for a host named ``file`` and is rejected.
+    """
+    text = (value or "").strip()
+    if not text.lower().startswith("file://"):
+        return None
+    parsed = urlparse(text)
+    if (parsed.scheme or "").lower() != "file":
+        return None
+    if parsed.username or parsed.password or parsed.port is not None or parsed.query or parsed.fragment:
+        return None
+    host = parsed.hostname or ""
+    if host.lower() not in ("", "localhost"):
+        return None
+    parts = _path_segments(parsed.path or "")
+    if parts is None:
+        return None
+    return "/" + "/".join(parts)
 
 
 def _is_file_url(value: str) -> bool:
-    return value.strip().lower().startswith("file:")
+    return _file_url_path(value) is not None
 
 
 def _is_local_path(value: str) -> bool:
@@ -159,7 +194,8 @@ def _is_local_path(value: str) -> bool:
 
 def _looks_like_network_remote(value: str) -> bool:
     text = value.strip()
-    if "://" in text or text.lower().startswith("git@"):
+    low = text.lower()
+    if "://" in text or low.startswith(("git@", "github.com/", "file:")):
         return True
     return ":" in text and not text.startswith(("/", "."))
 
@@ -176,8 +212,9 @@ def require_owner_name(repo: str) -> str:
 def refuse_public(value: str) -> None:
     """Reject the public repo, and reject a network remote this code cannot parse.
 
-    A local path or ``file:`` URL is not a GitHub remote. Anything that looks like a
-    network remote but is not exactly ``github.com`` fails closed instead of being ignored.
+    A local path or a ``file://`` URL with an empty or localhost host is not a GitHub remote.
+    Anything that looks like a network remote but is not exactly ``https`` or ``ssh`` to
+    ``github.com`` fails closed instead of being ignored.
     """
     text = (value or "").strip()
     if not text or _is_local_path(text) or _is_file_url(text):
@@ -190,13 +227,19 @@ def refuse_public(value: str) -> None:
 
 
 def validate_remote(remote: str, repo: str) -> str:
-    """Allow a local path, a file URL, or a github.com URL for this exact repo. Nothing else."""
+    """Allow a local path, a file:// URL, or an https/ssh github.com URL for this exact repo."""
     name = require_owner_name(repo)
     text = (remote or "").strip()
     if not text:
         raise ValidationError("refusing unparseable backup remote")
-    if _is_local_path(text) or _is_file_url(text):
+    if _is_local_path(text):
         return text
+    if text.lower().startswith("file:"):
+        if _file_url_path(text) is None:
+            raise ValidationError("refusing unparseable backup remote")
+        return text
+    if "://" not in text:
+        raise ValidationError("refusing unparseable backup remote")
     canon = canonical_github_repo(text)
     if canon is None:
         raise ValidationError("refusing unparseable backup remote")
@@ -205,6 +248,27 @@ def validate_remote(remote: str, repo: str) -> str:
     if canon != name.lower():
         raise ValidationError("backup remote does not match the configured repo")
     return text
+
+
+def canonical_push_url(remote: str, repo: str) -> str:
+    """The URL git will be given. Never the caller's string when that string is a GitHub remote.
+
+    https becomes ``https://github.com/<repo>.git``. ssh becomes ``ssh://git@github.com/<repo>.git``.
+    A file URL becomes ``file://`` plus its absolute path. A local filesystem path is kept.
+    """
+    name = require_owner_name(repo)
+    text = validate_remote(remote, name)
+    if _is_local_path(text):
+        return text
+    file_path = _file_url_path(text)
+    if file_path is not None:
+        return "file://" + file_path
+    scheme = (urlparse(text).scheme or "").lower()
+    if scheme == "ssh":
+        return f"ssh://git@github.com/{name}.git"
+    if scheme == "https":
+        return f"https://github.com/{name}.git"
+    raise ValidationError("refusing unparseable backup remote")
 
 
 def normalize_repo(value: str) -> str:
@@ -367,6 +431,23 @@ def _sha256_file(path: Path) -> str:
 def _scrub_env() -> dict[str, str]:
     env = os.environ.copy()
     env.pop("OMG_BACKUP_PASSPHRASE", None)
+    return env
+
+
+def _git_publish_env() -> dict[str, str]:
+    """Git environment for a kit push. Global and system config cannot rewrite the URL.
+
+    ``url.insteadOf`` in the operator's gitconfig, or a ``GIT_CONFIG_KEY_*`` injection, would
+    send the kit to a different remote while the command still exits 0. Those sources are dropped.
+    The checkout's own config is checked separately and refused when it contains a rewrite.
+    """
+    env = _scrub_env()
+    for key in list(env):
+        if (key == "GIT_CONFIG_COUNT" or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+                or key in {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"}):
+            env.pop(key, None)
+    env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
     return env
 
 
@@ -1142,11 +1223,20 @@ def _same_remote(left: str, right: str) -> bool:
 def _remote_for(target: dict[str, Any]) -> str:
     repo = require_owner_name(str(target["repo"]))
     remote = target.get("remote") or f"https://github.com/{repo}.git"
-    return validate_remote(str(remote), repo)
+    return canonical_push_url(str(remote), repo)
 
 
 def _git(runner, checkout: Path, args: list[str]):
-    return _invoke(runner, ["git", "-C", str(checkout), *args])
+    return _invoke(runner, ["git", "-C", str(checkout), *args], env=_git_publish_env())
+
+
+def _refuse_git_redirect(runner, checkout: Path) -> None:
+    """Fail closed when the checkout's own config would rewrite the push URL."""
+    cp = _git(runner, checkout, ["config", "--local", "--get-regexp", "insteadof"])
+    if cp.returncode not in (0, 1):
+        raise ValidationError("could not verify that git will not redirect the kit push")
+    if cp.returncode == 0 and (cp.stdout or "").strip():
+        raise ValidationError("refusing git push: url rewrite would send the kit elsewhere")
 
 
 def assert_repo_private(repo: str, runner) -> None:
@@ -1230,7 +1320,7 @@ def push_github(paths: Paths, bundle: Path, target: dict[str, Any], policy: dict
     checkout.mkdir(parents=True, exist_ok=True)
     os.chmod(checkout, 0o700)
     if not (checkout / ".git").is_dir():
-        cp = _invoke(runner, ["git", "init", "-b", "main", str(checkout)])
+        cp = _invoke(runner, ["git", "init", "-b", "main", str(checkout)], env=_git_publish_env())
         if cp.returncode != 0:
             raise ValidationError("git init of the recovery checkout failed")
         cp = _git(runner, checkout, ["remote", "add", "origin", remote])
@@ -1241,9 +1331,16 @@ def push_github(paths: Paths, bundle: Path, target: dict[str, Any], policy: dict
         if cp.returncode != 0:
             raise ValidationError("recovery checkout has no origin")
         current = (cp.stdout or "").strip()
-        validate_remote(current, repo)
-        if not _same_remote(current, remote):
-            raise ValidationError("recovery checkout origin does not match the configured remote")
+        if current != remote:
+            try:
+                same = canonical_push_url(current, repo) == remote
+            except ValidationError:
+                raise ValidationError("recovery checkout origin does not match the configured remote") from None
+            if not same:
+                raise ValidationError("recovery checkout origin does not match the configured remote")
+            cp = _git(runner, checkout, ["remote", "set-url", "origin", remote])
+            if cp.returncode != 0:
+                raise ValidationError("git remote set-url failed")
     kit_dest = checkout / "kit"
     _publish_kit(resolve_kit(paths), kit_dest)
     readme = checkout / "README.md"
@@ -1254,11 +1351,13 @@ def push_github(paths: Paths, bundle: Path, target: dict[str, Any], policy: dict
     status = _git(runner, checkout, ["status", "--porcelain", "--", "kit", "README.md"])
     if (status.stdout or "").strip():
         cp = _invoke(runner, ["git", "-C", str(checkout), "-c", "user.name=omg-backup",
-                              "-c", "user.email=omg-backup@localhost", "commit", "-m", "update recovery kit"])
+                              "-c", "user.email=omg-backup@localhost", "commit", "-m", "update recovery kit"],
+                     env=_git_publish_env())
         if cp.returncode != 0:
             raise ValidationError("git commit of the recovery kit failed")
     # A commit can succeed while the push fails. The next run has a clean tree and must still push.
     assert_repo_private(repo, runner)
+    _refuse_git_redirect(runner, checkout)
     cp = _git(runner, checkout, ["push", "origin", "HEAD:main"])
     if cp.returncode != 0:
         raise ValidationError("git push of the recovery kit failed")

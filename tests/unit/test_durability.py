@@ -155,16 +155,20 @@ def test_public_repository_is_refused_before_a_command_runs(omg_home):
         "ssh://git@github.com/pysol-dev/oh-my-grok",
         "https://github.com./pysol-dev/oh-my-grok.git",
     )
+    not_a_github_url = {
+        "github.com/pysol-dev/oh-my-grok",
+        "git@github.com:pysol-dev/oh-my-grok.git",
+    }
     for value in bypasses:
-        if "www.github.com" in value or "ssh.github.com" in value:
-            with pytest.raises(ValidationError):
-                durability.refuse_public(value)
-            with pytest.raises(ValidationError):
-                durability.validate_remote(value, "example/private-backups")
-            continue
         with pytest.raises(ValidationError):
             durability.refuse_public(value)
-        assert durability.canonical_github_repo(value) == "pysol-dev/oh-my-grok"
+        with pytest.raises(ValidationError):
+            durability.validate_remote(value, "example/private-backups")
+        canon = durability.canonical_github_repo(value)
+        if value in not_a_github_url or "www.github.com" in value or "ssh.github.com" in value:
+            assert canon is None
+        else:
+            assert canon == "pysol-dev/oh-my-grok"
     with pytest.raises(ValidationError):
         durability.require_owner_name("https://github.com/example/private.git")
     with pytest.raises(ValidationError):
@@ -337,7 +341,7 @@ def test_github_push_uses_a_local_remote_and_never_force(omg_home, tmp_path):
     def runner(argv, cwd=None, env=None):
         calls.append(list(argv))
         if argv[0] == "git":
-            return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=60, check=False)
+            return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=60, check=False)
         gh = _fake_gh(argv, releases)
         if gh is not None:
             if argv[:3] == ["gh", "release", "delete"]:
@@ -399,7 +403,7 @@ def test_a_rejected_kit_push_is_retried_on_the_next_publication(omg_home, tmp_pa
             if len(pushes) == 1:
                 return subprocess.CompletedProcess(argv, 1, "", "rejected")
         if argv[0] == "git":
-            return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=60, check=False)
+            return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=60, check=False)
         gh = _fake_gh(argv, releases)
         if gh is not None:
             return gh
@@ -745,7 +749,7 @@ def test_incomplete_release_is_reuploaded_and_checked(omg_home, tmp_path):
         if argv[:2] == ["gh", "api"]:
             return subprocess.CompletedProcess(argv, 0, json.dumps({"private": True, "visibility": "private"}), "")
         if argv[0] == "git":
-            return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=60, check=False)
+            return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=60, check=False)
         if argv[:3] == ["gh", "release", "view"]:
             return subprocess.CompletedProcess(argv, 0, json.dumps({"assets": state["assets"]}), "")
         if argv[:3] == ["gh", "release", "upload"]:
@@ -773,7 +777,7 @@ def test_incomplete_release_is_reuploaded_and_checked(omg_home, tmp_path):
         if argv[:2] == ["gh", "api"]:
             return subprocess.CompletedProcess(argv, 0, json.dumps({"private": True, "visibility": "private"}), "")
         if argv[0] == "git":
-            return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=60, check=False)
+            return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=60, check=False)
         if argv[:3] == ["gh", "release", "view"]:
             return subprocess.CompletedProcess(argv, 0, json.dumps({"assets": state["assets"]}), "")
         if argv[:3] == ["gh", "release", "upload"]:
@@ -931,19 +935,193 @@ def test_foreign_signing_key_name_exits_12(omg_home, monkeypatch, tmp_path):
         engine.close()
     other = tmp_path / "other-gpg"
     other.mkdir(mode=0o700)
-    batch = tmp_path / "other.batch"
-    batch.write_text("Key-Type: EdDSA\nKey-Curve: ed25519\nName-Real: not-the-omg-signer\n"
-                     "Expire-Date: 0\n%no-protection\n%commit\n")
-    generated = durability._gpg(other, ["--generate-key", str(batch)])
-    assert generated.returncode == 0, generated.stderr
-    exported = tmp_path / "other.pub"
-    exported_key = durability._gpg(other, ["--armor", "--output", str(exported), "--export", "not-the-omg-signer"])
-    assert exported_key.returncode == 0, exported_key.stderr
-    kit = durability.kit_dir(get_paths())
-    (kit / "signing.pub").write_bytes(exported.read_bytes())
-    db_path = get_paths().db_path
-    digest = durability._sha256_file(db_path)
-    code, text = _capture(lambda: durability.run_recover(check=False, passphrase=PASSPHRASE))
-    assert code == EXIT_VERIFY
-    assert "list-keys failed" not in text
-    assert durability._sha256_file(db_path) == digest
+    try:
+        batch = tmp_path / "other.batch"
+        batch.write_text("Key-Type: EdDSA\nKey-Curve: ed25519\nName-Real: not-the-omg-signer\n"
+                         "Expire-Date: 0\n%no-protection\n%commit\n")
+        generated = durability._gpg(other, ["--generate-key", str(batch)])
+        assert generated.returncode == 0, generated.stderr
+        exported = tmp_path / "other.pub"
+        exported_key = durability._gpg(other, ["--armor", "--output", str(exported), "--export", "not-the-omg-signer"])
+        assert exported_key.returncode == 0, exported_key.stderr
+        kit = durability.kit_dir(get_paths())
+        (kit / "signing.pub").write_bytes(exported.read_bytes())
+        db_path = get_paths().db_path
+        digest = durability._sha256_file(db_path)
+        code, text = _capture(lambda: durability.run_recover(check=False, passphrase=PASSPHRASE))
+        assert code == EXIT_VERIFY
+        assert "list-keys failed" not in text
+        assert durability._sha256_file(db_path) == digest
+    finally:
+        subprocess.run(["gpgconf", "--homedir", str(other), "--kill", "gpg-agent"],
+                       capture_output=True, check=False)
+        agent_env = os.environ.copy()
+        agent_env["GNUPGHOME"] = str(other)
+        agent_env.pop("OMG_BACKUP_PASSPHRASE", None)
+        subprocess.run(["gpgconf", "--kill", "gpg-agent"], env=agent_env, capture_output=True, check=False)
+
+
+def test_dot_segments_cannot_name_the_configured_repo():
+    """Momus test_10: git collapses /../.. onto the public repository. The parser must not."""
+    repo = "example/private-backups"
+    attacks = (
+        f"https://github.com/{repo}/../../pysol-dev/oh-my-grok.git",
+        f"https://github.com/{repo}/%2e%2e/%2e%2e/pysol-dev/oh-my-grok.git",
+        f"https://github.com/{repo}.git/../../pysol-dev/oh-my-grok.git",
+        f"https://github.com/{repo}/%2e%2e%2f%2e%2e%2fpysol-dev/oh-my-grok.git",
+        f"ssh://git@github.com/{repo}.git/../../pysol-dev/oh-my-grok.git",
+        f"git@github.com:{repo}/../../pysol-dev/oh-my-grok.git",
+        f"ssh://git@github.com/{repo}/%2e%2e/%2e%2e/pysol-dev/oh-my-grok.git",
+        "https://github.com/example//private-backups.git",
+        "https://github.com/example/./private-backups.git",
+        "https://github.com/example/private-backups.git/.",
+    )
+    for remote in attacks:
+        assert durability.canonical_github_repo(remote) is None
+        with pytest.raises(ValidationError):
+            durability.validate_remote(remote, repo)
+
+
+def test_github_remote_schemes_are_only_https_and_ssh(tmp_path):
+    repo = "example/private-backups"
+    rejected = (
+        f"http://github.com/{repo}.git",
+        f"git://github.com/{repo}.git",
+        f"persistent-https://github.com/{repo}.git",
+        f"git@github.com:{repo}.git",
+        f"github.com/{repo}.git",
+        repo,
+        f"file:{repo}.git",
+        "file://github.com/example/private-backups.git",
+        "file://127.0.0.1/tmp/bare.git",
+        "file://localhost/tmp/../bare.git",
+        "file://user@localhost/tmp/bare.git",
+    )
+    for remote in rejected:
+        with pytest.raises(ValidationError):
+            durability.validate_remote(remote, repo)
+    local = tmp_path / "bare.git"
+    local.mkdir()
+    assert durability._file_url_path(f"file://{local}") == str(local)
+    assert durability._file_url_path(f"file://localhost{local}") == str(local)
+    assert durability.validate_remote(f"file://{local}", repo) == f"file://{local}"
+    assert durability.validate_remote(f"file://localhost{local}", repo) == f"file://localhost{local}"
+
+
+def test_push_rebuilds_the_github_url_and_refuses_dot_segments(omg_home, tmp_path):
+    paths = get_paths()
+    kit = durability.kit_dir(paths)
+    kit.mkdir(parents=True)
+    for name in KIT_FILES:
+        (kit / name).write_text("kit-" + name + "\n")
+    bundle = tmp_path / "omg-20261117T090000Z.tar.gpg"
+    bundle.write_bytes(b"cipher")
+    (tmp_path / (bundle.name + ".sig")).write_bytes(b"sig")
+    calls = []
+    envs = []
+    releases: dict[str, list[Path]] = {}
+
+    def runner(argv, cwd=None, env=None):
+        calls.append(list(argv))
+        if argv[0] == "git":
+            envs.append(env)
+            if "config" in argv and "insteadof" in argv:
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        gh = _fake_gh(argv, releases)
+        if gh is not None:
+            return gh
+        raise AssertionError(argv)
+
+    policy = {"backup_keep_hourly": 1, "backup_keep_daily": 1, "backup_size_cap_bytes": 1000}
+    repo = "Example/Private-Backups"
+    decorated = "https://user:token@github.com./Example/Private-Backups.git/"
+    durability.push_github(paths, bundle, {"type": "github_release", "repo": repo, "remote": decorated,
+                                           "checkout": str(tmp_path / "https-co")}, policy, runner=runner)
+    added = [cmd for cmd in calls if cmd[0] == "git" and "remote" in cmd and "add" in cmd]
+    assert added == [["git", "-C", str(tmp_path / "https-co"), "remote", "add", "origin",
+                      "https://github.com/Example/Private-Backups.git"]]
+    assert all(env is not None and env.get("GIT_CONFIG_GLOBAL") == "/dev/null" and env.get("GIT_CONFIG_NOSYSTEM") == "1"
+               for env in envs)
+    assert all("GIT_CONFIG_COUNT" not in (env or {}) for env in envs)
+    assert not any("user:token" in " ".join(cmd) or "github.com." in " ".join(cmd) for cmd in calls if cmd[0] == "git")
+
+    calls.clear()
+    ssh_remote = "ssh://attacker@github.com:443/Example/Private-Backups.git"
+    durability.push_github(paths, bundle, {"type": "github_release", "repo": repo, "remote": ssh_remote,
+                                           "checkout": str(tmp_path / "ssh-co")}, policy, runner=runner)
+    added = [cmd for cmd in calls if cmd[0] == "git" and "remote" in cmd and "add" in cmd]
+    assert added[0][-1] == "ssh://git@github.com/Example/Private-Backups.git"
+    assert "attacker@" not in added[0][-1]
+
+    for remote in (f"https://github.com/{repo}/../../pysol-dev/oh-my-grok.git",
+                   f"https://github.com/{repo}/%2e%2e/%2e%2e/pysol-dev/oh-my-grok.git",
+                   f"ssh://git@github.com/{repo}.git/../../pysol-dev/oh-my-grok.git",
+                   f"git@github.com:{repo}/../../pysol-dev/oh-my-grok.git"):
+        calls.clear()
+        with pytest.raises(ValidationError):
+            durability.push_github(paths, bundle, {"type": "github_release", "repo": repo, "remote": remote,
+                                                   "checkout": str(tmp_path / "nope")}, policy, runner=runner)
+        assert not any(cmd[0] == "git" for cmd in calls)
+        assert not any("pysol-dev/oh-my-grok" in " ".join(cmd) for cmd in calls)
+
+
+def test_url_insteadof_cannot_redirect_the_kit_push(omg_home, tmp_path, monkeypatch):
+    intended = tmp_path / "intended.git"
+    decoy = tmp_path / "decoy.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(intended)], check=True, capture_output=True)
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(decoy)], check=True, capture_output=True)
+    config = tmp_path / "redirect.gitconfig"
+    config.write_text(f'[url "{decoy}"]\n\tinsteadOf = {intended}\n')
+    system = tmp_path / "system.gitconfig"
+    system.write_text(f'[url "{decoy}"]\n\tpushInsteadOf = {intended}\n')
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(system))
+    monkeypatch.delenv("GIT_CONFIG_NOSYSTEM", raising=False)
+    paths = get_paths()
+    kit = durability.kit_dir(paths)
+    kit.mkdir(parents=True)
+    for name in KIT_FILES:
+        (kit / name).write_text("kit-" + name + "\n")
+    bundle = tmp_path / "omg-20261117T091500Z.tar.gpg"
+    bundle.write_bytes(b"cipher")
+    (tmp_path / (bundle.name + ".sig")).write_bytes(b"sig")
+    releases = {}
+
+    def runner(argv, cwd=None, env=None):
+        if argv[0] == "git":
+            return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=60, check=False)
+        gh = _fake_gh(argv, releases)
+        if gh is not None:
+            return gh
+        raise AssertionError(argv)
+
+    checkout = tmp_path / "checkout"
+    result = durability.push_github(
+        paths, bundle, {"type": "github_release", "repo": "example/private-backups", "remote": str(intended),
+                        "checkout": str(checkout)},
+        {"backup_keep_hourly": 4, "backup_keep_daily": 2, "backup_size_cap_bytes": 1_000_000}, runner=runner)
+    assert result["ok"] is True
+    intended_head = subprocess.run(["git", "--git-dir", str(intended), "rev-parse", "HEAD"],
+                                   capture_output=True, check=False)
+    decoy_head = subprocess.run(["git", "--git-dir", str(decoy), "rev-parse", "HEAD"],
+                                capture_output=True, check=False)
+    assert intended_head.returncode == 0
+    assert decoy_head.returncode != 0
+    subprocess.run(["git", "-C", str(checkout), "config", f"url.{decoy}.pushInsteadOf", str(intended)],
+                   check=True, capture_output=True)
+    with pytest.raises(ValidationError, match="elsewhere"):
+        durability.push_github(
+            paths, bundle, {"type": "github_release", "repo": "example/private-backups", "remote": str(intended),
+                            "checkout": str(checkout)},
+            {"backup_keep_hourly": 4, "backup_keep_daily": 2, "backup_size_cap_bytes": 1_000_000}, runner=runner)
+    decoy_after = subprocess.run(["git", "--git-dir", str(decoy), "rev-parse", "HEAD"],
+                                 capture_output=True, check=False)
+    assert decoy_after.returncode != 0
+
+
+def test_recover_documents_the_internal_error_exit():
+    text = (ROOT / "spec" / "DURABILITY.md").read_text()
+    table = text.split("### 6.2 Exit codes", 1)[1].split("## 7.", 1)[0]
+    assert "| 1 |" in table
+    assert "internal error" in table.lower()
