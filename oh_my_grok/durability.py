@@ -108,33 +108,60 @@ def _owner_name_from_path(path: str) -> str | None:
     return f"{owner}/{name}".lower()
 
 
-def canonical_github_repo(value: str) -> str | None:
-    """Map a GitHub reference to ``owner/name``.
+def _exact_github_host(host: str) -> bool:
+    """True only for ``github.com`` after stripping trailing dots. Aliases and other hosts are not."""
+    return host.strip().lower().rstrip(".") == "github.com"
 
-    Accepts ``owner/name`` and the URL and scp forms a remote might use
-    (``https://user@host/...``, ``ssh://git@host:port/...``, ``git@host:owner/name.git``,
-    a trailing slash, ``www.`` and ``ssh.`` hostnames). A local filesystem path is not a
-    GitHub repository and returns None.
+
+def canonical_github_repo(value: str) -> str | None:
+    """``owner/name`` when ``value`` names github.com exactly, else None.
+
+    Trailing dots on the host, a ``.git`` suffix, and extra slashes are ignored.
+    ``www.github.com``, ``ssh.github.com``, host aliases, and IP literals are not github.com.
+    A local filesystem path returns None.
     """
     raw = (value or "").strip()
     if not raw:
         return None
-    if "://" not in raw and ":" in raw:
+    if "://" not in raw and ":" in raw and not raw.startswith(("/", ".")):
         matched = re.match(r"^(?:[^@\s]+@)?([^:\s]+):(.+)$", raw)
-        host = matched.group(1).lower() if matched else ""
-        if matched and host.endswith("github.com"):
+        if matched and _exact_github_host(matched.group(1)):
             return _owner_name_from_path(matched.group(2))
+        return None
     url_text = raw
-    if "://" not in url_text and "github.com" in url_text.lower():
+    if "://" not in url_text and url_text.lower().startswith("github.com/"):
         url_text = "https://" + url_text
     if "://" in url_text:
         parsed = urlparse(url_text)
-        host = (parsed.hostname or "").lower()
-        if host == "github.com" or host.endswith(".github.com"):
+        if (parsed.scheme or "").lower() == "file":
+            return None
+        if parsed.hostname and _exact_github_host(parsed.hostname):
             return _owner_name_from_path(parsed.path)
+        return None
     if _OWNER_NAME.fullmatch(raw):
         return raw.lower()
     return None
+
+
+def _is_file_url(value: str) -> bool:
+    return value.strip().lower().startswith("file:")
+
+
+def _is_local_path(value: str) -> bool:
+    text = value.strip()
+    if not text or "://" in text or text.lower().startswith("git@"):
+        return False
+    if ":" in text:
+        return False
+    path = Path(text).expanduser()
+    return path.is_absolute() or text.startswith(".") or path.exists()
+
+
+def _looks_like_network_remote(value: str) -> bool:
+    text = value.strip()
+    if "://" in text or text.lower().startswith("git@"):
+        return True
+    return ":" in text and not text.startswith(("/", "."))
 
 
 def require_owner_name(repo: str) -> str:
@@ -147,10 +174,37 @@ def require_owner_name(repo: str) -> str:
 
 
 def refuse_public(value: str) -> None:
-    """Reject the public oh-my-grok repo before any git or gh command runs."""
-    canon = canonical_github_repo(value)
+    """Reject the public repo, and reject a network remote this code cannot parse.
+
+    A local path or ``file:`` URL is not a GitHub remote. Anything that looks like a
+    network remote but is not exactly ``github.com`` fails closed instead of being ignored.
+    """
+    text = (value or "").strip()
+    if not text or _is_local_path(text) or _is_file_url(text):
+        return
+    canon = canonical_github_repo(text)
     if canon == PUBLIC_REPO or (canon or "").startswith(PUBLIC_REPO + "/"):
         raise ValidationError("refusing backup target that points at the public oh-my-grok repo")
+    if canon is None and _looks_like_network_remote(text):
+        raise ValidationError("refusing unparseable backup remote")
+
+
+def validate_remote(remote: str, repo: str) -> str:
+    """Allow a local path, a file URL, or a github.com URL for this exact repo. Nothing else."""
+    name = require_owner_name(repo)
+    text = (remote or "").strip()
+    if not text:
+        raise ValidationError("refusing unparseable backup remote")
+    if _is_local_path(text) or _is_file_url(text):
+        return text
+    canon = canonical_github_repo(text)
+    if canon is None:
+        raise ValidationError("refusing unparseable backup remote")
+    if canon == PUBLIC_REPO or canon.startswith(PUBLIC_REPO + "/"):
+        raise ValidationError("refusing backup target that points at the public oh-my-grok repo")
+    if canon != name.lower():
+        raise ValidationError("backup remote does not match the configured repo")
+    return text
 
 
 def normalize_repo(value: str) -> str:
@@ -184,7 +238,7 @@ def validate_targets(targets) -> None:
             if target.get("remote"):
                 if not isinstance(target["remote"], str):
                     raise ValidationError("github_release remote must be a string")
-                refuse_public(target["remote"])
+                validate_remote(target["remote"], repo)
             for key in ("checkout", "mirror"):
                 if key in target and (not isinstance(target[key], str) or not target[key].strip()):
                     raise ValidationError(f"github_release {key} must be a non-empty string")
@@ -399,6 +453,19 @@ def _fingerprint(homedir: Path, uid: str) -> str:
             if len(parts) > 9 and parts[9]:
                 return parts[9]
     raise ValidationError("backup key has no fingerprint")
+
+
+def _imported_fingerprint(homedir: Path) -> str:
+    """Fingerprint of the key that was imported, whatever its user id is."""
+    cp = _gpg(homedir, ["--with-colons", "--list-keys"])
+    if cp.returncode != 0:
+        raise BundleInvalid("could not read the signing key")
+    for line in (cp.stdout or "").splitlines():
+        if line.startswith("fpr:"):
+            parts = line.split(":")
+            if len(parts) > 9 and parts[9]:
+                return parts[9]
+    raise BundleInvalid("signing key has no fingerprint")
 
 
 def _secret_uids(homedir: Path) -> list[str]:
@@ -1073,10 +1140,9 @@ def _same_remote(left: str, right: str) -> bool:
 
 
 def _remote_for(target: dict[str, Any]) -> str:
-    remote = target.get("remote") or f"https://github.com/{target['repo']}.git"
-    refuse_public(target["repo"])
-    refuse_public(remote)
-    return remote
+    repo = require_owner_name(str(target["repo"]))
+    remote = target.get("remote") or f"https://github.com/{repo}.git"
+    return validate_remote(str(remote), repo)
 
 
 def _git(runner, checkout: Path, args: list[str]):
@@ -1093,7 +1159,7 @@ def assert_repo_private(repo: str, runner) -> None:
         data = json.loads(cp.stdout or "")
     except json.JSONDecodeError:
         raise ValidationError("could not verify that the backup repo is private") from None
-    if not isinstance(data, dict) or data.get("private") is not True:
+    if not isinstance(data, dict) or data.get("visibility") != "private":
         raise ValidationError("refusing to publish to a repository that is not private")
 
 
@@ -1157,8 +1223,8 @@ def _ensure_release_assets(repo: str, bundle: Path, runner) -> None:
 def push_github(paths: Paths, bundle: Path, target: dict[str, Any], policy: dict[str, Any], *, runner=None) -> dict[str, Any]:
     runner = runner or subprocess_runner
     repo = require_owner_name(target["repo"])
-    assert_repo_private(repo, runner)
     remote = _remote_for(target)
+    assert_repo_private(repo, runner)
     checkout = Path(target["checkout"]) if target.get("checkout") else (
         paths.state_dir / "backups" / "github" / repo.replace("/", "__"))
     checkout.mkdir(parents=True, exist_ok=True)
@@ -1175,7 +1241,7 @@ def push_github(paths: Paths, bundle: Path, target: dict[str, Any], policy: dict
         if cp.returncode != 0:
             raise ValidationError("recovery checkout has no origin")
         current = (cp.stdout or "").strip()
-        refuse_public(current)
+        validate_remote(current, repo)
         if not _same_remote(current, remote):
             raise ValidationError("recovery checkout origin does not match the configured remote")
     kit_dest = checkout / "kit"
@@ -1576,7 +1642,10 @@ def verify_signature(bundle: Path, kit: Path, expected_fingerprint: str) -> None
         cp = _gpg(home, ["--import", str(kit / "signing.pub")])
         if cp.returncode != 0:
             raise BundleInvalid("could not import the signing public key")
-        imported = _fingerprint(home, UID_SIGNING).lower()
+        try:
+            imported = _imported_fingerprint(home).lower()
+        except ValidationError as exc:
+            raise BundleInvalid("could not read the signing key") from exc
         if imported != expected:
             raise BundleInvalid("signing fingerprint does not match the pinned key")
         cp = _gpg(home, ["--status-fd", "1", "--trust-model", "always", "--verify", str(sig), str(bundle)])
@@ -1762,7 +1831,7 @@ def run_recover(*, check: bool, passphrase: str, runner=None) -> int:
             return EXIT_VERIFY
         try:
             verify_signature(bundle, kit, pinned_signing_fingerprint(paths, kit))
-        except BundleInvalid as exc:
+        except (BundleInvalid, ValidationError) as exc:
             print(redact(exc.message), file=sys.stderr)
             return EXIT_VERIFY
         tmp = _private_dir()

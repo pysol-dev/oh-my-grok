@@ -42,6 +42,10 @@ def _gpg_agent_per_test(tmp_path, monkeypatch):
     for directory in targets:
         subprocess.run(["gpgconf", "--homedir", str(directory), "--kill", "gpg-agent"],
                        capture_output=True, check=False)
+    agent_env = os.environ.copy()
+    agent_env["GNUPGHOME"] = str(home)
+    agent_env.pop("OMG_BACKUP_PASSPHRASE", None)
+    subprocess.run(["gpgconf", "--kill", "gpg-agent"], env=agent_env, capture_output=True, check=False)
 
 
 def _absent(text: str) -> None:

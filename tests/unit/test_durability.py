@@ -59,7 +59,7 @@ def _fake_gh(argv, releases: dict[str, list[Path]]) -> subprocess.CompletedProce
     if not argv or argv[0] != "gh":
         return None
     if argv[:2] == ["gh", "api"]:
-        return subprocess.CompletedProcess(argv, 0, json.dumps({"private": True}), "")
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"private": True, "visibility": "private"}), "")
     if argv[:3] == ["gh", "release", "view"]:
         tag = argv[3]
         if tag not in releases:
@@ -92,6 +92,10 @@ def _gpg_agent_per_test(tmp_path, monkeypatch):
     for directory in targets:
         subprocess.run(["gpgconf", "--homedir", str(directory), "--kill", "gpg-agent"],
                        capture_output=True, check=False)
+    agent_env = os.environ.copy()
+    agent_env["GNUPGHOME"] = str(home)
+    agent_env.pop("OMG_BACKUP_PASSPHRASE", None)
+    subprocess.run(["gpgconf", "--kill", "gpg-agent"], env=agent_env, capture_output=True, check=False)
 
 
 def _absent(blob, needle: str) -> None:
@@ -149,8 +153,15 @@ def test_public_repository_is_refused_before_a_command_runs(omg_home):
         "ssh://git@ssh.github.com:443/pysol-dev/oh-my-grok.git",
         "git@github.com:pysol-dev/oh-my-grok.git",
         "ssh://git@github.com/pysol-dev/oh-my-grok",
+        "https://github.com./pysol-dev/oh-my-grok.git",
     )
     for value in bypasses:
+        if "www.github.com" in value or "ssh.github.com" in value:
+            with pytest.raises(ValidationError):
+                durability.refuse_public(value)
+            with pytest.raises(ValidationError):
+                durability.validate_remote(value, "example/private-backups")
+            continue
         with pytest.raises(ValidationError):
             durability.refuse_public(value)
         assert durability.canonical_github_repo(value) == "pysol-dev/oh-my-grok"
@@ -732,7 +743,7 @@ def test_incomplete_release_is_reuploaded_and_checked(omg_home, tmp_path):
 
     def runner(argv, cwd=None, env=None):
         if argv[:2] == ["gh", "api"]:
-            return subprocess.CompletedProcess(argv, 0, json.dumps({"private": True}), "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"private": True, "visibility": "private"}), "")
         if argv[0] == "git":
             return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=60, check=False)
         if argv[:3] == ["gh", "release", "view"]:
@@ -760,7 +771,7 @@ def test_incomplete_release_is_reuploaded_and_checked(omg_home, tmp_path):
 
     def still_wrong(argv, cwd=None, env=None):
         if argv[:2] == ["gh", "api"]:
-            return subprocess.CompletedProcess(argv, 0, json.dumps({"private": True}), "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"private": True, "visibility": "private"}), "")
         if argv[0] == "git":
             return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=60, check=False)
         if argv[:3] == ["gh", "release", "view"]:
@@ -832,3 +843,107 @@ def test_child_processes_do_not_receive_the_passphrase(monkeypatch, tmp_path):
     durability._shred_file(target)
     script = (ROOT / "scripts" / "recover.sh").read_text()
     assert script.index("unset OMG_BACKUP_PASSPHRASE") < script.index('"$ROOT/omg" watchdog ensure')
+
+
+def test_remote_fails_closed_unless_it_is_local_or_this_github_repo(tmp_path):
+    repo = "example/private-backups"
+    refused = (
+        "https://github.com./pysol-dev/oh-my-grok.git",
+        "github-alias:pysol-dev/oh-my-grok.git",
+        "https://192.0.2.1/pysol-dev/oh-my-grok.git",
+        "git@192.0.2.1:pysol-dev/oh-my-grok.git",
+        "https://www.github.com/example/private-backups.git",
+        "ssh://git@ssh.github.com:443/example/private-backups.git",
+        "https://github.com/someone/else.git",
+        "git@github.com:pysol-dev/oh-my-grok.git",
+        "not a remote",
+    )
+    for remote in refused:
+        with pytest.raises(ValidationError):
+            durability.validate_remote(remote, repo)
+    local = tmp_path / "bare.git"
+    local.mkdir()
+    assert durability.validate_remote(str(local), repo) == str(local)
+    assert durability.validate_remote(f"file://{local}", repo) == f"file://{local}"
+    allowed = "https://github.com/Example/Private-Backups.git"
+    assert durability.validate_remote(allowed, "Example/Private-Backups") == allowed
+    dotted = "https://github.com./example/private-backups.git/"
+    assert durability.canonical_github_repo(dotted) == repo
+    assert durability.validate_remote(dotted, repo) == dotted
+
+
+def test_private_repo_cannot_push_its_kit_to_another_repository(omg_home, tmp_path):
+    """Momus test_5c: a private repo whose remote names a different public repository."""
+    calls = []
+
+    def runner(argv, cwd=None, env=None):
+        calls.append(list(argv))
+        if argv[:2] == ["gh", "api"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(
+                {"private": True, "visibility": "private"}), "")
+        raise AssertionError(argv)
+
+    bundle = tmp_path / "omg-20261117T070809Z.tar.gpg"
+    bundle.write_bytes(b"cipher")
+    (tmp_path / (bundle.name + ".sig")).write_bytes(b"sig")
+    policy = {"backup_keep_hourly": 1, "backup_keep_daily": 1, "backup_size_cap_bytes": 1000}
+    for remote in ("https://github.com/pysol-dev/oh-my-grok.git", "https://github.com/someone/public.git",
+                   "github-alias:example/private-backups.git", "https://198.51.100.8/example/private-backups.git"):
+        calls.clear()
+        with pytest.raises(ValidationError):
+            durability.push_github(get_paths(), bundle,
+                                   {"type": "github_release", "repo": "example/private-backups", "remote": remote,
+                                    "checkout": str(tmp_path / "co")},
+                                   policy, runner=runner)
+        assert not any(cmd and cmd[0] == "git" for cmd in calls)
+        assert not any(cmd[:2] == ["gh", "api"] for cmd in calls)
+
+
+def test_internal_visibility_is_not_private(omg_home, tmp_path):
+    calls = []
+
+    def runner(argv, cwd=None, env=None):
+        calls.append(list(argv))
+        if argv[:2] == ["gh", "api"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(
+                {"private": True, "visibility": "internal"}), "")
+        raise AssertionError(argv)
+
+    bundle = tmp_path / "omg-20261117T080910Z.tar.gpg"
+    bundle.write_bytes(b"cipher")
+    (tmp_path / (bundle.name + ".sig")).write_bytes(b"sig")
+    with pytest.raises(ValidationError, match="not private"):
+        durability.push_github(get_paths(), bundle,
+                               {"type": "github_release", "repo": "example/internal-backups",
+                                "remote": str(tmp_path / "bare.git"), "checkout": str(tmp_path / "co")},
+                               {"backup_keep_hourly": 1, "backup_keep_daily": 1, "backup_size_cap_bytes": 1000},
+                               runner=runner)
+    assert not any(cmd and cmd[0] == "git" for cmd in calls)
+
+
+def test_foreign_signing_key_name_exits_12(omg_home, monkeypatch, tmp_path):
+    monkeypatch.setenv("OMG_BACKUP_PASSPHRASE", PASSPHRASE)
+    durability.init_keys(get_paths(), passphrase=PASSPHRASE)
+    engine = Engine(transport=lambda *a, **k: HttpResult(200, None, None))
+    try:
+        durability.create_bundle(engine.conn, engine.paths, push=False)
+    finally:
+        engine.close()
+    other = tmp_path / "other-gpg"
+    other.mkdir(mode=0o700)
+    batch = tmp_path / "other.batch"
+    batch.write_text("Key-Type: EdDSA\nKey-Curve: ed25519\nName-Real: not-the-omg-signer\n"
+                     "Expire-Date: 0\n%no-protection\n%commit\n")
+    generated = durability._gpg(other, ["--generate-key", str(batch)])
+    assert generated.returncode == 0, generated.stderr
+    exported = tmp_path / "other.pub"
+    exported_key = durability._gpg(other, ["--armor", "--output", str(exported), "--export", "not-the-omg-signer"])
+    assert exported_key.returncode == 0, exported_key.stderr
+    kit = durability.kit_dir(get_paths())
+    (kit / "signing.pub").write_bytes(exported.read_bytes())
+    db_path = get_paths().db_path
+    digest = durability._sha256_file(db_path)
+    code, text = _capture(lambda: durability.run_recover(check=False, passphrase=PASSPHRASE))
+    assert code == EXIT_VERIFY
+    assert "list-keys failed" not in text
+    assert durability._sha256_file(db_path) == digest
