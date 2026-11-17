@@ -302,6 +302,88 @@ def test_github_push_uses_a_local_remote_and_never_force(omg_home, tmp_path):
     assert not any("--force" in cmd or (cmd[0] == "git" and "-f" in cmd) for cmd in calls)
 
 
+def test_a_rejected_kit_push_is_retried_on_the_next_publication(omg_home, tmp_path):
+    paths = get_paths()
+    kit = durability.kit_dir(paths)
+    kit.mkdir(parents=True)
+    for name in KIT_FILES:
+        (kit / name).write_text("kit-" + name + "\n")
+        os.chmod(kit / name, 0o600)
+    bundle = tmp_path / "omg-20261117T030405Z.tar.gpg"
+    bundle.write_bytes(b"ciphertext")
+    (tmp_path / (bundle.name + ".sig")).write_bytes(b"signature")
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare)], check=True, capture_output=True)
+    releases = {}
+    pushes = []
+
+    def runner(argv, cwd=None, env=None):
+        if argv[0] == "git" and "push" in argv:
+            pushes.append(list(argv))
+            if len(pushes) == 1:
+                return subprocess.CompletedProcess(argv, 1, "", "rejected")
+        if argv[0] == "git":
+            return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=60, check=False)
+        if argv[:3] == ["gh", "release", "view"]:
+            tag = argv[3]
+            if tag not in releases:
+                return subprocess.CompletedProcess(argv, 1, "", "missing")
+            assets = [{"name": name} for name in releases[tag]]
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"assets": assets}), "")
+        if argv[:3] == ["gh", "release", "create"]:
+            tag = argv[3]
+            files = [Path(arg).name for arg in argv[4:] if not arg.startswith("--")]
+            releases[tag] = files
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:3] == ["gh", "release", "list"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps([{"tagName": tag} for tag in releases]), "")
+        if argv[:3] == ["gh", "release", "delete"]:
+            releases.pop(argv[3], None)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        raise AssertionError(argv)
+
+    target = {"type": "github_release", "repo": "example/omg-private-backups", "remote": str(bare),
+              "checkout": str(tmp_path / "checkout")}
+    policy = {"backup_keep_hourly": 48, "backup_keep_daily": 14, "backup_size_cap_bytes": 1_000_000}
+    with pytest.raises(ValidationError, match="git push"):
+        durability.push_github(paths, bundle, target, policy, runner=runner)
+    unborn = subprocess.run(["git", "-C", str(bare), "rev-parse", "--verify", "HEAD"], capture_output=True)
+    assert unborn.returncode != 0
+    result = durability.push_github(paths, bundle, target, policy, runner=runner)
+    assert result["ok"] is True
+    assert len(pushes) == 2
+    assert all("--force" not in cmd and "-f" not in cmd for cmd in pushes)
+    listed = subprocess.run(["git", "-C", str(bare), "ls-tree", "-r", "--name-only", "HEAD"],
+                            check=True, capture_output=True, text=True)
+    assert "kit/encryption.sec.asc" in listed.stdout.split()
+    assert "kit/signing.pub" in listed.stdout.split()
+
+
+def test_custom_init_kit_is_the_directory_publication_copies(omg_home, monkeypatch, tmp_path):
+    custom = tmp_path / "custom-kit"
+    monkeypatch.setenv("OMG_BACKUP_PASSPHRASE", PASSPHRASE)
+    info = durability.init_keys(get_paths(), passphrase=PASSPHRASE, kit=custom)
+    assert Path(info["kit"]).resolve() == custom.resolve()
+    assert Path(durability.kit_pointer_path(get_paths()).read_text().strip()) == custom.resolve()
+    assert durability.resolve_kit(get_paths()).resolve() == custom.resolve()
+    assert not durability._kit_complete(durability.kit_dir(get_paths()))
+    default = durability.kit_dir(get_paths())
+    default.mkdir(parents=True)
+    for name in KIT_FILES:
+        (default / name).write_text("wrong-kit-" + name)
+    bundle = tmp_path / "omg-20261117T040506Z.tar.gpg"
+    bundle.write_bytes(b"ciphertext")
+    (tmp_path / (bundle.name + ".sig")).write_bytes(b"sig")
+    store = tmp_path / "store"
+    policy = {"backup_keep_hourly": 48, "backup_keep_daily": 14, "backup_size_cap_bytes": 1_000_000}
+    durability.push_agent_store(get_paths(), bundle,
+                                {"type": "agent_store", "path": str(store)}, policy)
+    for name in KIT_FILES:
+        assert durability._sha256_file(store / "kit" / name) == durability._sha256_file(custom / name)
+    assert b"PRIVATE KEY" not in (store / "kit" / "signing.pub").read_bytes()
+    assert b"wrong-kit-" not in (store / "kit" / "encryption.pub").read_bytes()
+
+
 def test_raw_sqlite_backup_still_writes_a_database(omg_home, tmp_path):
     env = os.environ.copy()
     dest = tmp_path / "snap.sqlite3"

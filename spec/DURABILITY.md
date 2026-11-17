@@ -65,7 +65,7 @@ Unknown target types, unknown target keys, and a target that names the public `p
 
 ## 3. Keys (`omg backup init-key`)
 
-One-time. A second run exits conflict and does not overwrite.
+One-time. A second run exits conflict and does not overwrite. `--kit` chooses the recovery kit directory (default `state/recovery-kit`). The chosen absolute path is recorded in `state/secrets/backup-kit.path` (mode `0600`). Later publication and local kit lookup read that path. A symlink kit directory is refused.
 
 The passphrase is read only from the environment variable `OMG_BACKUP_PASSPHRASE`. There is no passphrase argument. The value is never logged, never placed on a command line, and is registered with the redactor. It must be a single non-empty line of at least 12 characters.
 
@@ -115,7 +115,7 @@ Retention, applied to the local bundle directory and to each agent-store `bundle
 
 `{"type": "github_release", "repo": "owner/name", "checkout": "...", "mirror": "...", "remote": "..."}`. `repo` is required. `checkout` is optional (default `state/backups/github/<owner>__<name>`). `mirror` is an optional local directory of already-downloaded assets, used by tests and by doctor so a check does not have to call `gh`. `remote` is optional and defaults to `https://github.com/<repo>.git`. Tests set it to a local bare repository. A remote that normalizes to the public repository is refused the same way `repo` is.
 
-Git stores **only** the recovery kit (`kit/` plus a README that points at release assets). Bundles are uploaded as assets of a release whose tag is the bundle name without `.tar.gpg`, via `gh release create`. Retention deletes older releases and their tags (`gh release delete --yes --cleanup-tag`). Nothing in this path uses `--force`, `--force-with-lease`, `-f` on `git push`, or a refspec that starts with `+`. A rejected push is a failure. It is not retried with a force.
+Git stores **only** the recovery kit (`kit/` plus a README that points at release assets). Bundles are uploaded as assets of a release whose tag is the bundle name without `.tar.gpg`, via `gh release create`. Retention deletes older releases and their tags (`gh release delete --yes --cleanup-tag`). Nothing in this path uses `--force`, `--force-with-lease`, `-f` on `git push`, or a refspec that starts with `+`. A rejected push is a failure. It is not retried with a force. The next publication pushes `HEAD:main` again even when the kit files are already committed, so a commit that never reached the remote is not skipped.
 
 Any target repo, remote URL, or argument that normalizes to `pysol-dev/oh-my-grok` (including `https://github.com/pysol-dev/oh-my-grok.git` and `git@github.com:pysol-dev/oh-my-grok.git`) is refused before a git or `gh` command is run.
 

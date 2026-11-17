@@ -360,6 +360,8 @@ def init_keys(paths: Paths, *, passphrase: str, kit: Path | None = None) -> dict
     passphrase = _require_passphrase(passphrase)
     paths.ensure()
     kit = kit or kit_dir(paths)
+    if kit.is_symlink():
+        raise ValidationError("recovery kit directory must not be a symlink")
     home = gnupg_home(paths)
     if kit.exists() and any((kit / name).exists() for name in KIT_FILES):
         raise Conflict("recovery kit already exists")
@@ -403,6 +405,7 @@ def init_keys(paths: Paths, *, passphrase: str, kit: Path | None = None) -> dict
         _restrict_tree(home)
         _restrict_tree(kit)
         sign_fpr = _fingerprint(home, UID_SIGNING)
+        remember_kit(paths, kit)
         finished = True
         return {"kit": str(kit), "gnupg_home": str(home), "encryption_fingerprint": enc_fpr,
                 "signing_fingerprint": sign_fpr}
@@ -869,8 +872,38 @@ def _publish_kit(kit: Path, dest: Path) -> None:
 
 
 def _kit_complete(path: Path | None) -> bool:
-    return bool(path) and path.is_dir() and all((path / name).is_file() and not (path / name).is_symlink()
-                                                for name in KIT_FILES)
+    return bool(path) and path.is_dir() and not path.is_symlink() and all(
+        (path / name).is_file() and not (path / name).is_symlink() for name in KIT_FILES)
+
+
+def kit_pointer_path(paths: Paths) -> Path:
+    return paths.secrets_dir / "backup-kit.path"
+
+
+def remember_kit(paths: Paths, kit: Path) -> None:
+    """Record the kit directory chosen by init-key. Publication reads this, not a hardcoded default."""
+    if kit.is_symlink():
+        raise ValidationError("recovery kit directory must not be a symlink")
+    paths.secrets_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(paths.secrets_dir, 0o700)
+    _write_mode(kit_pointer_path(paths), (str(kit.resolve()) + "\n").encode(), 0o600)
+
+
+def resolve_kit(paths: Paths) -> Path:
+    """The kit init-key recorded, when that directory still exists. Otherwise the default location."""
+    pointer = kit_pointer_path(paths)
+    if pointer.is_file() and not pointer.is_symlink():
+        try:
+            raw = pointer.read_text().strip()
+        except OSError:
+            raw = ""
+        if raw:
+            candidate = Path(raw)
+            if candidate.is_symlink():
+                raise ValidationError("recovery kit directory must not be a symlink")
+            if candidate.exists():
+                return candidate
+    return kit_dir(paths)
 
 
 def push_agent_store(paths: Paths, bundle: Path, target: dict, policy: dict) -> dict:
@@ -891,7 +924,7 @@ def push_agent_store(paths: Paths, bundle: Path, target: dict, policy: dict) -> 
     _install_file(sig, bundles / sig.name)
     if side.is_file():
         _install_file(side, bundles / side.name)
-    _publish_kit(kit_dir(paths), store / "kit")
+    _publish_kit(resolve_kit(paths), store / "kit")
     removed = _prune_dir(bundles, policy)
     latest = newest_bundle(bundles)
     (store / "LATEST").write_text((latest.name if latest else bundle.name) + "\n")
@@ -943,7 +976,7 @@ def push_github(paths: Paths, bundle: Path, target: dict, policy: dict, *, runne
         if not _same_remote(current, remote):
             raise ValidationError("recovery checkout origin does not match the configured remote")
     kit_dest = checkout / "kit"
-    _publish_kit(kit_dir(paths), kit_dest)
+    _publish_kit(resolve_kit(paths), kit_dest)
     readme = checkout / "README.md"
     if not readme.exists():
         readme.write_text(KIT_README)
@@ -955,9 +988,10 @@ def push_github(paths: Paths, bundle: Path, target: dict, policy: dict, *, runne
                               "-c", "user.email=omg-backup@localhost", "commit", "-m", "update recovery kit"])
         if cp.returncode != 0:
             raise ValidationError("git commit of the recovery kit failed")
-        cp = _git(runner, checkout, ["push", "origin", "HEAD:main"])
-        if cp.returncode != 0:
-            raise ValidationError("git push of the recovery kit failed")
+    # A commit can succeed while the push fails. The next run has a clean tree and must still push.
+    cp = _git(runner, checkout, ["push", "origin", "HEAD:main"])
+    if cp.returncode != 0:
+        raise ValidationError("git push of the recovery kit failed")
     tag = bundle_tag(bundle.name)
     sig = Path(str(bundle) + ".sig")
     view = _invoke(runner, ["gh", "release", "view", tag, "--repo", repo, "--json", "assets"])
@@ -1174,6 +1208,7 @@ def _kit_candidates(paths: Paths) -> list[Path]:
         found.append(Path(mirror) / "kit")
     if DEFAULT_AGENT_STORE.is_dir():
         found.append(DEFAULT_AGENT_STORE / "kit")
+    found.append(resolve_kit(paths))
     found.append(kit_dir(paths))
     return found
 
@@ -1203,7 +1238,7 @@ def _bundle_sources(paths: Paths) -> list[tuple[int, Path, Path | None]]:
     if mirror_env:
         mirror = Path(mirror_env)
         sources.append((10, mirror, mirror / "kit"))
-    sources.append((20, bundles_dir(paths), kit_dir(paths)))
+    sources.append((20, bundles_dir(paths), resolve_kit(paths)))
     return sources
 
 
