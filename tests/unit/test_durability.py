@@ -609,7 +609,7 @@ def test_job_scripts_keep_owner_execute_and_secrets_stay_private(tmp_path):
     (logs / "app.log").write_text("log")
     os.chmod(logs / "app.log", 0o755)
     tree = tmp_path / "tree"
-    files: dict = {}
+    files: dict[str, dict[str, str]] = {}
     durability._add_tree(tree, jobs, "jobs", files, allow_execute=True)
     durability._add_tree(tree, logs, "state/logs", files, allow_execute=False)
     tar_path = tmp_path / "bundle.tar"
