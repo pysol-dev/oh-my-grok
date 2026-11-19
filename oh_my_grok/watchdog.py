@@ -2,7 +2,8 @@
 
 ``features.backup`` is a separate switch. When it is ``on``, each tick runs the restic schedule
 (generation change and 10 minutes, or 6 hours, plus daily prune and check). ``off`` skips that step.
-The repository password is never written to the heartbeat or the log.
+The daemon keeps ``OMG_RESTIC_PASSWORD`` in its own environment. The heartbeat records only whether
+that variable is set. The value is never written to the heartbeat or the log.
 
 There is no systemd unit and no crontab on the host this serves. ``serve`` is the foreground loop.
 ``start`` daemonizes it with a pidfile and an exclusive lock under the state directory. ``ensure`` is the
@@ -36,7 +37,7 @@ from .config import load_policy
 from .engine import PAYLOAD_SCHEMA_VERSION, Engine
 from .errors import GateRefused, OmgError
 from .hooks import hook_status
-from .paths import CODE_ROOT, Paths, get_paths, scrubbed_environ
+from .paths import CODE_ROOT, Paths, get_paths
 from .redact import redact, redact_obj
 
 log = logging.getLogger("oh_my_grok.watchdog")
@@ -411,7 +412,8 @@ def tick(engine: Engine, *, now: float | None = None, interval: float | None = N
         if not step.get("ok"):
             log.error("step %s failed: %s", name, step.get("error", ""))
     payload = _write_heartbeat(engine.paths, {
-        "unix": moment, "ts": db.utcnow(), "mode": mode, "interval_seconds": step_interval, "steps": outcomes})
+        "unix": moment, "ts": db.utcnow(), "mode": mode, "interval_seconds": step_interval, "steps": outcomes,
+        "restic_password": "set" if os.environ.get("OMG_RESTIC_PASSWORD") else "unset"})
     log.info("tick mode=%s %s", mode, " ".join(_tick_label(name, step) for name, step in outcomes.items()))
     return payload
 
@@ -537,8 +539,9 @@ def start(interval: float | None = None, paths: Paths | None = None) -> dict:
     log_fd = os.open(log_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
     os.fchmod(log_fd, 0o600)
     with os.fdopen(log_fd, "ab") as handle:
+        # The daemon itself keeps OMG_RESTIC_PASSWORD. Children it spawns, other than restic, scrub it.
         proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=handle, stderr=subprocess.STDOUT,
-                                start_new_session=True, cwd=str(CODE_ROOT), env=scrubbed_environ())
+                                start_new_session=True, cwd=str(CODE_ROOT), env=os.environ.copy())
     deadline = time.time() + 15
     while time.time() < deadline:
         current = status(paths)

@@ -260,25 +260,34 @@ Restore also uses `/tmp`. Snapshots are tagged `omg`, `gen:<max event id>`, and 
 (schema 7 on this code) with host `omg-box`. The snapshot is a SQLite backup of the database, not the
 live WAL, plus `config/`, all of `jobs/`, and `state/secrets/hooks.json` when that file exists.
 
-`forget` groups by host, not by path or tags. The `gen:` and `schema:` tags change every snapshot, so
-grouping by tags would keep every generation. With host grouping, the retention policy is one set:
-48 hourly, 14 daily, and 8 weekly.
+`forget` groups by host and only considers snapshots with host `omg-box` and tag `omg`. The `gen:`
+and `schema:` tags change every snapshot, so grouping by tags would keep every generation. Foreign or
+untagged snapshots are left in place. With that filter, the retention policy is one set: 48 hourly,
+14 daily, and 8 weekly.
+
+The watchdog process keeps `OMG_RESTIC_PASSWORD`. Every child it starts, other than a restic command
+that needs the password, has that variable removed. The password still reaches restic only through
+`RESTIC_PASSWORD_COMMAND=printenv OMG_RESTIC_PASSWORD`. The heartbeat records `restic_password` as
+`set` or `unset` and never the value. Backup, prune, and check share a flock under the omg home.
+A second caller exits 16 and records `backup_locked` without touching the staging directory. Staging
+is mode 0700. A symlink, or a directory owned by another user, is refused. The staged database must
+exist and pass `integrity_check` before restic is started.
 
 Schedule, when the flag is on: back up if the event generation changed and at least 10 minutes have passed,
 or if 6 hours have passed. Prune once a day. Check once a day. Once a week the check reads a 5 percent
 data subset. `EFBIG` on backup or prune kills that restic process, records `backup_failed` with
-`reason=efbig`, and is not tried again until the 10 minute minimum has passed. `EAGAIN`, or `ENOENT`
-while listing locks, is retried once. `init` that fails with `EINVAL` / `invalid argument` is not retried.
+`reason=efbig`, and is not tried again until the 10 minute minimum has passed, even when the daily
+prune was already due. `EAGAIN`, or `ENOENT` while listing locks, is retried once. `EINVAL` /
+`invalid argument` kills restic as soon as it appears on stderr and is not retried.
 
 A lock whose hostname is this machine and whose pid is not alive is removed with plain `restic unlock`
 (never `--remove-all`) and the operation is tried once more. Any other lock records `backup_locked` and
 the tick skips. `omg backup run` exits 16 in that case. Exit 11 is reserved for a diverged restore.
-`omg doctor` fails when a lock is 30 minutes old or older, when any repository file is 15 MiB or larger,
-when an `efbig` failure is still the latest backup outcome, or when there are 3 or more consecutive
-backup failures. A pack size other than 4 is a warning. Doctor also reports lock count, age, and machine,
-the store size summed from file sizes (not `df`), and whether the password is set or unset. It does not
-report the password. Child processes other than a restic command that needs the password do not inherit
-`OMG_RESTIC_PASSWORD`.
+`omg doctor`, when backup is on, fails if the watchdog heartbeat says the password is unset, if the
+watchdog has not reported it, if the password is shorter than 12 characters, if the latest backup failed,
+if a lock is 30 minutes old or older, or if any repository file is 15 MiB or larger. A pack size other
+than 4 is a warning. Doctor also reports lock count, age, and machine and the store size summed from
+file sizes (not `df`). It does not report the password.
 
 ```bash
 # policy on the host, not in git: backup_repo is an absolute directory; features.backup is "on" or "off"
@@ -305,9 +314,10 @@ scripts/recover.sh
 Lock handling, in order:
 
 1. Read the locks with `--no-lock`, including an exclusive lock. That read is not a failed check.
-2. A lock from another machine younger than 30 minutes, whether or not it is exclusive, waits with
-   `--retry-lock 2m` and then exits 16 if it is still there. The restore does not continue. A lock whose
-   pid is still alive on this machine is handled the same way. Neither is removed.
+2. An exclusive lock from another machine younger than 30 minutes, or an exclusive lock whose pid is
+   still alive on this machine, waits with `--retry-lock 2m` and then exits 16 if it is still there.
+   The two-minute wait applies only to exclusive locks. A young non-exclusive lock from another machine
+   exits 16 immediately and is not restored past. Neither kind is removed.
 3. A stale lock on this machine (the pid is not alive), including an exclusive lock left by a killed
    restic, is removed with plain `restic unlock`. Never pass `--remove-all`.
 4. After that unlock, `restic check` must succeed before a snapshot is applied.

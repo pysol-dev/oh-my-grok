@@ -245,8 +245,12 @@ def handle_locks(paths: Paths, repo: Path, *, password: str, timeout: float, che
         if check:
             print("repository lock is held", file=sys.stderr)
             return EXIT_LOCK
-        return _wait_for_lock(paths, repo, password=password, timeout=timeout, now=moment,
-                              hostname=host, pid_alive_fn=alive, runner=runner)
+        # The two-minute wait is only for an exclusive lock. A shared lock still stops the restore.
+        if any(lock.get("exclusive") for lock in locks):
+            return _wait_for_lock(paths, repo, password=password, timeout=timeout, now=moment,
+                                  hostname=host, pid_alive_fn=alive, runner=runner)
+        print("repository lock is held", file=sys.stderr)
+        return EXIT_LOCK
     if check:
         print("stale repository lock; --check does not remove it", file=sys.stderr)
         return EXIT_LOCK

@@ -3,6 +3,7 @@ import errno
 import json
 import os
 import socket
+import stat
 import subprocess
 import time
 from datetime import UTC, datetime
@@ -695,6 +696,7 @@ def test_young_nonexclusive_foreign_lock_is_not_restored(omg_home, tmp_path, mon
     assert code == 16
     assert not any("unlock" in argv for argv in calls)
     assert not any("restore" in argv for argv in calls)
+    assert not any("--retry-lock" in argv for argv in calls)
 
 
 def test_own_stale_lock_is_cleared_and_a_foreign_lock_is_recorded(omg_home, tmp_path, monkeypatch):
@@ -767,6 +769,25 @@ def test_doctor_fails_a_lock_older_than_30_minutes(omg_home, tmp_path, monkeypat
     assert report["backup_locks"]["ok"] is False
     assert report["backup_locks"]["status"] == "FAIL"
     assert "oldest_age_seconds=1800" in report["backup_locks"]["detail"]
+
+
+def test_forget_filters_host_and_omg_tag(omg_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", PASSWORD)
+    _policy(tmp_path / "repo", features={"backup": "on"})
+    engine = Engine()
+    seen = []
+
+    def runner(argv, env, timeout):
+        seen.append(argv)
+        return CommandResult(0, stdout="ok\n")
+
+    try:
+        restic_backup.prune_repo(engine.conn, engine.paths, now=NOW, runner=runner)
+    finally:
+        engine.close()
+    argv = next(item for item in seen if "forget" in item)
+    assert argv[argv.index("--host") + 1] == "omg-box"
+    assert argv[argv.index("--tag") + 1] == "omg"
 
 
 def test_prune_efbig_waits_out_the_minimum_interval(omg_home, tmp_path, monkeypatch):
@@ -918,11 +939,26 @@ def test_child_processes_do_not_inherit_the_restic_password(omg_home, monkeypatc
     assert "OMG_RESTIC_PASSWORD" not in version_env
 
 
-def test_short_password_is_redacted(monkeypatch):
-    from oh_my_grok.redact import redact
-    monkeypatch.setenv("OMG_RESTIC_PASSWORD", "q7z")
-    restic_backup.require_password()
-    assert redact("leak q7z now") == "leak [REDACTED] now"
+def test_short_password_is_redacted(omg_home, tmp_path, monkeypatch):
+    from oh_my_grok.redact import redact, register_secret
+    register_secret("q", min_length=4)
+    assert redact("q") == "q"
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", "short-pw")
+    with pytest.raises(BackupFailed) as exc:
+        restic_backup.require_password()
+    assert exc.value.reason == "password_short"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "config").write_text("{}\n")
+    _policy(repo, features={"backup": "on"})
+    _heartbeat(get_paths(), "set")
+    report = {item["check"]: item for item in doctor_report(get_paths(), runner=_quiet_runner())}
+    assert report["backup_password"]["ok"] is False
+    assert report["backup_password"]["detail"] == "shorter than 12"
+    assert "short-pw" not in json.dumps(report)
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", "long-enough-pw")
+    assert restic_backup.require_password() == "long-enough-pw"
+    assert redact("see long-enough-pw") == "see [REDACTED]"
 
 
 def test_init_einval_is_not_retried(omg_home, tmp_path, monkeypatch):
@@ -972,3 +1008,181 @@ def test_recover_script_refuses_a_missing_password(monkeypatch):
     assert proc.returncode == 2
     assert "OMG_RESTIC_PASSWORD is not set" in proc.stderr
     assert PASSWORD not in proc.stderr
+
+
+def _heartbeat(paths, visible: str):
+    directory = paths.state_dir / "watchdog"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "heartbeat.json").write_text(json.dumps({
+        "unix": NOW, "mode": "on", "interval_seconds": 60, "steps": {}, "restic_password": visible}))
+
+
+def test_watchdog_keeps_the_password_and_doctor_reads_the_heartbeat(omg_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", PASSWORD)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "config").write_text("{}\n")
+    _policy(repo, features={"backup": "off"})
+    engine = Engine()
+    try:
+        beat = watchdog.tick(engine, now=NOW)
+    finally:
+        engine.close()
+    assert beat["restic_password"] == "set"
+    text = (get_paths().state_dir / "watchdog" / "heartbeat.json").read_text()
+    assert PASSWORD not in text
+    seen = {}
+    real_popen = subprocess.Popen
+
+    def popen(args, **kwargs):
+        seen["env"] = kwargs.get("env")
+
+        class Proc:
+            pid = 424242
+            def poll(self):
+                return None
+        return Proc()
+
+    calls = {"n": 0}
+
+    def fake_status(*_a, **_k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"alive": False, "pid": None, "heartbeat": None}
+        return {"alive": True, "pid": 424242, "heartbeat": {"unix": NOW}}
+
+    monkeypatch.setattr(watchdog, "status", fake_status)
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    watchdog.start()
+    assert seen["env"]["OMG_RESTIC_PASSWORD"] == PASSWORD
+    monkeypatch.setattr(subprocess, "Popen", real_popen)
+
+    _policy(repo, features={"backup": "on"})
+    _heartbeat(get_paths(), "unset")
+    (get_paths().state_dir / "backup").mkdir(parents=True, exist_ok=True)
+    (get_paths().state_dir / "backup" / "status.json").write_text(json.dumps({"pack_size": 4}))
+    report = {item["check"]: item for item in doctor_report(get_paths(), runner=_quiet_runner())}
+    assert report["backup_password"]["ok"] is False
+    assert report["backup_password"]["detail"] == "watchdog password unset"
+    assert PASSWORD not in json.dumps(report)
+    fresh = Engine()
+    try:
+        fresh.conn.execute(
+            "INSERT INTO events(ts,job_id,task_id,kind,actor,correlation_id,data_json) VALUES (?,?,?,?,?,?,?)",
+            (db.utcnow(), None, None, "backup_failed", "backup", None, '{"reason":"restic"}'))
+    finally:
+        fresh.close()
+    _heartbeat(get_paths(), "set")
+    report = {item["check"]: item for item in doctor_report(get_paths(), runner=_quiet_runner())}
+    assert report["backup_failures"]["ok"] is False
+    assert report["backup_password"]["ok"] is True
+
+
+def test_second_backup_skips_when_the_operation_lock_is_held(omg_home, tmp_path, monkeypatch):
+    import fcntl
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", PASSWORD)
+    _policy(tmp_path / "repo", features={"backup": "on"})
+    engine = Engine()
+    directory = engine.paths.state_dir / "backup"
+    directory.mkdir(parents=True)
+    fd = os.open(directory / "operation.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        calls = []
+
+        def runner(argv, env, timeout):
+            calls.append(argv)
+            return CommandResult(0, stdout="saved\n")
+
+        result = restic_backup.run_backup(engine.conn, engine.paths, force=True, now=NOW, runner=runner)
+        kinds = [row["kind"] for row in engine.conn.execute("SELECT kind FROM events")]
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        engine.close()
+    assert result["reason"] == "locked" and calls == []
+    assert "backup_locked" in kinds
+
+
+def test_restic_is_not_called_without_a_staged_database(omg_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", PASSWORD)
+    _policy(tmp_path / "repo", features={"backup": "on"})
+    engine = Engine()
+    calls = []
+
+    def runner(argv, env, timeout):
+        calls.append(argv)
+        return CommandResult(0)
+
+    def empty_stage(conn, paths, root):
+        tree = root / "snapshot"
+        (tree / "state").mkdir(parents=True)
+        return {"tree": tree, "generation": 0, "tail_sha256": "ab", "schema": 7, "db_name": "omg.sqlite3"}
+
+    monkeypatch.setattr(restic_backup, "stage_snapshot", empty_stage)
+    try:
+        with pytest.raises(restic_backup.IntegrityError_):
+            restic_backup.run_backup(engine.conn, engine.paths, force=True, now=NOW, runner=runner)
+    finally:
+        engine.close()
+    assert calls == []
+
+
+def test_prune_efbig_waits_even_when_the_daily_prune_is_due(omg_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", PASSWORD)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "config").write_text("{}\n")
+    _policy(repo, features={"backup": "on"}, backup_min_interval_seconds=600,
+            backup_prune_interval_seconds=86400)
+    engine = Engine()
+    restic_backup.update_status(
+        engine.paths, last_backup_unix=NOW, last_generation=0,
+        last_prune_unix=NOW - 86401, last_prune_attempt_unix=NOW - 60,
+        last_prune_failure_reason="efbig")
+    calls = []
+
+    def runner(argv, env, timeout):
+        calls.append(argv)
+        return CommandResult(0, stdout="[]\n")
+
+    try:
+        restic_backup.scheduled(engine.conn, engine.paths, now=NOW, runner=runner)
+    finally:
+        engine.close()
+    assert not any("forget" in argv for argv in calls)
+
+
+def test_einval_kills_restic_without_waiting_for_the_timeout(tmp_path):
+    import sys
+    script = tmp_path / "hang.py"
+    script.write_text("import sys, time\nsys.stderr.write('rename: invalid argument\\n')\n"
+                      "sys.stderr.flush()\ntime.sleep(30)\n")
+    started = time.monotonic()
+    result = restic_backup._stream([sys.executable, str(script)], os.environ.copy(), 20)
+    assert time.monotonic() - started < 4
+    assert result.einval is True
+
+
+def test_staging_refuses_a_symlink_and_is_private(omg_home, tmp_path, monkeypatch):
+    paths = get_paths()
+    root = restic_backup.staging_root(paths)
+    if root.exists() or root.is_symlink():
+        if root.is_symlink() or root.is_file():
+            root.unlink()
+        else:
+            import shutil
+            shutil.rmtree(root)
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    root.symlink_to(other)
+    with pytest.raises(restic_backup.IntegrityError_):
+        restic_backup.prepare_staging(paths)
+    root.unlink()
+    made = restic_backup.prepare_staging(paths)
+    assert stat.S_IMODE(made.stat().st_mode) == 0o700
+    monkeypatch.setattr(os, "getuid", lambda: made.stat().st_uid + 1)
+    with pytest.raises(restic_backup.IntegrityError_):
+        restic_backup.prepare_staging(paths)
+    import shutil
+    shutil.rmtree(made)

@@ -13,6 +13,8 @@ and are not returned, logged, or stored in an event.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -45,6 +47,8 @@ STORE_FILE_CAP = 16 * 1024 * 1024
 # Doctor fails a file before it can reach that cap.
 DOCTOR_FILE_LIMIT = 15 * 1024 * 1024
 LOCK_YOUNG_SECONDS = 30 * 60
+MIN_PASSWORD_CHARS = 12
+REDACT_PASSWORD_CHARS = 4
 RETRY_LOCK = "2m"
 EVENT_FIELDS = ("id", "ts", "job_id", "task_id", "kind", "actor", "correlation_id", "data_json")
 
@@ -73,6 +77,7 @@ class BackupFailed(OmgError):
         self.reason = reason
         self.exit_code = {
             "password_unset": EXIT_USAGE,
+            "password_short": EXIT_USAGE,
             "password_rejected": EXIT_PASSWORD,
             "locked": EXIT_LOCKED,
             "repo_unset": EXIT_USAGE,
@@ -87,6 +92,7 @@ class CommandResult:
     stdout: str = ""
     stderr: str = ""
     efbig: bool = False
+    einval: bool = False
     locked: bool = False
     timed_out: bool = False
 
@@ -99,7 +105,9 @@ def require_password() -> str:
     password = os.environ.get(PASSWORD_ENV) or ""
     if not password:
         raise BackupFailed("password_unset")
-    register_secret(password, min_length=1)
+    if len(password) < MIN_PASSWORD_CHARS:
+        raise BackupFailed("password_short")
+    register_secret(password, min_length=REDACT_PASSWORD_CHARS)
     return password
 
 
@@ -139,8 +147,13 @@ def backup_due(*, last_at: float | None, last_gen: int | None, gen: int, now: fl
 def _efbig_backoff(status: dict[str, Any], now: float, policy: dict, *,
                    reason_key: str = "last_failure_reason", attempt_key: str = "last_attempt_unix",
                    success_key: str = "last_backup_unix",
-                   max_interval_key: str = "backup_max_interval_seconds") -> bool:
-    """An EFBIG failure is not retried on the next tick. The long ceiling still runs the operation."""
+                   max_interval_key: str = "backup_max_interval_seconds",
+                   honor_ceiling: bool = True) -> bool:
+    """Block a retry until the minimum interval after EFBIG.
+
+    Backup may still run when the long ceiling has elapsed. Prune must not: its ceiling is the
+    same number as "prune is due", which would cancel the wait on every tick.
+    """
     if status.get(reason_key) != "efbig":
         return False
     attempt = status.get(attempt_key)
@@ -148,6 +161,8 @@ def _efbig_backoff(status: dict[str, Any], now: float, policy: dict, *,
         return False
     if now - float(attempt) >= float(policy["backup_min_interval_seconds"]):
         return False
+    if not honor_ceiling:
+        return True
     last_ok = status.get(success_key)
     forced = (isinstance(last_ok, (int, float)) and not isinstance(last_ok, bool)
               and now - float(last_ok) >= float(policy[max_interval_key]))
@@ -165,10 +180,42 @@ def staging_root(paths: Paths) -> Path:
 
 def prepare_staging(paths: Paths) -> Path:
     root = staging_root(paths)
-    if root.exists() or root.is_symlink():
+    if root.is_symlink():
+        raise IntegrityError_("staging path is a symlink")
+    if root.exists():
+        info = root.stat()
+        if not stat.S_ISDIR(info.st_mode):
+            raise IntegrityError_("staging path is not a directory")
+        if info.st_uid != os.getuid():
+            raise IntegrityError_("staging path is not owned by the current user")
         shutil.rmtree(root)
-    root.mkdir(parents=True)
+    root.mkdir(parents=True, mode=0o700)
+    os.chmod(root, 0o700)
     return root
+
+
+@contextlib.contextmanager
+def operation_lock(conn: sqlite3.Connection, paths: Paths):
+    """Exclusive lock for backup, prune, and check. A busy lock skips; it does not touch staging.
+
+    The lock file lives under the omg home, never on the agent store.
+    """
+    directory = paths.state_dir / "backup"
+    directory.mkdir(parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    fd = os.open(directory / "operation.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        _emit(conn, "backup_locked", reason="locked")
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def interval_due(last_at: float | None, now: float, interval: float) -> bool:
@@ -499,8 +546,9 @@ def _stream(argv: list[str], env: dict[str, str], timeout: float) -> CommandResu
     while True:
         got_out = _read_some(proc.stdout, out, limit=None)
         got_err = _read_some(proc.stderr, err, limit=65536)
-        if _is_efbig(err.decode("utf-8", "replace")):
-            efbig = True
+        err_text = err.decode("utf-8", "replace")
+        if _is_efbig(err_text) or _is_einval(err_text):
+            efbig = _is_efbig(err_text)
             _kill(proc)
             break
         if proc.poll() is not None:
@@ -523,7 +571,7 @@ def _stream(argv: list[str], env: dict[str, str], timeout: float) -> CommandResu
     stdout = out.decode("utf-8", "replace")
     return CommandResult(returncode=proc.returncode if proc.returncode is not None else -9,
                          stdout=stdout, stderr=stderr, efbig=efbig or _is_efbig(stderr),
-                         locked=proc.returncode == 11, timed_out=timed_out)
+                         einval=_is_einval(stderr), locked=proc.returncode == 11, timed_out=timed_out)
 
 
 def _execute(argv: list[str], env: dict[str, str], timeout: float, runner: Runner | None,
@@ -535,6 +583,7 @@ def _execute(argv: list[str], env: dict[str, str], timeout: float, runner: Runne
     if runner is not None:
         result = runner(list(argv), dict(env), timeout)
         result.efbig = result.efbig or _is_efbig(result.stderr)
+        result.einval = result.einval or _is_einval(result.stderr)
         result.locked = result.locked or result.returncode == 11
         return result
     return _stream(argv, env, timeout)
@@ -550,7 +599,7 @@ def call_restic(paths: Paths, repo: Path, command: list[str], *, password: str, 
     last: CommandResult | None = None
     for attempt in (1, 2):
         last = _execute(argv, env, timeout, runner, password)
-        if last.efbig or _is_einval(last.stderr) or last.locked or last.timed_out or last.returncode == 0:
+        if last.efbig or last.einval or _is_einval(last.stderr) or last.locked or last.timed_out or last.returncode == 0:
             return last
         if last.returncode == 12:
             return last
@@ -635,9 +684,26 @@ def run_backup(conn: sqlite3.Connection, paths: Paths, *, force: bool = False, n
     repo = _require_repo(policy)
     password = require_password()
     timeout = _timeout(policy)
+    with operation_lock(conn, paths) as held:
+        if not held:
+            return {"ok": True, "skipped": True, "reason": "locked"}
+        return _run_backup_locked(conn, paths, repo, password, timeout, moment, runner)
+
+
+def _require_staged_database(meta: dict[str, Any]) -> None:
+    database = Path(meta["tree"]) / "state" / meta["db_name"]
+    if not database.is_file() or database.is_symlink():
+        raise IntegrityError_("staged database is missing")
+    health, _events = inspect_database(database)
+    if health != "ok":
+        raise IntegrityError_("staged database failed integrity_check")
+
+
+def _run_backup_locked(conn, paths, repo, password, timeout, moment, runner) -> dict[str, Any]:
     staging = prepare_staging(paths)
     try:
         meta = stage_snapshot(conn, paths, staging)
+        _require_staged_database(meta)
         command = ["backup", "--host", HOST, "--tag", "omg", "--tag", f"gen:{meta['generation']}",
                    "--tag", f"schema:{meta['schema']}", str(meta["tree"])]
         result = call_restic(paths, repo, command, password=password, timeout=timeout, runner=runner)
@@ -674,10 +740,17 @@ def prune_repo(conn: sqlite3.Connection, paths: Paths, *, runner: Runner | None 
     repo = _require_repo(policy)
     password = require_password()
     moment = time.time() if now is None else now
+    with operation_lock(conn, paths) as held:
+        if not held:
+            return {"ok": True, "skipped": True, "reason": "locked"}
+        return _prune_locked(conn, paths, policy, repo, password, moment, runner)
+
+
+def _prune_locked(conn, paths, policy, repo, password, moment, runner) -> dict[str, Any]:
     # Group by host only. Tags include gen: and schema:, which change every snapshot, so grouping
-    # by tags would keep every generation. The staging path is stable, and host grouping still
-    # applies if that path ever changes.
-    command = ["forget", "--group-by", "host", "--keep-hourly", str(policy["backup_keep_hourly"]),
+    # by tags would keep every generation. --host and --tag keep foreign snapshots out of this policy.
+    command = ["forget", "--group-by", "host", "--host", HOST, "--tag", "omg",
+               "--keep-hourly", str(policy["backup_keep_hourly"]),
                "--keep-daily", str(policy["backup_keep_daily"]),
                "--keep-weekly", str(policy["backup_keep_weekly"]), "--prune"]
     result = call_restic(paths, repo, command, password=password, timeout=_timeout(policy), runner=runner)
@@ -703,6 +776,14 @@ def check_repo(conn: sqlite3.Connection, paths: Paths, *, read_data: bool = Fals
     repo = _require_repo(policy)
     password = require_password()
     moment = time.time() if now is None else now
+    with operation_lock(conn, paths) as held:
+        if not held:
+            return {"ok": True, "skipped": True, "reason": "locked"}
+        return _check_locked(conn, paths, repo, password, moment, read_data, runner)
+
+
+def _check_locked(conn, paths, repo, password, moment, read_data, runner) -> dict[str, Any]:
+    policy = _policy(paths)
     command = ["check"]
     if read_data:
         command.extend(["--read-data-subset", "5%"])
@@ -738,7 +819,7 @@ def scheduled(conn: sqlite3.Connection, paths: Paths, *, now: float | None = Non
     status = load_status(paths)
     prune_blocked = _efbig_backoff(status, moment, policy, reason_key="last_prune_failure_reason",
                                    attempt_key="last_prune_attempt_unix", success_key="last_prune_unix",
-                                   max_interval_key="backup_prune_interval_seconds")
+                                   max_interval_key="backup_prune_interval_seconds", honor_ceiling=False)
     if interval_due(status.get("last_prune_unix"), moment, policy["backup_prune_interval_seconds"]) and not prune_blocked:
         out["prune"] = prune_repo(conn, paths, runner=runner, now=moment)
         if out["prune"].get("reason") == "locked":
@@ -903,9 +984,9 @@ def _walk_repo(repo: Path) -> tuple[int, list[tuple[str, int]]]:
     return total, large
 
 
-def _failure_view(paths: Paths) -> tuple[int, bool]:
+def _failure_view(paths: Paths) -> tuple[int, bool, bool]:
     if not paths.db_path.exists():
-        return 0, False
+        return 0, False, False
     conn = db.connect(paths.db_path)
     try:
         try:
@@ -913,11 +994,12 @@ def _failure_view(paths: Paths) -> tuple[int, bool]:
                 "SELECT kind, data_json FROM events WHERE kind IN ('backup_failed', 'backup_ok') ORDER BY id"
             ).fetchall()
         except sqlite3.Error:
-            return 0, False
+            return 0, False, False
     finally:
         conn.close()
     consecutive = 0
     efbig = False
+    recent_failure = bool(rows) and rows[-1]["kind"] == "backup_failed"
     for row in reversed(rows):
         if row["kind"] == "backup_ok":
             break
@@ -930,7 +1012,7 @@ def _failure_view(paths: Paths) -> tuple[int, bool]:
             data = {}
         if isinstance(data, dict) and data.get("reason") == "efbig":
             efbig = True
-    return consecutive, efbig
+    return consecutive, efbig, recent_failure
 
 
 def _check(name: str, ok: bool, detail: str, status: str | None = None) -> dict[str, Any]:
@@ -1004,9 +1086,9 @@ def doctor_report(paths: Paths | None = None, *, now: float | None = None,
             checks.append(_check("backup_files", True, "no file >= 15 MiB"))
         checks.append(_check("backup_store_size", True, f"bytes={total}"))
         checks.append(_lock_check(paths, repo, policy, now=now, runner=runner))
-    consecutive, efbig = _failure_view(paths)
-    if efbig or consecutive >= 3:
-        reason = "recent efbig" if efbig else f"{consecutive} consecutive failures"
+    consecutive, efbig, recent_failure = _failure_view(paths)
+    if recent_failure or efbig or consecutive >= 3:
+        reason = "recent efbig" if efbig else "recent backup failure"
         checks.append(_check("backup_failures", False, reason))
     else:
         checks.append(_check("backup_failures", True, f"consecutive={consecutive}"))
@@ -1016,17 +1098,35 @@ def doctor_report(paths: Paths | None = None, *, now: float | None = None,
     else:
         shown = "unset" if pack is None else str(pack)
         checks.append(_check("backup_pack_size", True, f"pack size is {shown}, expected 4", "WARN"))
-    if password == "set":
-        checks.append(_check("backup_password", True, "set"))
-    else:
-        checks.append(_check("backup_password", False, "unset"))
+    checks.append(_password_check(paths))
     return checks
+
+
+def _password_check(paths: Paths) -> dict[str, Any]:
+    """With backup on, trust the watchdog heartbeat, not the shell that happens to run doctor."""
+    raw = os.environ.get(PASSWORD_ENV) or ""
+    if raw and len(raw) < MIN_PASSWORD_CHARS:
+        return _check("backup_password", False, "shorter than 12")
+    beat_path = paths.state_dir / "watchdog" / "heartbeat.json"
+    reported = None
+    try:
+        beat = json.loads(beat_path.read_text())
+    except (OSError, ValueError):
+        beat = None
+    if isinstance(beat, dict):
+        reported = beat.get("restic_password")
+    if reported == "unset":
+        return _check("backup_password", False, "watchdog password unset")
+    if reported != "set":
+        return _check("backup_password", False, "watchdog has not reported the password")
+    return _check("backup_password", True, "set")
 
 
 def _lock_check(paths: Paths, repo: Path, policy: dict, *, now: float | None,
                 runner: Runner | None) -> dict[str, Any]:
-    if not password_is_set():
-        return _check("backup_locks", True, "not read (password unset)")
+    raw = os.environ.get(PASSWORD_ENV) or ""
+    if len(raw) < MIN_PASSWORD_CHARS:
+        return _check("backup_locks", True, "not read (password unset)", "WARN")
     moment = time.time() if now is None else now
     try:
         locks = list_locks(paths, repo, password=require_password(), timeout=_timeout(policy), runner=runner)

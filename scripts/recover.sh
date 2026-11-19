@@ -4,9 +4,10 @@
 # Lock handling is done by python3 -m oh_my_grok.recover, in this order:
 #   1. Read locks with --no-lock before changing the home, the config, or jobs.
 #      An exclusive lock can be classified; it does not abort the read as exit 12.
-#   2. A lock from another machine younger than 30 minutes, exclusive or not, waits with
-#      --retry-lock 2m and then exits 16. It is not removed, and the restore does not continue.
-#      The same wait applies to a lock whose pid is still alive on this machine.
+#   2. An exclusive lock from another machine younger than 30 minutes, or an exclusive lock whose
+#      pid is still alive here, waits with --retry-lock 2m and then exits 16. The two-minute wait
+#      applies only to exclusive locks. A young non-exclusive foreign lock exits 16 immediately.
+#      Neither is removed, and the restore does not continue.
 #   3. A stale lock on this machine (the pid is not alive), including an exclusive lock left by
 #      a killed restic, is removed with plain `restic unlock`. Never pass --remove-all.
 #   4. After that unlock, `restic check` must succeed before a snapshot is applied.
