@@ -872,7 +872,7 @@ def test_child_processes_do_not_inherit_the_restic_password(omg_home, monkeypatc
     import subprocess
     monkeypatch.setenv("OMG_RESTIC_PASSWORD", PASSWORD)
     monkeypatch.setenv("RESTIC_PASSWORD", PASSWORD)
-    from oh_my_grok.redact import scrubbed_environ
+    from oh_my_grok.paths import scrubbed_environ
     clean = scrubbed_environ()
     assert "OMG_RESTIC_PASSWORD" not in clean and "RESTIC_PASSWORD" not in clean
 

@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from .redact import scrubbed_environ
+from .paths import scrubbed_environ
 
 BWRAP_CANDIDATES = ("/usr/bin/bwrap", "/bin/bwrap")
 BWRAP_VERSION_RE = re.compile(r"bubblewrap (\d{1,3}\.\d{1,3}(?:\.\d{1,3})?)")

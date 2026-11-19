@@ -19,8 +19,8 @@ from . import __version__, db, sandbox
 from .config import TEMPLATE_MARKERS, load_policy, load_verifier_profiles
 from .errors import OmgError, ValidationError
 from .hooks import _check_perms, hook_status, load_hooks, set_hook, validate_url
-from .paths import CODE_ROOT, get_paths
-from .redact import redact, redact_obj, scrubbed_environ
+from .paths import CODE_ROOT, get_paths, scrubbed_environ
+from .redact import redact, redact_obj
 from .roster import CLASSES, INTENTS, validate_scope
 from .states import ROLES
 from . import verifier

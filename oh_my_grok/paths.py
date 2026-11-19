@@ -13,6 +13,17 @@ from pathlib import Path
 CODE_ROOT = Path(__file__).resolve().parent.parent
 
 
+# Removed from every child environment. Restic commands that need the password set it explicitly.
+SECRET_ENV_KEYS = ("OMG_RESTIC_PASSWORD", "RESTIC_PASSWORD", "RESTIC_PASSWORD_FILE", "RESTIC_PASSWORD_COMMAND")
+
+
+def scrubbed_environ(base: dict[str, str] | None = None) -> dict[str, str]:
+    env = dict(os.environ if base is None else base)
+    for key in SECRET_ENV_KEYS:
+        env.pop(key, None)
+    return env
+
+
 def env_get(suffix: str, default: str | None = None) -> str | None:
     """Prefer OMG_<suffix>. Fall back to legacy OMO_<suffix>. Empty values are skipped."""
     for prefix in ("OMG_", "OMO_"):

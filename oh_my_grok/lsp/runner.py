@@ -18,7 +18,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from .. import sandbox
-from ..redact import scrubbed_environ
+from ..paths import scrubbed_environ
 from . import delta, profiles
 from .client import LspClient, LspError, MethodNotFound
 

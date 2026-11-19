@@ -36,8 +36,8 @@ from .config import load_policy
 from .engine import PAYLOAD_SCHEMA_VERSION, Engine
 from .errors import GateRefused, OmgError
 from .hooks import hook_status
-from .paths import CODE_ROOT, Paths, get_paths
-from .redact import redact, redact_obj, scrubbed_environ
+from .paths import CODE_ROOT, Paths, get_paths, scrubbed_environ
+from .redact import redact, redact_obj
 
 log = logging.getLogger("oh_my_grok.watchdog")
 _configured_log_path: str | None = None

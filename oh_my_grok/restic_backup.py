@@ -33,8 +33,8 @@ from typing import Any
 from . import db, features
 from .config import canonical_json, load_policy, sha256_text
 from .errors import IntegrityError_, OmgError
-from .paths import Paths, get_paths, tools_dir
-from .redact import redact, register_secret, scrubbed_environ
+from .paths import Paths, get_paths, scrubbed_environ, tools_dir
+from .redact import redact, register_secret
 
 PACK_MIB = 4
 HOST = "omg-box"
