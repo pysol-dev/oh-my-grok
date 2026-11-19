@@ -38,8 +38,33 @@ DEFAULT_POLICY = {
     "watchdog_stale_intervals": 3,
     "watchdog_log_max_bytes": 1_048_576,
     "watchdog_log_backups": 3,
+    # Restic repository (features.backup). The path is a local directory, usually on the
+    # agent store. Empty means "not configured". The flag defaults to off.
+    "backup_repo": "",
+    "backup_min_interval_seconds": 600,
+    "backup_max_interval_seconds": 21600,
+    "backup_keep_hourly": 48,
+    "backup_keep_daily": 14,
+    "backup_keep_weekly": 8,
+    "backup_prune_interval_seconds": 86400,
+    "backup_check_interval_seconds": 86400,
+    "backup_read_data_interval_seconds": 604800,
+    "backup_timeout_seconds": 600,
     "features": {},
 }
+
+_BACKUP_INTS = (
+    "backup_min_interval_seconds",
+    "backup_max_interval_seconds",
+    "backup_keep_hourly",
+    "backup_keep_daily",
+    "backup_keep_weekly",
+    "backup_prune_interval_seconds",
+    "backup_check_interval_seconds",
+    "backup_read_data_interval_seconds",
+    "backup_timeout_seconds",
+)
+_REMOTE_REPO_SCHEMES = {"s3", "rest", "b2", "azure", "gs", "sftp", "swift", "rclone", "http", "https"}
 
 REMOVED_POLICY_KEYS = {"require_independent_assurance", "fixture_allow_reduced_assurance"}
 TEMPLATE_MARKERS = ("OMG_VERIFY_TEMPLATE", "OMO_VERIFY_TEMPLATE")
@@ -85,7 +110,31 @@ def load_policy(config_dir: Path) -> dict:
             raise ValidationError(f"unknown policy keys: {sorted(unknown)}")
         pol.update(data)
     pol["features"] = features.normalize(pol.get("features"))
+    _validate_backup_policy(pol)
     return pol
+
+
+def _validate_backup_policy(pol: dict) -> None:
+    for key in _BACKUP_INTS:
+        value = pol[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValidationError(f"{key} must be a positive integer")
+    if pol["backup_max_interval_seconds"] < pol["backup_min_interval_seconds"]:
+        raise ValidationError("backup_max_interval_seconds must be >= backup_min_interval_seconds")
+    repo = pol["backup_repo"]
+    if not isinstance(repo, str):
+        raise ValidationError("backup_repo must be a string")
+    if repo == "":
+        return
+    if "://" in repo or repo.split(":", 1)[0] in _REMOTE_REPO_SCHEMES:
+        raise ValidationError("backup_repo must be a local directory path")
+    path = Path(repo)
+    if not path.is_absolute():
+        raise ValidationError("backup_repo must be an absolute path")
+    resolved = path.resolve()
+    root = CODE_ROOT.resolve()
+    if resolved == root or root in resolved.parents:
+        raise ValidationError("backup_repo must not be inside the oh-my-grok checkout")
 
 
 _PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
