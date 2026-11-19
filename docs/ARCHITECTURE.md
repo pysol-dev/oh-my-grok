@@ -22,6 +22,8 @@ user ─chat─▶ Hephaestus ─MCP─▶ omg engine ◀─MCP── role routi
 | Module | Purpose |
 |---|---|
 | `db.py` | Connection (WAL, foreign_keys, busy_timeout), `BEGIN IMMEDIATE` transactions, versioned checksummed migrations, backup/restore with integrity checks |
+| `restic_backup.py` | Restic 0.19.1 backups of a SQLite snapshot, config, jobs, and `hooks.json` into a local repository. Pack size is 4 MiB. The password is only `RESTIC_PASSWORD_COMMAND=printenv OMG_RESTIC_PASSWORD`. `features.backup` defaults off |
+| `recover.py` | Restore from that repository: stale-lock unlock, prefix/newer/diverged decisions, forward schema migration, refusal of a newer schema |
 | `states.py` | Explicit task, job and dispatch transition tables. Illegal transitions raise |
 | `engine.py` | Every workflow rule: submit, the DAG, claim/lease, complete handlers, plan revisions, approvals, verification, repair loop, independence, final gate, reconcile, cancel/resume, status/export. Also intent gating, roster, escalation, projection flush, LSP and git and docs gates. The database is the only transition authority |
 | `features.py` | Feature modes (`off` / `shadow` / `enforce`, boulder `off` / `on`). Frozen into the job at submit. Default off |
@@ -33,7 +35,7 @@ user ─chat─▶ Hephaestus ─MCP─▶ omg engine ◀─MCP── role routi
 | `skills.py` | Delivers the git-master skill text into the executor packet. Delivery is not proof the model obeyed it |
 | `operational.py` | Derives the doctor live-status line from recorded evidence. Never a constant |
 | `mcp_server.py` | The 11 MCP tools (pydantic-validated): submit, claim, context, checkpoint, complete, status, reconcile, cancel, escalate, docs, heal. `heal` projects the failure corpus and does not require a role binding. Logs go to stderr, redacted. No approve/ship/shell/secret tools |
-| `cli.py` | `omg`: doctor, migrate, status, submit, plan show, approve/deny (TTY), cancel (TTY), resume, reconcile, export, backup/restore, hook set/check/list, roles, heal collect/show/prune-duplicates, test |
+| `cli.py` | `omg`: doctor, migrate, status, submit, plan show, approve/deny (TTY), cancel (TTY), resume, reconcile, export, backup (sqlite `--out`, or restic `init`/`run`/`prune`/`check`), restore, hook set/check/list, roles, heal collect/show/prune-duplicates, test |
 | `transport.py` | Bounded-timeout HTTP POST (stdlib). Hook URLs must be https (`hooks.py`); plain http is accepted only for 127.0.0.1/localhost with `OMG_ALLOW_INSECURE_HOOKS=1` (tests) |
 | `hooks.py` | Webhook URL and key store `state/secrets/hooks.json` (0600 file in a 0700 dir). Separate from job state |
 | `artifacts.py` | Immutable, content-addressed artifact files. Path-traversal and symlink checks. sha256 verified on read |

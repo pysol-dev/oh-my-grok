@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import socket
 import ssl
 from dataclasses import dataclass
@@ -19,6 +20,10 @@ class HttpResult:
 
 
 def post_json(url: str, key: str, body: dict, connect_timeout: float, read_timeout: float) -> HttpResult:
+    # Recovery sets this before a restored hooks file can be used. Return before parsing the URL
+    # or building an Authorization header, so nothing is contacted and the key is not logged.
+    if os.environ.get("OMG_DISABLE_TRANSPORT") == "1":
+        return HttpResult(None, None, "transport disabled")
     u = urlparse(url)
     data = json.dumps(body, separators=(",", ":")).encode()
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",

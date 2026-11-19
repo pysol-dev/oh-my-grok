@@ -1,5 +1,9 @@
 """Host watchdog: a self-supervised loop that reconciles, collects failures, and wakes stalled roles.
 
+``features.backup`` is a separate switch. When it is ``on``, each tick runs the restic schedule
+(generation change and 10 minutes, or 6 hours, plus daily prune and check). ``off`` skips that step.
+The repository password is never written to the heartbeat or the log.
+
 There is no systemd unit and no crontab on the host this serves. ``serve`` is the foreground loop.
 ``start`` daemonizes it with a pidfile and an exclusive lock under the state directory. ``ensure`` is the
 call a coarse external backstop makes after a restart: it starts the loop only when it is not already alive.
@@ -401,6 +405,8 @@ def tick(engine: Engine, *, now: float | None = None, interval: float | None = N
             "heal_collect": _step(lambda: _heal(engine)),
             "stalls": _step(lambda: _stalls(engine, policy, moment, wake=mode == features.ON)),
         }
+    # backup is its own flag. The loop is only the clock; off skips the step.
+    outcomes["backup"] = _step(lambda: _backup_step(engine, moment))
     for name, step in outcomes.items():
         if not step.get("ok"):
             log.error("step %s failed: %s", name, step.get("error", ""))
@@ -408,6 +414,11 @@ def tick(engine: Engine, *, now: float | None = None, interval: float | None = N
         "unix": moment, "ts": db.utcnow(), "mode": mode, "interval_seconds": step_interval, "steps": outcomes})
     log.info("tick mode=%s %s", mode, " ".join(_tick_label(name, step) for name, step in outcomes.items()))
     return payload
+
+
+def _backup_step(engine: Engine, now: float) -> dict:
+    from . import restic_backup
+    return restic_backup.scheduled(engine.conn, engine.paths, now=now)
 
 
 def _stalls(engine: Engine, policy: dict, now: float, *, wake: bool) -> dict:
