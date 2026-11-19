@@ -449,9 +449,11 @@ duties between cooperating agents, not protection against a malicious same-accou
   repository commits or routine outputs.
 - Rotation: run `omg hook set ROLE` again with the new value. Rotate the key in the routine UI first. A changed key
   shows up as `HTTP 401/403: webhook key rejected` and blocks the task until resumed.
-- The restic repository password is `OMG_RESTIC_PASSWORD`. Restic is given it only through
-  `RESTIC_PASSWORD_COMMAND=printenv OMG_RESTIC_PASSWORD`. It is not an argument, not a file, and not written
-  under `/workspace` or into events, doctor output, or logs. `state/secrets/hooks.json` is backed up as raw
+- The restic repository password is `OMG_RESTIC_PASSWORD`. Restic commands that need it receive it only
+  through `RESTIC_PASSWORD_COMMAND=printenv OMG_RESTIC_PASSWORD` in that process. Other child processes,
+  including the sandbox, language-server git, `restic version`, pytest, and the watchdog, have the variable
+  removed. It is not an argument, not a file, and not written under `/workspace` or into events, doctor
+  output, or logs. `state/secrets/hooks.json` is backed up as raw
   bytes inside the encrypted restic snapshot and is not printed. `scripts/recover.sh` exports
   `OMG_DISABLE_TRANSPORT=1` before a restored hooks file can cause a POST.
 - **2026-11-04 disclosure (honest record):** the terminal path (`hook set`: GUI paste delivered length=0) and the

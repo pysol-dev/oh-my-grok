@@ -20,7 +20,7 @@ from .config import TEMPLATE_MARKERS, load_policy, load_verifier_profiles
 from .errors import OmgError, ValidationError
 from .hooks import _check_perms, hook_status, load_hooks, set_hook, validate_url
 from .paths import CODE_ROOT, get_paths
-from .redact import redact, redact_obj
+from .redact import redact, redact_obj, scrubbed_environ
 from .roster import CLASSES, INTENTS, validate_scope
 from .states import ROLES
 from . import verifier
@@ -605,7 +605,7 @@ def _pytest(suite: str, extra: list[str]) -> int:
     tdir = CODE_ROOT / "tests" / suite
     cmd = [sys.executable, "-m", "pytest", str(tdir), "-q", "-p", "no:cacheprovider", *extra]
     print("running: " + " ".join(cmd), file=sys.stderr)
-    return subprocess.call(cmd, cwd=str(CODE_ROOT))
+    return subprocess.call(cmd, cwd=str(CODE_ROOT), env=scrubbed_environ())
 
 
 def cmd_test(args) -> int:

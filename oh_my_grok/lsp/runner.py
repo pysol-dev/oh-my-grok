@@ -18,6 +18,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from .. import sandbox
+from ..redact import scrubbed_environ
 from . import delta, profiles
 from .client import LspClient, LspError, MethodNotFound
 
@@ -35,7 +36,8 @@ class Unavailable(Exception):
 # --------------------------------------------------------------------------------------------------- git helpers
 def _git(repo: Path, *args: str) -> bytes:
     try:
-        cp = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, timeout=GIT_TIMEOUT)
+        cp = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-C", str(repo), *args],
+                            capture_output=True, timeout=GIT_TIMEOUT, env=scrubbed_environ())
     except (OSError, subprocess.SubprocessError) as e:
         raise Unavailable("git_failed", f"{type(e).__name__}") from e
     if cp.returncode != 0:
@@ -75,8 +77,8 @@ def blob_id(data: bytes, like: str) -> str:
 
 def stage_revision(repo: Path, sha: str, dest: Path) -> None:
     dest.mkdir(parents=True)
-    proc = subprocess.Popen(["git", "-C", str(repo), "archive", "--format=tar", sha], stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE)
+    proc = subprocess.Popen(["git", "-c", "core.hooksPath=/dev/null", "-C", str(repo), "archive", "--format=tar", sha],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=scrubbed_environ())
     try:
         with tarfile.open(fileobj=proc.stdout, mode="r|") as tf:
             tf.extractall(dest, filter="data")
@@ -447,9 +449,10 @@ def canary_all(cfg: dict, sbx: sandbox.Probe, scratch: Path, only: list[str] | N
         env = {"GIT_AUTHOR_NAME": "omg", "GIT_AUTHOR_EMAIL": "omg@invalid", "GIT_COMMITTER_NAME": "omg",
                "GIT_COMMITTER_EMAIL": "omg@invalid", "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
         for cmd in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "canary"]):
-            subprocess.run(["git", "-C", str(repo), *cmd], check=True, capture_output=True, env=env)
-        sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True,
-                             text=True).stdout.strip()
+            subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-C", str(repo), *cmd], check=True,
+                           capture_output=True, env=env)
+        sha = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-C", str(repo), "rev-parse", "HEAD"],
+                             check=True, capture_output=True, text=True, env=env).stdout.strip()
         for name, prof in profiles.enabled_profiles(cfg).items():
             if only is not None and name not in only:
                 continue

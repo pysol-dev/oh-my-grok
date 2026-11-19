@@ -37,7 +37,7 @@ from .engine import PAYLOAD_SCHEMA_VERSION, Engine
 from .errors import GateRefused, OmgError
 from .hooks import hook_status
 from .paths import CODE_ROOT, Paths, get_paths
-from .redact import redact, redact_obj
+from .redact import redact, redact_obj, scrubbed_environ
 
 log = logging.getLogger("oh_my_grok.watchdog")
 _configured_log_path: str | None = None
@@ -538,7 +538,7 @@ def start(interval: float | None = None, paths: Paths | None = None) -> dict:
     os.fchmod(log_fd, 0o600)
     with os.fdopen(log_fd, "ab") as handle:
         proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=handle, stderr=subprocess.STDOUT,
-                                start_new_session=True, cwd=str(CODE_ROOT), env=os.environ.copy())
+                                start_new_session=True, cwd=str(CODE_ROOT), env=scrubbed_environ())
     deadline = time.time() + 15
     while time.time() < deadline:
         current = status(paths)

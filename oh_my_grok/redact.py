@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any
 
@@ -20,8 +21,19 @@ SECRET_KEYS = re.compile(r"(?i)^(authorization|key|bearer|token|secret|password|
 _known: set[str] = set()
 
 
-def register_secret(value: str | None) -> None:
-    if value and len(value) >= 6:
+# Removed from every child environment. Restic commands that need the password set it explicitly.
+SECRET_ENV_KEYS = ("OMG_RESTIC_PASSWORD", "RESTIC_PASSWORD", "RESTIC_PASSWORD_FILE", "RESTIC_PASSWORD_COMMAND")
+
+
+def scrubbed_environ(base: dict[str, str] | None = None) -> dict[str, str]:
+    env = dict(os.environ if base is None else base)
+    for key in SECRET_ENV_KEYS:
+        env.pop(key, None)
+    return env
+
+
+def register_secret(value: str | None, *, min_length: int = 6) -> None:
+    if value and len(value) >= min_length:
         _known.add(value)
 
 
