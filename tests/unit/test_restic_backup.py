@@ -2,6 +2,8 @@
 import errno
 import json
 import os
+import socket
+import subprocess
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -264,8 +266,11 @@ def test_locked_repository_is_skipped_without_a_failure_event(omg_home, tmp_path
 
     calls, runner = _runner_factory(script)
     result = restic_backup.run_backup(engine.conn, engine.paths, force=True, now=NOW, runner=runner)
-    assert result["reason"] == "locked" and len(calls) == 1
-    assert _events(engine.conn) == []
+    assert result["reason"] == "locked"
+    kinds = [row["kind"] for row in engine.conn.execute("SELECT kind FROM events ORDER BY id")]
+    assert "backup_locked" in kinds
+    assert "backup_failed" not in kinds
+    assert not any("unlock" in argv for argv, _env, _timeout in calls)
     engine.close()
 
 
@@ -606,6 +611,357 @@ def test_transport_disable_does_not_open_a_connection(monkeypatch):
     result = post_json("https://hooks.example.invalid/secret-path", "super-secret-key", {"a": 1}, 1, 1)
     assert result.error == "transport disabled"
     assert result.status is None
+
+
+def test_forget_keep_one_leaves_one_snapshot(omg_home, tmp_path, monkeypatch):
+    restic = Path(__file__).resolve().parents[2] / "tools" / "restic"
+    if not restic.is_file():
+        pytest.skip("restic 0.19.1 is not installed")
+    monkeypatch.setenv("OMG_RESTIC_BIN", str(restic))
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", PASSWORD)
+    repo = tmp_path / "repo"
+    _policy(repo, features={"backup": "on"}, backup_keep_hourly=1, backup_keep_daily=1, backup_keep_weekly=1,
+            backup_timeout_seconds=60)
+    engine = Engine()
+    try:
+        restic_backup.init_repo(engine.paths)
+        first = restic_backup.run_backup(engine.conn, engine.paths, force=True, now=NOW)
+        _add_event(engine.conn, data="later")
+        second = restic_backup.run_backup(engine.conn, engine.paths, force=True, now=NOW + 1)
+        assert first["tags"] != second["tags"]
+        restic_backup.prune_repo(engine.conn, engine.paths, now=NOW + 2)
+    finally:
+        engine.close()
+    env = os.environ.copy()
+    env.update({"OMG_RESTIC_PASSWORD": PASSWORD, "RESTIC_PASSWORD_COMMAND": "printenv OMG_RESTIC_PASSWORD",
+                "RESTIC_PACK_SIZE": "4"})
+    listed = subprocess.run([str(restic), "--repo", str(repo), "--json", "snapshots"], capture_output=True,
+                            text=True, env=env, timeout=30, check=False)
+    assert listed.returncode == 0, listed.stderr
+    snaps = json.loads(listed.stdout)
+    assert len(snaps) == 1
+    assert snaps[0]["paths"]
+
+
+def test_exclusive_stale_local_lock_is_unlocked_then_checked(omg_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", PASSWORD)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _policy(repo, features={"backup": "on"})
+    calls = []
+
+    def runner(argv, env, timeout):
+        calls.append(argv)
+        if ("list" in argv or "cat" in argv) and "--no-lock" not in argv:
+            return CommandResult(11, stderr="repository is already locked\n")
+        if "list" in argv:
+            return CommandResult(0, stdout="abc\n")
+        if "cat" in argv:
+            body = {"time": _stamp(NOW - 7200), "hostname": "thisbox", "pid": 9, "exclusive": True}
+            return CommandResult(0, stdout=json.dumps(body))
+        return CommandResult(0, stdout="ok\n")
+
+    code = restic_backup_recover().handle_locks(
+        get_paths(), repo, password=PASSWORD, timeout=5, check=False, now=NOW, hostname="thisbox",
+        pid_alive_fn=lambda pid: False, runner=runner)
+    assert code is None
+    assert any("--no-lock" in argv for argv in calls)
+    unlocks = [argv for argv in calls if "unlock" in argv]
+    assert len(unlocks) == 1 and "--remove-all" not in unlocks[0]
+    assert any("check" in argv for argv in calls)
+
+
+def test_young_nonexclusive_foreign_lock_is_not_restored(omg_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", PASSWORD)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _policy(repo, features={"backup": "on"})
+    calls = []
+
+    def runner(argv, env, timeout):
+        calls.append(argv)
+        if "list" in argv:
+            return CommandResult(0, stdout="abc\n")
+        if "cat" in argv:
+            body = {"time": _stamp(NOW), "hostname": "otherhost", "pid": 3, "exclusive": False}
+            return CommandResult(0, stdout=json.dumps(body))
+        if "--retry-lock" in argv:
+            return CommandResult(0, stdout="[]\n")
+        return CommandResult(0, stdout="ok\n")
+
+    code = restic_backup_recover().handle_locks(
+        get_paths(), repo, password=PASSWORD, timeout=5, check=False, now=NOW, hostname="thisbox",
+        pid_alive_fn=lambda pid: False, runner=runner)
+    assert code == 16
+    assert not any("unlock" in argv for argv in calls)
+    assert not any("restore" in argv for argv in calls)
+
+
+def test_own_stale_lock_is_cleared_and_a_foreign_lock_is_recorded(omg_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", PASSWORD)
+    repo = tmp_path / "repo"
+    _policy(repo, features={"backup": "on"})
+    engine = Engine()
+    state = {"phase": "backup"}
+    host = socket.gethostname()
+
+    def runner(argv, env, timeout):
+        if "backup" in argv and state["phase"] == "backup":
+            state["phase"] = "listed"
+            return CommandResult(11, stderr="repository is already locked\n")
+        if "list" in argv:
+            return CommandResult(0, stdout="abc\n")
+        if "cat" in argv:
+            body = {"time": _stamp(NOW - 10), "hostname": host, "pid": 99999999, "exclusive": True}
+            return CommandResult(0, stdout=json.dumps(body))
+        if "unlock" in argv:
+            assert "--remove-all" not in argv
+            state["phase"] = "unlocked"
+            return CommandResult(0, stdout="removed\n")
+        if "backup" in argv and state["phase"] == "unlocked":
+            return CommandResult(0, stdout="saved\n")
+        return CommandResult(0, stdout="ok\n")
+
+    result = restic_backup.run_backup(engine.conn, engine.paths, force=True, now=NOW, runner=runner)
+    assert result["ok"] is True and result.get("reason") != "locked"
+    assert [row["kind"] for row in _events(engine.conn)] == ["backup_ok"]
+
+    def foreign(argv, env, timeout):
+        if "list" in argv:
+            return CommandResult(0, stdout="abc\n")
+        if "cat" in argv:
+            body = {"time": _stamp(NOW), "hostname": "otherhost", "pid": 7, "exclusive": True}
+            return CommandResult(0, stdout=json.dumps(body))
+        if "unlock" in argv:
+            raise AssertionError("foreign lock was unlocked")
+        return CommandResult(11, stderr="repository is already locked\n")
+
+    skipped = restic_backup.run_backup(engine.conn, engine.paths, force=True, now=NOW + 1, runner=foreign)
+    assert skipped["reason"] == "locked"
+    kinds = [row["kind"] for row in engine.conn.execute("SELECT kind FROM events ORDER BY id")]
+    assert "backup_locked" in kinds
+    engine.close()
+
+
+def test_doctor_fails_a_lock_older_than_30_minutes(omg_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", PASSWORD)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "config").write_text("{}\n")
+    _policy(repo, features={"backup": "on"})
+    (get_paths().state_dir / "backup").mkdir(parents=True)
+    (get_paths().state_dir / "backup" / "status.json").write_text(json.dumps({"pack_size": 4}))
+
+    def runner(argv, env, timeout):
+        if "list" in argv:
+            return CommandResult(0, stdout="abc\n")
+        if "cat" in argv:
+            body = {"time": _stamp(NOW - 1800), "hostname": "otherhost", "pid": 1, "exclusive": True}
+            return CommandResult(0, stdout=json.dumps(body))
+        if argv[-1:] == ["version"] or "version" in argv:
+            return CommandResult(0, stdout="restic 0.19.1\n")
+        return CommandResult(0, stdout="ok\n")
+
+    monkeypatch.setenv("OMG_RESTIC_BIN", str(Path(__file__).resolve().parents[1] / "fake_restic.py"))
+    report = {item["check"]: item for item in doctor_report(get_paths(), now=NOW, runner=runner)}
+    assert report["backup_locks"]["ok"] is False
+    assert report["backup_locks"]["status"] == "FAIL"
+    assert "oldest_age_seconds=1800" in report["backup_locks"]["detail"]
+
+
+def test_prune_efbig_waits_out_the_minimum_interval(omg_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", PASSWORD)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "config").write_text("{}\n")
+    _policy(repo, features={"backup": "on"}, backup_min_interval_seconds=600, backup_max_interval_seconds=21600,
+            backup_prune_interval_seconds=86400)
+    engine = Engine()
+    restic_backup.update_status(engine.paths, last_backup_unix=NOW, last_generation=0)
+    calls = []
+
+    def runner(argv, env, timeout):
+        calls.append(argv)
+        if "forget" in argv:
+            return CommandResult(1, stderr="rename: file too large\n")
+        return CommandResult(0, stdout="[]\n")
+
+    with pytest.raises(BackupFailed) as exc:
+        restic_backup.scheduled(engine.conn, engine.paths, now=NOW + 10, runner=runner)
+    assert exc.value.reason == "efbig"
+    assert len([argv for argv in calls if "forget" in argv]) == 1
+    restic_backup.scheduled(engine.conn, engine.paths, now=NOW + 40, runner=runner)
+    assert len([argv for argv in calls if "forget" in argv]) == 1
+    with pytest.raises(BackupFailed):
+        restic_backup.scheduled(engine.conn, engine.paths, now=NOW + 10 + 600, runner=runner)
+    assert len([argv for argv in calls if "forget" in argv]) == 2
+    engine.close()
+
+
+def test_corrupt_local_database_is_moved_aside_then_restored(omg_home, tmp_path):
+    from oh_my_grok.recover import recover_from_tree
+    engine = Engine()
+    try:
+        _add_event(engine.conn, data="kept")
+        snap = tmp_path / "snap.sqlite3"
+        db.backup(engine.conn, snap)
+        paths = engine.paths
+    finally:
+        engine.close()
+    paths.db_path.write_bytes(b"this is not sqlite")
+    wal = Path(str(paths.db_path) + "-wal")
+    shm = Path(str(paths.db_path) + "-shm")
+    wal.write_bytes(b"wal-bytes")
+    shm.write_bytes(b"shm-bytes")
+    assert recover_from_tree(paths, _snapshot_tree(tmp_path / "tree", snap), check=False) == 0
+    aside = list(paths.backups_dir.glob("pre-recover-corrupt-*"))
+    assert any(path.read_bytes() == b"this is not sqlite" for path in aside)
+    assert any(path.name.endswith("-wal") and path.read_bytes() == b"wal-bytes" for path in aside)
+    assert any(path.name.endswith("-shm") and path.read_bytes() == b"shm-bytes" for path in aside)
+    fresh = Engine()
+    try:
+        values = [json.loads(row["data_json"])["v"]
+                  for row in fresh.conn.execute("SELECT data_json FROM events ORDER BY id")]
+        assert "kept" in values
+        assert fresh.conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        fresh.close()
+
+
+def test_stream_keeps_a_large_snapshot_list(tmp_path):
+    import sys
+    payload = [{"id": f"{i:064x}", "hostname": "omg-box", "tags": ["omg", f"gen:{i}"],
+                "paths": ["/tmp/omg-backup-staging-same/snapshot"], "pad": "x" * 180} for i in range(250)]
+    text = json.dumps(payload)
+    assert len(text) > 65536
+    script = tmp_path / "emit.py"
+    script.write_text("import sys\nsys.stdout.write(sys.stdin.read())\n")
+    proc_script = tmp_path / "print_json.py"
+    proc_script.write_text(f"import sys\nsys.stdout.write({text!r})\n")
+    result = restic_backup._stream([sys.executable, str(proc_script)], os.environ.copy(), 15)
+    assert result.returncode == 0
+    assert len(json.loads(result.stdout)) == 250
+
+
+def test_recover_sh_does_not_leak_disable_transport_to_the_watchdog(tmp_path, monkeypatch):
+    import subprocess
+    out = tmp_path / "out"
+    py = tmp_path / "python3"
+    py.write_text("#!/bin/sh\nprintf 'py:%s\\n' \"${OMG_DISABLE_TRANSPORT-}\" >> \"$OUT\"\nexit 0\n")
+    omg = tmp_path / "omg"
+    omg.write_text("#!/bin/sh\nprintf 'wd:%s\\n' \"${OMG_DISABLE_TRANSPORT-<unset>}\" >> \"$OUT\"\nexit 0\n")
+    os.chmod(py, 0o755)
+    os.chmod(omg, 0o755)
+    env = os.environ.copy()
+    env["OMG_RESTIC_PASSWORD"] = PASSWORD
+    env["OMG_RECOVER_PYTHON"] = str(py)
+    env["OMG_BIN"] = str(omg)
+    env["OMG_RECOVER_SKIP_BOOTSTRAP"] = "1"
+    env["OUT"] = str(out)
+    env.pop("OMG_DISABLE_TRANSPORT", None)
+    script = Path(__file__).resolve().parents[2] / "scripts" / "recover.sh"
+    proc = subprocess.run([str(script)], capture_output=True, text=True, env=env, timeout=20, check=False)
+    assert proc.returncode == 0, proc.stderr
+    lines = out.read_text().splitlines()
+    assert lines[0] == "py:1"
+    assert lines[1] == "wd:<unset>"
+    assert lines[2] == "wd:<unset>"
+
+
+def test_child_processes_do_not_inherit_the_restic_password(omg_home, monkeypatch):
+    import subprocess
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", PASSWORD)
+    monkeypatch.setenv("RESTIC_PASSWORD", PASSWORD)
+    from oh_my_grok.redact import scrubbed_environ
+    clean = scrubbed_environ()
+    assert "OMG_RESTIC_PASSWORD" not in clean and "RESTIC_PASSWORD" not in clean
+
+    seen = []
+    real_run = subprocess.run
+
+    def spy(argv, **kwargs):
+        seen.append(kwargs.get("env"))
+        kwargs["env"] = kwargs.get("env")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr("oh_my_grok.sandbox.subprocess.run", spy)
+    from oh_my_grok import sandbox
+    sandbox.probe.cache_clear()
+    sandbox.probe()
+    assert seen and all(env is not None and PASSWORD not in env.values() and "OMG_RESTIC_PASSWORD" not in env
+                        for env in seen)
+
+    from oh_my_grok.cli import _pytest
+    called = {}
+
+    def fake_call(cmd, **kwargs):
+        called["env"] = kwargs.get("env")
+        return 0
+
+    monkeypatch.setattr("oh_my_grok.cli.subprocess.call", fake_call)
+    assert _pytest("unit", ["-k", "none"]) == 0
+    assert "OMG_RESTIC_PASSWORD" not in called["env"]
+
+    from oh_my_grok.restic_backup import _restic_version
+    version_env = {}
+
+    def fake_version(argv, **kwargs):
+        version_env.update(kwargs.get("env") or {})
+        class Done:
+            stdout = "restic 0.19.1\n"
+            stderr = ""
+            returncode = 0
+        return Done()
+
+    monkeypatch.setattr("oh_my_grok.restic_backup.subprocess.run", fake_version)
+    assert "0.19.1" in _restic_version(Path("/usr/bin/true"))
+    assert "OMG_RESTIC_PASSWORD" not in version_env
+
+
+def test_short_password_is_redacted(monkeypatch):
+    from oh_my_grok.redact import redact
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", "q7z")
+    restic_backup.require_password()
+    assert redact("leak q7z now") == "leak [REDACTED] now"
+
+
+def test_init_einval_is_not_retried(omg_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", PASSWORD)
+    _policy(tmp_path / "repo", features={"backup": "on"})
+    calls = []
+
+    def runner(argv, env, timeout):
+        calls.append(argv)
+        return CommandResult(1, stderr="create repository: invalid argument\n")
+
+    with pytest.raises(BackupFailed) as exc:
+        restic_backup.init_repo(get_paths(), runner=runner)
+    assert exc.value.reason == "einval"
+    assert len(calls) == 1
+
+
+def test_restore_selects_host_and_omg_tag(omg_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", PASSWORD)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "config").write_text("{}\n")
+    _policy(repo, features={"backup": "on"})
+    calls = []
+
+    def runner(argv, env, timeout):
+        calls.append(argv)
+        if "snapshots" in argv:
+            return CommandResult(0, stdout='[{"id":"abc","short_id":"abc"}]\n')
+        if "restore" in argv:
+            assert argv[argv.index("--host") + 1] == "omg-box"
+            assert argv[argv.index("--tag") + 1] == "omg"
+            return CommandResult(1, stderr="stop before writing\n")
+        return CommandResult(0, stdout="")
+
+    code = restic_backup_recover().run_recover(check=True, runner=runner, hostname="thisbox",
+                                              pid_alive_fn=lambda pid: False)
+    assert code != 0
+    assert any("restore" in argv for argv in calls)
 
 
 def test_recover_script_refuses_a_missing_password(monkeypatch):

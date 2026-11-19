@@ -13,25 +13,28 @@ and are not returned, logged, or stored in an event.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import signal
+import socket
 import sqlite3
 import stat
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from . import db, features
 from .config import canonical_json, load_policy, sha256_text
 from .errors import IntegrityError_, OmgError
 from .paths import Paths, get_paths, tools_dir
-from .redact import redact, register_secret
+from .redact import redact, register_secret, scrubbed_environ
 
 PACK_MIB = 4
 HOST = "omg-box"
@@ -49,12 +52,14 @@ EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_NO_SNAPSHOT = 10
 EXIT_DIVERGED = 11
-EXIT_LOCKED = 11  # restic's own "repository is already locked"; backup treats it as busy
 EXIT_VERIFY = 12
 EXIT_PASSWORD = 13
 EXIT_CHECK_BEHIND = 14
 EXIT_POST = 15
+# Restic itself exits 11 when the repository is locked. omg reports that as 16 so it is not
+# the same code as a diverged restore.
 EXIT_LOCK = 16
+EXIT_LOCKED = EXIT_LOCK
 
 Runner = Callable[[list[str], dict[str, str], float], "CommandResult"]
 
@@ -94,8 +99,7 @@ def require_password() -> str:
     password = os.environ.get(PASSWORD_ENV) or ""
     if not password:
         raise BackupFailed("password_unset")
-    if len(password) >= 6:
-        register_secret(password)
+    register_secret(password, min_length=1)
     return password
 
 
@@ -132,20 +136,39 @@ def backup_due(*, last_at: float | None, last_gen: int | None, gen: int, now: fl
     return int(gen) != previous and age >= float(min_interval)
 
 
-def _efbig_backoff(status: dict[str, Any], now: float, policy: dict) -> bool:
-    """An EFBIG failure is not retried on the next tick. The 6h ceiling still runs a backup."""
-    if status.get("last_failure_reason") != "efbig":
+def _efbig_backoff(status: dict[str, Any], now: float, policy: dict, *,
+                   reason_key: str = "last_failure_reason", attempt_key: str = "last_attempt_unix",
+                   success_key: str = "last_backup_unix",
+                   max_interval_key: str = "backup_max_interval_seconds") -> bool:
+    """An EFBIG failure is not retried on the next tick. The long ceiling still runs the operation."""
+    if status.get(reason_key) != "efbig":
         return False
-    attempt = status.get("last_attempt_unix")
+    attempt = status.get(attempt_key)
     if not isinstance(attempt, (int, float)) or isinstance(attempt, bool):
         return False
     if now - float(attempt) >= float(policy["backup_min_interval_seconds"]):
         return False
-    last_ok = status.get("last_backup_unix")
-    if isinstance(last_ok, (int, float)) and not isinstance(last_ok, bool):
-        if now - float(last_ok) >= float(policy["backup_max_interval_seconds"]):
-            return False
-    return True
+    last_ok = status.get(success_key)
+    forced = (isinstance(last_ok, (int, float)) and not isinstance(last_ok, bool)
+              and now - float(last_ok) >= float(policy[max_interval_key]))
+    return not forced
+
+
+def staging_root(paths: Paths) -> Path:
+    """One directory per home, reused so restic records the same path for every snapshot.
+
+    A fresh temporary directory would make the default host+paths grouping keep every snapshot.
+    """
+    digest = hashlib.sha256(str(paths.root.resolve()).encode()).hexdigest()[:16]
+    return Path("/tmp") / f"omg-backup-staging-{digest}"
+
+
+def prepare_staging(paths: Paths) -> Path:
+    root = staging_root(paths)
+    if root.exists() or root.is_symlink():
+        shutil.rmtree(root)
+    root.mkdir(parents=True)
+    return root
 
 
 def interval_due(last_at: float | None, now: float, interval: float) -> bool:
@@ -189,6 +212,13 @@ def inspect_database(path: Path) -> tuple[str, list[dict[str, Any]] | None]:
     """Return missing, corrupt, or ok plus the event stream when the file is readable."""
     if not path.exists():
         return "missing", None
+    try:
+        header = path.read_bytes()[:16]
+    except OSError:
+        return "corrupt", None
+    # Do not let SQLite open a non-database: that rewrites the -shm sidecar before we can move it aside.
+    if header != b"SQLite format 3\x00":
+        return "corrupt", None
     try:
         conn = _open_ro(path)
     except sqlite3.Error:
@@ -416,6 +446,11 @@ def _is_efbig(text: str) -> bool:
     return "efbig" in low or "file too large" in low
 
 
+def _is_einval(text: str) -> bool:
+    low = text.lower()
+    return "einval" in low or "invalid argument" in low
+
+
 def _retry_reason(stderr: str) -> str | None:
     low = stderr.lower()
     if "eagain" in low or "resource temporarily unavailable" in low:
@@ -437,16 +472,17 @@ def _kill(proc: subprocess.Popen) -> None:
             return
 
 
-def _read_some(pipe, buf: bytearray) -> bool:
+def _read_some(pipe, buf: bytearray, *, limit: int | None) -> bool:
     try:
         chunk = pipe.read(65536)
     except BlockingIOError:
         return False
     if not chunk:
         return False
-    if len(buf) > 65536:
-        del buf[:-32768]
     buf.extend(chunk)
+    # Stderr is kept only for error matching. Stdout is kept whole: `snapshots --json` is parsed.
+    if limit is not None and len(buf) > limit:
+        del buf[:-limit]
     return True
 
 
@@ -461,8 +497,8 @@ def _stream(argv: list[str], env: dict[str, str], timeout: float) -> CommandResu
     timed_out = False
     deadline = time.monotonic() + timeout
     while True:
-        got_out = _read_some(proc.stdout, out)
-        got_err = _read_some(proc.stderr, err)
+        got_out = _read_some(proc.stdout, out, limit=None)
+        got_err = _read_some(proc.stderr, err, limit=65536)
         if _is_efbig(err.decode("utf-8", "replace")):
             efbig = True
             _kill(proc)
@@ -481,7 +517,7 @@ def _stream(argv: list[str], env: dict[str, str], timeout: float) -> CommandResu
         _kill(proc)
         proc.wait(timeout=5)
     for _ in range(50):
-        if not _read_some(proc.stdout, out) and not _read_some(proc.stderr, err):
+        if not _read_some(proc.stdout, out, limit=None) and not _read_some(proc.stderr, err, limit=65536):
             break
     stderr = err.decode("utf-8", "replace")
     stdout = out.decode("utf-8", "replace")
@@ -514,7 +550,7 @@ def call_restic(paths: Paths, repo: Path, command: list[str], *, password: str, 
     last: CommandResult | None = None
     for attempt in (1, 2):
         last = _execute(argv, env, timeout, runner, password)
-        if last.efbig or last.locked or last.timed_out or last.returncode == 0:
+        if last.efbig or _is_einval(last.stderr) or last.locked or last.timed_out or last.returncode == 0:
             return last
         if last.returncode == 12:
             return last
@@ -574,6 +610,8 @@ def init_repo(paths: Paths, *, runner: Runner | None = None) -> dict[str, Any]:
     result = call_restic(paths, repo, ["init"], password=password, timeout=_timeout(policy), runner=runner)
     if result.efbig:
         raise BackupFailed("efbig")
+    if _is_einval(result.stderr):
+        raise BackupFailed("einval")
     if result.returncode == 0 or "config file already exists" in result.stderr.lower():
         return {"ok": True, "initialized": True, "already": result.returncode != 0, "repo": str(repo)}
     if result.returncode == 12:
@@ -597,12 +635,15 @@ def run_backup(conn: sqlite3.Connection, paths: Paths, *, force: bool = False, n
     repo = _require_repo(policy)
     password = require_password()
     timeout = _timeout(policy)
-    staging = Path(tempfile.mkdtemp(prefix="omg-backup-", dir="/tmp"))
+    staging = prepare_staging(paths)
     try:
         meta = stage_snapshot(conn, paths, staging)
         command = ["backup", "--host", HOST, "--tag", "omg", "--tag", f"gen:{meta['generation']}",
                    "--tag", f"schema:{meta['schema']}", str(meta["tree"])]
         result = call_restic(paths, repo, command, password=password, timeout=timeout, runner=runner)
+        if result.locked:
+            result = _retry_after_own_stale_lock(conn, paths, repo, command, password=password, timeout=timeout,
+                                                 runner=runner)
         if result.efbig:
             update_status(paths, last_attempt_unix=moment, last_failure_reason="efbig")
             _fail(conn, "efbig")
@@ -633,17 +674,25 @@ def prune_repo(conn: sqlite3.Connection, paths: Paths, *, runner: Runner | None 
     repo = _require_repo(policy)
     password = require_password()
     moment = time.time() if now is None else now
-    command = ["forget", "--keep-hourly", str(policy["backup_keep_hourly"]),
+    # Group by host only. Tags include gen: and schema:, which change every snapshot, so grouping
+    # by tags would keep every generation. The staging path is stable, and host grouping still
+    # applies if that path ever changes.
+    command = ["forget", "--group-by", "host", "--keep-hourly", str(policy["backup_keep_hourly"]),
                "--keep-daily", str(policy["backup_keep_daily"]),
                "--keep-weekly", str(policy["backup_keep_weekly"]), "--prune"]
     result = call_restic(paths, repo, command, password=password, timeout=_timeout(policy), runner=runner)
+    if result.locked:
+        result = _retry_after_own_stale_lock(conn, paths, repo, command, password=password,
+                                             timeout=_timeout(policy), runner=runner)
     if result.efbig:
+        update_status(paths, last_prune_attempt_unix=moment, last_prune_failure_reason="efbig")
         _fail(conn, "efbig")
     if result.locked:
         return {"ok": True, "skipped": True, "reason": "locked"}
     if result.returncode != 0:
+        update_status(paths, last_prune_attempt_unix=moment, last_prune_failure_reason="prune")
         _fail(conn, "prune", exit_code=result.returncode, detail=_tail(result.stderr, password))
-    update_status(paths, last_prune_unix=moment, pack_size=PACK_MIB)
+    update_status(paths, last_prune_unix=moment, pack_size=PACK_MIB, last_prune_failure_reason=None)
     return {"ok": True, "pruned": True, "keep_hourly": policy["backup_keep_hourly"],
             "keep_daily": policy["backup_keep_daily"], "keep_weekly": policy["backup_keep_weekly"]}
 
@@ -658,6 +707,9 @@ def check_repo(conn: sqlite3.Connection, paths: Paths, *, read_data: bool = Fals
     if read_data:
         command.extend(["--read-data-subset", "5%"])
     result = call_restic(paths, repo, command, password=password, timeout=_timeout(policy), runner=runner)
+    if result.locked:
+        result = _retry_after_own_stale_lock(conn, paths, repo, command, password=password,
+                                             timeout=_timeout(policy), runner=runner)
     if result.locked:
         return {"ok": True, "skipped": True, "reason": "locked"}
     if result.returncode != 0:
@@ -684,7 +736,10 @@ def scheduled(conn: sqlite3.Connection, paths: Paths, *, now: float | None = Non
         return {"backup": backup, "skipped": True, "reason": "locked"}
     out: dict[str, Any] = {"backup": backup}
     status = load_status(paths)
-    if interval_due(status.get("last_prune_unix"), moment, policy["backup_prune_interval_seconds"]):
+    prune_blocked = _efbig_backoff(status, moment, policy, reason_key="last_prune_failure_reason",
+                                   attempt_key="last_prune_attempt_unix", success_key="last_prune_unix",
+                                   max_interval_key="backup_prune_interval_seconds")
+    if interval_due(status.get("last_prune_unix"), moment, policy["backup_prune_interval_seconds"]) and not prune_blocked:
         out["prune"] = prune_repo(conn, paths, runner=runner, now=moment)
         if out["prune"].get("reason") == "locked":
             return out
@@ -714,7 +769,7 @@ def parse_restic_time(value: str) -> datetime:
         text = head + "." + ("".join(digits) + "000000")[:6] + rest
     parsed = datetime.fromisoformat(text)
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed
 
 
@@ -724,14 +779,20 @@ def lock_age_seconds(lock: dict[str, Any], now: float) -> float:
 
 def list_locks(paths: Paths, repo: Path, *, password: str, timeout: float,
                runner: Runner | None = None) -> list[dict[str, Any]]:
-    listed = call_restic(paths, repo, ["list", "locks"], password=password, timeout=timeout, runner=runner)
+    # --no-lock so an exclusive lock can be classified instead of failing the read with exit 11.
+    no_lock = ["--no-lock"]
+    listed = call_restic(paths, repo, ["list", "locks"], password=password, timeout=timeout, runner=runner,
+                         extra_global=no_lock)
     if listed.locked:
         raise BackupFailed("locked")
     if listed.returncode != 0:
         raise BackupFailed("restic", exit_code=listed.returncode, detail=_tail(listed.stderr, password))
     locks = []
     for lock_id in [line.strip() for line in listed.stdout.splitlines() if line.strip()]:
-        cat = call_restic(paths, repo, ["cat", "lock", lock_id], password=password, timeout=timeout, runner=runner)
+        cat = call_restic(paths, repo, ["cat", "lock", lock_id], password=password, timeout=timeout, runner=runner,
+                          extra_global=no_lock)
+        if cat.locked or cat.returncode == 11:
+            raise BackupFailed("locked")
         if cat.returncode != 0:
             raise BackupFailed("restic", exit_code=cat.returncode, detail=_tail(cat.stderr, password))
         try:
@@ -784,6 +845,39 @@ def unlock_stale(paths: Paths, repo: Path, *, password: str, timeout: float,
                  runner: Runner | None = None) -> CommandResult:
     """Plain ``restic unlock``. There is no ``--remove-all`` path."""
     return call_restic(paths, repo, ["unlock"], password=password, timeout=timeout, runner=runner)
+
+
+def release_own_stale_lock(paths: Paths, repo: Path, *, password: str, timeout: float,
+                           runner: Runner | None = None) -> bool:
+    """Remove a lock left by a dead restic on this machine. A foreign or live lock is left alone."""
+    try:
+        locks = list_locks(paths, repo, password=password, timeout=timeout, runner=runner)
+    except BackupFailed:
+        return False
+    if not locks:
+        return False
+    host = socket.gethostname()
+    for lock in locks:
+        if str(lock.get("hostname") or "") != host:
+            return False
+        try:
+            pid = int(lock.get("pid") or 0)
+        except (TypeError, ValueError):
+            return False
+        if pid_alive(pid):
+            return False
+    unlocked = unlock_stale(paths, repo, password=password, timeout=timeout, runner=runner)
+    return unlocked.returncode == 0
+
+
+def _retry_after_own_stale_lock(conn: sqlite3.Connection, paths: Paths, repo: Path, command: list[str], *,
+                                password: str, timeout: float, runner: Runner | None) -> CommandResult:
+    if release_own_stale_lock(paths, repo, password=password, timeout=timeout, runner=runner):
+        retried = call_restic(paths, repo, command, password=password, timeout=timeout, runner=runner)
+        if not retried.locked:
+            return retried
+    _emit(conn, "backup_locked", reason="locked")
+    return CommandResult(returncode=11, locked=True)
 
 
 # ---------------------------------------------------------------- doctor
@@ -847,7 +941,8 @@ def _check(name: str, ok: bool, detail: str, status: str | None = None) -> dict[
 
 def _restic_version(binary: Path) -> str:
     try:
-        cp = subprocess.run([str(binary), "version"], capture_output=True, text=True, timeout=15, check=False)
+        cp = subprocess.run([str(binary), "version"], capture_output=True, text=True, timeout=15, check=False,
+                            env=scrubbed_environ())
     except (OSError, subprocess.TimeoutExpired):
         return ""
     return (cp.stdout or "") + (cp.stderr or "")
@@ -945,7 +1040,8 @@ def _lock_check(paths: Paths, repo: Path, policy: dict, *, now: float | None,
             age = max(0, int(lock_age_seconds(lock, moment)))
         except (KeyError, TypeError, ValueError):
             age = -1
-        if age > oldest:
-            oldest = age
+        oldest = max(oldest, age)
     detail = f"count={len(locks)} oldest_age_seconds={oldest} machines={','.join(machines) or '-'}"
+    if locks and (oldest < 0 or oldest >= LOCK_YOUNG_SECONDS):
+        return _check("backup_locks", False, detail)
     return _check("backup_locks", True, detail)

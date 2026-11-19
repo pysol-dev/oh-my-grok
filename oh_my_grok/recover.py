@@ -42,6 +42,7 @@ from .restic_backup import (
     EXIT_PASSWORD,
     EXIT_USAGE,
     EXIT_VERIFY,
+    HOST,
     BackupFailed,
     Runner,
     _policy,
@@ -133,16 +134,7 @@ def apply_snapshot(tree: Path, paths: Paths) -> None:
         raise IntegrityError_("snapshot failed integrity_check")
     paths.ensure()
     target = paths.db_path
-    if target.exists():
-        held = db.connect(target)
-        try:
-            db.backup(held, paths.backups_dir / f"pre-recover-{int(time.time())}.sqlite3")
-        finally:
-            held.close()
-    for suffix in ("-wal", "-shm"):
-        extra = Path(str(target) + suffix)
-        if extra.exists() or extra.is_symlink():
-            extra.unlink()
+    _preserve_local_database(paths, target)
     db.restore(database, target)
     _copy_tree(tree / "jobs", paths.jobs_dir)
     config_src = tree / "config"
@@ -171,6 +163,50 @@ def apply_snapshot(tree: Path, paths: Paths) -> None:
         db.migrate(conn)
     finally:
         conn.close()
+
+
+def _preserve_local_database(paths: Paths, target: Path) -> None:
+    """Keep a copy of a readable database. A corrupt file is renamed aside, with its WAL siblings."""
+    wal = [Path(str(target) + suffix) for suffix in ("-wal", "-shm")]
+    present = target.exists() or any(path.exists() or path.is_symlink() for path in wal)
+    if not present:
+        return
+    paths.backups_dir.mkdir(parents=True, exist_ok=True)
+    stamp = int(time.time())
+    health = "missing"
+    if target.exists() and not target.is_symlink() and _sqlite_header(target):
+        health, _events = inspect_database(target)
+    if health == "ok":
+        try:
+            held = db.connect(target)
+            try:
+                db.backup(held, paths.backups_dir / f"pre-recover-{stamp}.sqlite3")
+            finally:
+                held.close()
+            _unlink_db_sidecars(target)
+            return
+        except (OSError, sqlite3.Error):
+            pass
+    aside = paths.backups_dir / f"pre-recover-corrupt-{stamp}.sqlite3"
+    if target.exists() or target.is_symlink():
+        os.replace(target, aside)
+    for extra in wal:
+        if extra.exists() or extra.is_symlink():
+            os.replace(extra, Path(str(aside) + extra.name[len(target.name):]))
+
+
+def _sqlite_header(path: Path) -> bool:
+    try:
+        return path.read_bytes()[:16] == b"SQLite format 3\x00"
+    except OSError:
+        return False
+
+
+def _unlink_db_sidecars(target: Path) -> None:
+    for suffix in ("-wal", "-shm"):
+        extra = Path(str(target) + suffix)
+        if extra.exists() or extra.is_symlink():
+            extra.unlink()
 
 
 def _database_file(tree: Path) -> Path:
@@ -215,9 +251,6 @@ def handle_locks(paths: Paths, repo: Path, *, password: str, timeout: float, che
         print("stale repository lock; --check does not remove it", file=sys.stderr)
         return EXIT_LOCK
     unlocked = unlock_stale(paths, repo, password=password, timeout=timeout, runner=runner)
-    if "--remove-all" in (getattr(unlocked, "argv", []) or []):
-        print("refusing unlock --remove-all", file=sys.stderr)
-        return EXIT_VERIFY
     if unlocked.returncode != 0:
         print("restic unlock failed", file=sys.stderr)
         return EXIT_VERIFY
@@ -230,13 +263,22 @@ def handle_locks(paths: Paths, repo: Path, *, password: str, timeout: float, che
 
 def _wait_for_lock(paths, repo, *, password, timeout, runner, now=None, hostname=None,
                   pid_alive_fn=None) -> int | None:
+    """Wait, then refuse to restore while a young foreign lock is still present."""
     waiting = max(timeout, 150.0)
-    result = call_restic(paths, repo, ["snapshots", "--json"], password=password, timeout=waiting,
-                         runner=runner, extra_global=["--retry-lock", "2m"])
-    if result.returncode == 0 and not result.locked:
-        return None
-    print("repository lock is still held after --retry-lock 2m", file=sys.stderr)
-    return EXIT_LOCK
+    call_restic(paths, repo, ["snapshots", "--json"], password=password, timeout=waiting,
+                runner=runner, extra_global=["--retry-lock", "2m"])
+    moment = time.time() if now is None else now
+    host = hostname if hostname is not None else socket.gethostname()
+    alive = pid_alive if pid_alive_fn is None else pid_alive_fn
+    try:
+        locks = list_locks(paths, repo, password=password, timeout=timeout, runner=runner)
+    except BackupFailed:
+        print("repository lock is still held after --retry-lock 2m", file=sys.stderr)
+        return EXIT_LOCK
+    if classify_locks(locks, now=moment, hostname=host, pid_alive_fn=alive) == "wait":
+        print("repository lock is still held after --retry-lock 2m", file=sys.stderr)
+        return EXIT_LOCK
+    return None
 
 
 def recover_from_tree(paths: Paths, tree: Path, *, check: bool) -> int:
@@ -325,7 +367,8 @@ def run_recover(*, check: bool = False, runner: Runner | None = None, now: float
         if not snapshots:
             print("no snapshot in the repository", file=sys.stderr)
             return EXIT_NO_SNAPSHOT
-        restored = call_restic(paths, repo, ["restore", "latest", "--target", str(staging)],
+        restored = call_restic(paths, repo, ["restore", "latest", "--host", HOST, "--tag", "omg",
+                                            "--target", str(staging)],
                               password=password, timeout=timeout, runner=runner)
         if restored.returncode != 0:
             print("restic restore failed", file=sys.stderr)

@@ -2,12 +2,14 @@
 # Restore oh-my-grok state from the restic repository named by backup_repo.
 #
 # Lock handling is done by python3 -m oh_my_grok.recover, in this order:
-#   1. Read locks before changing the home, the config, or jobs.
-#   2. A lock from another machine younger than 30 minutes, or a lock whose pid is still
-#      alive here, waits with --retry-lock 2m and then exits 16. It is not removed.
-#   3. Any other lock is stale. It is removed with plain `restic unlock`.
-#      Never pass --remove-all.
-#   4. After a stale lock is removed, `restic check` must succeed before a snapshot is applied.
+#   1. Read locks with --no-lock before changing the home, the config, or jobs.
+#      An exclusive lock can be classified; it does not abort the read as exit 12.
+#   2. A lock from another machine younger than 30 minutes, exclusive or not, waits with
+#      --retry-lock 2m and then exits 16. It is not removed, and the restore does not continue.
+#      The same wait applies to a lock whose pid is still alive on this machine.
+#   3. A stale lock on this machine (the pid is not alive), including an exclusive lock left by
+#      a killed restic, is removed with plain `restic unlock`. Never pass --remove-all.
+#   4. After that unlock, `restic check` must succeed before a snapshot is applied.
 #
 # A snapshot whose event stream extends the local stream is restored. A local stream that is
 # already ahead is kept. Diverged streams exit 11 and change nothing. A newer schema is refused.
@@ -24,10 +26,11 @@
 #  13  password rejected
 #  14  --check only: a restore would be required
 #  15  restore was applied, then watchdog ensure or doctor failed
-#  16  a lock is still held after --retry-lock 2m
+#  16  a lock is still held after --retry-lock 2m (not the same code as divergence)
 #
 # OMG_RESTIC_PASSWORD is read from the environment and never printed.
-# OMG_DISABLE_TRANSPORT=1 is exported so a restored hooks file cannot POST.
+# OMG_DISABLE_TRANSPORT=1 applies only to the restore process. The watchdog started
+# afterwards does not inherit it.
 set -euo pipefail
 umask 077
 
@@ -37,7 +40,7 @@ for arg in "$@"; do
   case "$arg" in
     --check) CHECK=1 ;;
     -h|--help)
-      sed -n '2,32p' "$0"
+      sed -n '2,33p' "$0"
       exit 0
       ;;
     *)
@@ -53,18 +56,20 @@ if [ -z "${OMG_RESTIC_PASSWORD:-}" ]; then
   exit 2
 fi
 
-if [ "$CHECK" = 0 ]; then
+if [ "$CHECK" = 0 ] && [ "${OMG_RECOVER_SKIP_BOOTSTRAP:-}" != "1" ]; then
   env -u OMG_RESTIC_PASSWORD "$ROOT/scripts/bootstrap.sh" || exit 8
 fi
 
-export OMG_DISABLE_TRANSPORT=1
+PY="${OMG_RECOVER_PYTHON:-python3}"
+OMG="${OMG_BIN:-$ROOT/omg}"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 args=()
 if [ "$CHECK" = 1 ]; then
   args+=(--check)
 fi
 set +e
-python3 -m oh_my_grok.recover "${args[@]}"
+# Prefix, not export: this process sees the flag, and the parent shell does not keep it.
+OMG_DISABLE_TRANSPORT=1 "$PY" -m oh_my_grok.recover "${args[@]}"
 rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
@@ -74,11 +79,11 @@ if [ "$CHECK" = 1 ]; then
   exit 0
 fi
 
-if ! "$ROOT/omg" watchdog ensure; then
+if ! env -u OMG_DISABLE_TRANSPORT "$OMG" watchdog ensure; then
   echo "watchdog ensure failed" >&2
   exit 15
 fi
-if ! "$ROOT/omg" doctor; then
+if ! env -u OMG_DISABLE_TRANSPORT "$OMG" doctor; then
   echo "doctor reported problems after restore" >&2
   exit 15
 fi
