@@ -396,6 +396,8 @@ def tick(engine: Engine, *, now: float | None = None, interval: float | None = N
     configure_logging(engine.paths, policy)
     mode = policy["features"]["watchdog"]
     moment = time.time() if now is None else now
+    from . import restic_backup
+    restic_backup.reap_stale_staging(engine.paths)
     step_interval = float(policy["watchdog_interval_seconds"] if interval is None else interval)
     if mode == features.OFF:
         outcomes = {name: {"ok": True, "skipped": True, "reason": "watchdog off"}

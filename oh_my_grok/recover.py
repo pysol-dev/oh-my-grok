@@ -52,11 +52,12 @@ from .restic_backup import (
     find_snapshot_root,
     inspect_database,
     list_locks,
+    operation_lock,
     password_is_set,
     pid_alive,
+    read_password,
     relate_streams,
     repo_path,
-    require_password,
     schema_version,
     unlock_stale,
 )
@@ -325,16 +326,48 @@ def recover_from_tree(paths: Paths, tree: Path, *, check: bool) -> int:
     return EXIT_OK
 
 
+def _lock_connection(paths: Paths) -> sqlite3.Connection | None:
+    """Open the database only when it is already a SQLite file. A corrupt file is not opened."""
+    database = paths.db_path
+    if not database.is_file() or database.is_symlink():
+        return None
+    try:
+        header = database.read_bytes()[:16]
+    except OSError:
+        return None
+    if header != b"SQLite format 3\x00":
+        return None
+    return db.connect(database)
+
+
 def run_recover(*, check: bool = False, runner: Runner | None = None, now: float | None = None,
                 hostname: str | None = None, pid_alive_fn=None) -> int:
     os.environ["OMG_DISABLE_TRANSPORT"] = "1"
     if not password_is_set():
         print("OMG_RESTIC_PASSWORD is not set", file=sys.stderr)
         return EXIT_USAGE
-    password = require_password()
     paths = get_paths()
+    conn = _lock_connection(paths)
     try:
+        return _run_recover(paths, conn, check=check, runner=runner, now=now, hostname=hostname,
+                            pid_alive_fn=pid_alive_fn)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _run_recover(paths: Paths, conn: sqlite3.Connection | None, *, check: bool, runner: Runner | None,
+                 now: float | None, hostname: str | None, pid_alive_fn) -> int:
+    try:
+        # Any password that opens the repository is accepted. The 12-character minimum is for init.
+        password = read_password()
         policy = _policy(paths)
+    except BackupFailed as exc:
+        if exc.reason == "password_unset":
+            print("OMG_RESTIC_PASSWORD is not set", file=sys.stderr)
+            return EXIT_USAGE
+        print(redact(exc.message), file=sys.stderr)
+        return EXIT_VERIFY
     except OmgError as exc:
         print(redact(exc.message), file=sys.stderr)
         return EXIT_USAGE
@@ -343,6 +376,15 @@ def run_recover(*, check: bool = False, runner: Runner | None = None, now: float
         print("backup_repo is empty", file=sys.stderr)
         return EXIT_USAGE
     timeout = _timeout(policy)
+    with operation_lock(conn, paths) as held:
+        if not held:
+            print("backup operation in progress", file=sys.stderr)
+            return EXIT_LOCK
+        return _recover_locked(paths, repo, password, timeout, check=check, runner=runner, now=now,
+                               hostname=hostname, pid_alive_fn=pid_alive_fn)
+
+
+def _recover_locked(paths, repo, password, timeout, *, check, runner, now, hostname, pid_alive_fn) -> int:
     try:
         stopped = handle_locks(paths, repo, password=password, timeout=timeout, check=check, now=now,
                                hostname=hostname, pid_alive_fn=pid_alive_fn, runner=runner)

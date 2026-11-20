@@ -50,6 +50,9 @@ DEFAULT_POLICY = {
     "backup_check_interval_seconds": 86400,
     "backup_read_data_interval_seconds": 604800,
     "backup_timeout_seconds": 600,
+    # Doctor fails when the last successful backup is older than this. The default matches
+    # the longest schedule gap, so a backup that is merely due is already past the row.
+    "backup_max_age_seconds": 21600,
     "features": {},
 }
 
@@ -63,6 +66,7 @@ _BACKUP_INTS = (
     "backup_check_interval_seconds",
     "backup_read_data_interval_seconds",
     "backup_timeout_seconds",
+    "backup_max_age_seconds",
 )
 _REMOTE_REPO_SCHEMES = {"s3", "rest", "b2", "azure", "gs", "sftp", "swift", "rclone", "http", "https"}
 

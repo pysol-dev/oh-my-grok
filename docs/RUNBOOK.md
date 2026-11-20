@@ -250,7 +250,9 @@ watchdog run the schedule below. `omg backup run` writes a snapshot immediately.
 
 The password is `OMG_RESTIC_PASSWORD` in the environment. Restic receives it only as
 `RESTIC_PASSWORD_COMMAND=printenv OMG_RESTIC_PASSWORD`. Do not pass it on argv, do not put it in a file, and
-do not put it under `/workspace`. The value is never printed. `hooks.json` is copied into the snapshot as
+do not put it under `/workspace`. The value is never printed. `omg backup init` and `omg doctor` reject a
+password shorter than 12 characters. Restore accepts any password that opens the repository, including one
+chosen before that minimum. `hooks.json` is copied into the snapshot as
 raw bytes and encrypted by restic; it is not printed either.
 
 Every restic command this code builds uses `RESTIC_PACK_SIZE=4` and `--pack-size 4`. The store rejects a
@@ -268,10 +270,13 @@ untagged snapshots are left in place. With that filter, the retention policy is 
 The watchdog process keeps `OMG_RESTIC_PASSWORD`. Every child it starts, other than a restic command
 that needs the password, has that variable removed. The password still reaches restic only through
 `RESTIC_PASSWORD_COMMAND=printenv OMG_RESTIC_PASSWORD`. The heartbeat records `restic_password` as
-`set` or `unset` and never the value. Backup, prune, and check share a flock under the omg home.
-A second caller exits 16 and records `backup_locked` without touching the staging directory. Staging
-is mode 0700. A symlink, or a directory owned by another user, is refused. The staged database must
-exist and pass `integrity_check` before restic is started.
+`set` or `unset` and never the value. Backup, prune, check, and restore share a flock under the omg
+home. A second caller exits 16 and records `backup_locked` without touching the staging directory.
+Staging is mode 0700. A symlink, or a directory owned by another user, is refused. A mode-0700 staging
+directory left by a killed backup is removed at the start of a backup, on each watchdog tick, and by
+`omg doctor`, unless that flock is held. The staged database must
+exist and pass `integrity_check` before restic is started. A missing database, a failed integrity
+check, or a missing or too-short password records `backup_failed`.
 
 Schedule, when the flag is on: back up if the event generation changed and at least 10 minutes have passed,
 or if 6 hours have passed. Prune once a day. Check once a day. Once a week the check reads a 5 percent
@@ -283,11 +288,12 @@ prune was already due. `EAGAIN`, or `ENOENT` while listing locks, is retried onc
 A lock whose hostname is this machine and whose pid is not alive is removed with plain `restic unlock`
 (never `--remove-all`) and the operation is tried once more. Any other lock records `backup_locked` and
 the tick skips. `omg backup run` exits 16 in that case. Exit 11 is reserved for a diverged restore.
-`omg doctor`, when backup is on, fails if the watchdog heartbeat says the password is unset, if the
-watchdog has not reported it, if the password is shorter than 12 characters, if the latest backup failed,
-if a lock is 30 minutes old or older, or if any repository file is 15 MiB or larger. A pack size other
-than 4 is a warning. Doctor also reports lock count, age, and machine and the store size summed from
-file sizes (not `df`). It does not report the password.
+`omg doctor`, when backup is on, fails if the watchdog heartbeat is missing or older than its interval
+times `watchdog_stale_intervals`, if that heartbeat says the password is unset, if the password is
+shorter than 12 characters, if the latest backup failed, if the last successful backup is older than
+`backup_max_age_seconds` (default 6 hours), if a lock is 30 minutes old or older, or if any repository
+file is 15 MiB or larger. A pack size other than 4 is a warning. Doctor also reports lock count, age,
+and machine and the store size summed from file sizes (not `df`). It does not report the password.
 
 ```bash
 # policy on the host, not in git: backup_repo is an absolute directory; features.backup is "on" or "off"

@@ -101,14 +101,35 @@ def password_is_set() -> bool:
     return bool(os.environ.get(PASSWORD_ENV))
 
 
-def require_password() -> str:
+def read_password() -> str:
+    """The password that opens an existing repository. Length is not checked.
+
+    Init and doctor reject a password shorter than 12 characters. Restore accepts any
+    password restic accepts, including one chosen before that minimum existed.
+    """
     password = os.environ.get(PASSWORD_ENV) or ""
     if not password:
         raise BackupFailed("password_unset")
+    if len(password) >= REDACT_PASSWORD_CHARS:
+        register_secret(password, min_length=REDACT_PASSWORD_CHARS)
+    return password
+
+
+def require_password() -> str:
+    password = read_password()
     if len(password) < MIN_PASSWORD_CHARS:
         raise BackupFailed("password_short")
-    register_secret(password, min_length=REDACT_PASSWORD_CHARS)
     return password
+
+
+def _password_for(conn: sqlite3.Connection, paths: Paths) -> str:
+    """Like ``require_password``, and record a failure the doctor can see."""
+    try:
+        return require_password()
+    except BackupFailed as exc:
+        if exc.reason in {"password_unset", "password_short"}:
+            _fail(conn, exc.reason)
+        raise
 
 
 def repo_path(policy: dict) -> Path | None:
@@ -194,11 +215,52 @@ def prepare_staging(paths: Paths) -> Path:
     return root
 
 
-@contextlib.contextmanager
-def operation_lock(conn: sqlite3.Connection, paths: Paths):
-    """Exclusive lock for backup, prune, and check. A busy lock skips; it does not touch staging.
+def _private_staging(root: Path) -> bool:
+    """A leftover from this user: a real directory, mode 0700, not a symlink."""
+    try:
+        info = root.lstat()
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return False
+    return info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700
 
-    The lock file lives under the omg home, never on the agent store.
+
+def reap_stale_staging(paths: Paths) -> bool:
+    """Remove this home's leftover staging directory.
+
+    A killed backup leaves a mode-0700 directory that contains a database copy and
+    ``hooks.json``. A live backup, prune, check, or restore holds the operation lock, so
+    this does not remove a directory that work is using. The lock file is under the omg
+    home, never on the agent store.
+    """
+    directory = paths.state_dir / "backup"
+    directory.mkdir(parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    fd = os.open(directory / "operation.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        try:
+            root = staging_root(paths)
+            if not _private_staging(root):
+                return False
+            shutil.rmtree(root)
+            return True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def operation_lock(conn: sqlite3.Connection | None, paths: Paths):
+    """Exclusive lock for backup, prune, check, and restore. A busy lock skips.
+
+    The lock file lives under the omg home, never on the agent store. ``conn`` may be
+    None when the database cannot be opened; the busy lock is still reported to the caller.
     """
     directory = paths.state_dir / "backup"
     directory.mkdir(parents=True, exist_ok=True)
@@ -208,7 +270,8 @@ def operation_lock(conn: sqlite3.Connection, paths: Paths):
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         os.close(fd)
-        _emit(conn, "backup_locked", reason="locked")
+        if conn is not None:
+            _emit(conn, "backup_locked", reason="locked")
         yield False
         return
     try:
@@ -670,6 +733,7 @@ def init_repo(paths: Paths, *, runner: Runner | None = None) -> dict[str, Any]:
 
 def run_backup(conn: sqlite3.Connection, paths: Paths, *, force: bool = False, now: float | None = None,
                runner: Runner | None = None) -> dict[str, Any]:
+    reap_stale_staging(paths)
     policy = _policy(paths)
     moment = time.time() if now is None else now
     status = load_status(paths)
@@ -682,7 +746,7 @@ def run_backup(conn: sqlite3.Connection, paths: Paths, *, force: bool = False, n
     if not force and _efbig_backoff(status, moment, policy):
         return {"ok": True, "skipped": True, "reason": "efbig"}
     repo = _require_repo(policy)
-    password = require_password()
+    password = _password_for(conn, paths)
     timeout = _timeout(policy)
     with operation_lock(conn, paths) as held:
         if not held:
@@ -703,7 +767,11 @@ def _run_backup_locked(conn, paths, repo, password, timeout, moment, runner) -> 
     staging = prepare_staging(paths)
     try:
         meta = stage_snapshot(conn, paths, staging)
-        _require_staged_database(meta)
+        try:
+            _require_staged_database(meta)
+        except IntegrityError_:
+            _emit(conn, "backup_failed", reason="integrity")
+            raise
         command = ["backup", "--host", HOST, "--tag", "omg", "--tag", f"gen:{meta['generation']}",
                    "--tag", f"schema:{meta['schema']}", str(meta["tree"])]
         result = call_restic(paths, repo, command, password=password, timeout=timeout, runner=runner)
@@ -738,7 +806,7 @@ def prune_repo(conn: sqlite3.Connection, paths: Paths, *, runner: Runner | None 
                now: float | None = None) -> dict[str, Any]:
     policy = _policy(paths)
     repo = _require_repo(policy)
-    password = require_password()
+    password = _password_for(conn, paths)
     moment = time.time() if now is None else now
     with operation_lock(conn, paths) as held:
         if not held:
@@ -774,7 +842,7 @@ def check_repo(conn: sqlite3.Connection, paths: Paths, *, read_data: bool = Fals
                now: float | None = None) -> dict[str, Any]:
     policy = _policy(paths)
     repo = _require_repo(policy)
-    password = require_password()
+    password = _password_for(conn, paths)
     moment = time.time() if now is None else now
     with operation_lock(conn, paths) as held:
         if not held:
@@ -1034,6 +1102,8 @@ def doctor_report(paths: Paths | None = None, *, now: float | None = None,
                   runner: Runner | None = None) -> list[dict[str, Any]]:
     """Checks for ``omg doctor``. WARN and SKIP keep ``ok`` true so they do not fail the command."""
     paths = paths or get_paths()
+    reap_stale_staging(paths)
+    moment = time.time() if now is None else now
     try:
         policy = _policy(paths)
     except OmgError as exc:
@@ -1049,6 +1119,7 @@ def doctor_report(paths: Paths | None = None, *, now: float | None = None,
             _check("backup_locks", True, "backup off", "SKIP"),
             _check("backup_store_size", True, "backup off", "SKIP"),
             _check("backup_password", True, password, "PASS"),
+            _check("backup_age", True, "backup off", "SKIP"),
         ]
     checks = []
     try:
@@ -1098,28 +1169,59 @@ def doctor_report(paths: Paths | None = None, *, now: float | None = None,
     else:
         shown = "unset" if pack is None else str(pack)
         checks.append(_check("backup_pack_size", True, f"pack size is {shown}, expected 4", "WARN"))
-    checks.append(_password_check(paths))
+    checks.append(_password_check(paths, policy, moment))
+    checks.append(_backup_age_check(paths, policy, moment))
     return checks
 
 
-def _password_check(paths: Paths) -> dict[str, Any]:
-    """With backup on, trust the watchdog heartbeat, not the shell that happens to run doctor."""
+def _read_heartbeat(paths: Paths) -> dict | None:
+    try:
+        beat = json.loads((paths.state_dir / "watchdog" / "heartbeat.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return beat if isinstance(beat, dict) else None
+
+
+def _heartbeat_stale(beat: dict | None, policy: dict, now: float) -> bool:
+    """Same limit the watchdog uses: interval times watchdog_stale_intervals."""
+    if not isinstance(beat, dict):
+        return True
+    unix = beat.get("unix")
+    if isinstance(unix, bool) or not isinstance(unix, (int, float)):
+        return True
+    interval = beat.get("interval_seconds")
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or float(interval) <= 0:
+        interval = policy["watchdog_interval_seconds"]
+    limit = float(interval) * float(policy["watchdog_stale_intervals"])
+    return now - float(unix) > limit
+
+
+def _password_check(paths: Paths, policy: dict, now: float) -> dict[str, Any]:
+    """With backup on, trust a fresh watchdog heartbeat, not the shell that happens to run doctor."""
     raw = os.environ.get(PASSWORD_ENV) or ""
     if raw and len(raw) < MIN_PASSWORD_CHARS:
         return _check("backup_password", False, "shorter than 12")
-    beat_path = paths.state_dir / "watchdog" / "heartbeat.json"
-    reported = None
-    try:
-        beat = json.loads(beat_path.read_text())
-    except (OSError, ValueError):
-        beat = None
-    if isinstance(beat, dict):
-        reported = beat.get("restic_password")
+    beat = _read_heartbeat(paths)
+    if _heartbeat_stale(beat, policy, now):
+        return _check("backup_password", False, "watchdog heartbeat is stale")
+    reported = beat.get("restic_password") if beat else None
     if reported == "unset":
         return _check("backup_password", False, "watchdog password unset")
     if reported != "set":
         return _check("backup_password", False, "watchdog has not reported the password")
     return _check("backup_password", True, "set")
+
+
+def _backup_age_check(paths: Paths, policy: dict, now: float) -> dict[str, Any]:
+    limit = int(policy["backup_max_age_seconds"])
+    last = load_status(paths).get("last_backup_unix")
+    if isinstance(last, bool) or not isinstance(last, (int, float)):
+        return _check("backup_age", False, f"no successful backup limit_seconds={limit}")
+    age = int(now - float(last))
+    detail = f"age_seconds={age} limit_seconds={limit}"
+    if age > limit:
+        return _check("backup_age", False, detail)
+    return _check("backup_age", True, detail)
 
 
 def _lock_check(paths: Paths, repo: Path, policy: dict, *, now: float | None,
