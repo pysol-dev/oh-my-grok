@@ -34,6 +34,7 @@ from .errors import IntegrityError_, OmgError
 from .paths import Paths, get_paths
 from .redact import redact, register_secret
 from .restic_backup import (
+    EXIT_ARGV,
     EXIT_CHECK_BEHIND,
     EXIT_DIVERGED,
     EXIT_LOCK,
@@ -49,6 +50,7 @@ from .restic_backup import (
     _timeout,
     call_restic,
     classify_locks,
+    external_cache,
     find_snapshot_root,
     inspect_database,
     list_locks,
@@ -369,6 +371,9 @@ def _run_recover(paths: Paths, conn: sqlite3.Connection | None, *, check: bool, 
         if exc.reason == "password_unset":
             print("OMG_RESTIC_PASSWORD is not set", file=sys.stderr)
             return EXIT_USAGE
+        if exc.reason == "password_in_argv":
+            print("restic invocation would include the password", file=sys.stderr)
+            return EXIT_ARGV
         print(redact(exc.message), file=sys.stderr)
         return EXIT_VERIFY
     except OmgError as exc:
@@ -379,7 +384,23 @@ def _run_recover(paths: Paths, conn: sqlite3.Connection | None, *, check: bool, 
         print("backup_repo is empty", file=sys.stderr)
         return EXIT_USAGE
     timeout = _timeout(policy)
-    with operation_lock(conn, paths, record=False) as held:
+    # --check must not create state/backup/operation.lock or any other file in the home.
+    cache_dir = Path(tempfile.mkdtemp(prefix="omg-restic-cache-", dir="/tmp")) if check else None
+    try:
+        if cache_dir is None:
+            return _recover_holding_lock(paths, conn, repo, password, timeout, check=check, runner=runner,
+                                         now=now, hostname=hostname, pid_alive_fn=pid_alive_fn, create_lock=True)
+        with external_cache(cache_dir):
+            return _recover_holding_lock(paths, conn, repo, password, timeout, check=check, runner=runner,
+                                         now=now, hostname=hostname, pid_alive_fn=pid_alive_fn, create_lock=False)
+    finally:
+        if cache_dir is not None:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+
+
+def _recover_holding_lock(paths, conn, repo, password, timeout, *, check, runner, now, hostname,
+                          pid_alive_fn, create_lock: bool) -> int:
+    with operation_lock(conn, paths, record=False, create=create_lock) as held:
         if not held:
             print("backup operation in progress", file=sys.stderr)
             return EXIT_LOCK
@@ -395,6 +416,9 @@ def _recover_locked(paths, repo, password, timeout, *, check, runner, now, hostn
         if exc.reason == "password_rejected":
             print("restic password was rejected", file=sys.stderr)
             return EXIT_PASSWORD
+        if exc.reason == "password_in_argv":
+            print("restic invocation would include the password", file=sys.stderr)
+            return EXIT_ARGV
         print(redact(exc.message), file=sys.stderr)
         return EXIT_VERIFY
     if stopped is not None:

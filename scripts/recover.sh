@@ -27,7 +27,10 @@
 #  13  password rejected
 #  14  --check only: a restore would be required
 #  15  restore was applied, then watchdog ensure or doctor failed
-#  16  a lock is still held after --retry-lock 2m (not the same code as divergence)
+#  16  backup operation in progress (the omg flock is already held), or a repository lock is
+#      still held after --retry-lock 2m. Not the same code as divergence.
+#  17  the restic command would have included the password. Not a failed check (12) or a
+#      newer snapshot schema.
 #
 # OMG_RESTIC_PASSWORD is read from the environment and never printed.
 # OMG_DISABLE_TRANSPORT=1 applies only to the restore process. The watchdog started
@@ -41,7 +44,7 @@ for arg in "$@"; do
   case "$arg" in
     --check) CHECK=1 ;;
     -h|--help)
-      sed -n '2,33p' "$0"
+      sed -n '2,37p' "$0"
       exit 0
       ;;
     *)

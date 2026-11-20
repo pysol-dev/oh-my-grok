@@ -15,7 +15,7 @@ from oh_my_grok import db, restic_backup, watchdog
 from oh_my_grok.config import load_policy
 from oh_my_grok.engine import Engine
 from oh_my_grok.errors import ValidationError
-from oh_my_grok.paths import get_paths
+from oh_my_grok.paths import Paths, get_paths
 from oh_my_grok.restic_backup import (
     DOCTOR_FILE_LIMIT,
     STORE_FILE_CAP,
@@ -1430,7 +1430,120 @@ def test_one_character_password_is_not_treated_as_an_argument(omg_home, tmp_path
     assert exc.value.reason == "password_in_argv"
 
 
-def _secret_staging(paths: Path) -> Path:
+def test_cache_password_is_not_an_argument_and_a_built_value_exits_17(omg_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", "cache")
+    repo = tmp_path / "cache-repo"
+    repo.mkdir()
+    (repo / "config").write_text("{}\n")
+    _policy(repo, features={"backup": "on"})
+    calls = []
+
+    def runner(argv, env, timeout):
+        calls.append(list(argv))
+        if "snapshots" in argv:
+            return CommandResult(0, stdout="[]\n")
+        return CommandResult(0, stdout="")
+
+    code = restic_backup_recover().run_recover(runner=runner, hostname="thisbox", pid_alive_fn=lambda pid: False)
+    assert code == 10
+    assert any("snapshots" in argv for argv in calls)
+    home = str(get_paths().root)
+    cache = str(get_paths().state_dir / "restic-cache")
+    with pytest.raises(BackupFailed) as exc:
+        restic_backup._execute(
+            ["restic", "--repo", str(repo), "--cache-dir", cache, "--tag", "made-from-cache"],
+            {}, 1, None, "cache", allowed={str(repo), cache, home})
+    assert exc.value.reason == "password_in_argv"
+    assert exc.value.exit_code == restic_backup.EXIT_ARGV
+    assert exc.value.exit_code != 12
+
+
+def test_backup_off_does_not_create_the_operation_lock(omg_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", PASSWORD)
+    _policy(None, features={"backup": "off"})
+    engine = Engine()
+    try:
+        watchdog.tick(engine, now=NOW)
+        doctor_report(get_paths(), now=NOW, runner=_quiet_runner())
+    finally:
+        engine.close()
+    assert not (get_paths().state_dir / "backup" / "operation.lock").exists()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "config").write_text("{}\n")
+    _policy(repo, features={"backup": "off"})
+    code = restic_backup_recover().run_recover(check=True, runner=_quiet_runner(), hostname="thisbox",
+                                              pid_alive_fn=lambda pid: False)
+    assert code != 0
+    home = get_paths().state_dir
+    assert not (home / "backup" / "operation.lock").exists()
+    assert not (home / "restic-cache").exists()
+
+
+def test_password_unset_is_recorded_once_per_hour(omg_home, tmp_path, monkeypatch):
+    monkeypatch.delenv("OMG_RESTIC_PASSWORD", raising=False)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "config").write_text("{}\n")
+    _policy(repo, features={"backup": "on"})
+    engine = Engine()
+    try:
+        watchdog.tick(engine, now=NOW)
+        watchdog.tick(engine, now=NOW + 60)
+        once = [row for row in _events(engine.conn) if json.loads(row["data_json"]).get("reason") == "password_unset"]
+        _heartbeat(get_paths(), "unset")
+        (get_paths().state_dir / "backup").mkdir(parents=True, exist_ok=True)
+        report = {item["check"]: item for item in doctor_report(get_paths(), now=NOW + 60, runner=_quiet_runner())}
+        watchdog.tick(engine, now=NOW + 3600)
+        later = [row for row in _events(engine.conn) if json.loads(row["data_json"]).get("reason") == "password_unset"]
+    finally:
+        engine.close()
+    assert len(once) == 1
+    assert report["backup_failures"]["ok"] is False
+    assert len(later) == 2
+
+
+def test_restored_database_is_mode_0600(omg_home, tmp_path):
+    from oh_my_grok.recover import recover_from_tree
+    engine = Engine()
+    try:
+        _add_event(engine.conn, data="kept")
+        snap = tmp_path / "snap.sqlite3"
+        db.backup(engine.conn, snap)
+        paths = engine.paths
+    finally:
+        engine.close()
+    paths.db_path.write_bytes(b"not a database")
+    previous = os.umask(0o022)
+    try:
+        assert recover_from_tree(paths, _snapshot_tree(tmp_path / "tree", snap), check=False) == 0
+        assert stat.S_IMODE(paths.db_path.stat().st_mode) == 0o600
+    finally:
+        os.umask(previous)
+
+
+def test_staging_cleanup_failure_does_not_abort_the_tick(omg_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", PASSWORD)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "config").write_text("{}\n")
+    _policy(repo, features={"backup": "on"})
+
+    def boom(_paths):
+        raise RuntimeError("reap broke")
+
+    monkeypatch.setattr(restic_backup, "reap_stale_staging", boom)
+    engine = Engine()
+    try:
+        beat = watchdog.tick(engine, now=NOW)
+    finally:
+        engine.close()
+    assert beat["steps"]["staging"]["ok"] is False
+    assert "backup" in beat["steps"]
+    assert beat["restic_password"] == "set"
+
+
+def _secret_staging(paths: Paths) -> Path:
     root = restic_backup.staging_root(paths)
     if root.is_symlink():
         root.unlink()
@@ -1447,7 +1560,7 @@ def _secret_staging(paths: Path) -> Path:
 def test_stale_private_staging_is_removed_and_a_locked_one_is_kept(omg_home, tmp_path, monkeypatch):
     import fcntl
     monkeypatch.delenv("OMG_RESTIC_PASSWORD", raising=False)
-    _policy(None, features={"backup": "off"})
+    _policy(None, features={"backup": "on"})
     paths = get_paths()
     root = _secret_staging(paths)
     engine = Engine()

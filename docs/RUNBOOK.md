@@ -275,10 +275,13 @@ home. A second backup, prune, or check exits 16 and records `backup_locked` with
 staging directory. Restore exits 16 without writing an event, so a contended check cannot change the
 stream a later restore compares. A local database that sqlite cannot open does not block that restore.
 Staging is mode 0700. A symlink, or a directory owned by another user, is refused. A mode-0700 staging
-directory left by a killed backup is removed at the start of a backup, on each watchdog tick, and by
-`omg doctor`, unless that flock is held. The staged database must
-exist and pass `integrity_check` before restic is started. A missing database, a failed integrity
-check, or a missing or too-short password records `backup_failed`.
+directory left by a killed backup is removed at the start of a backup, and, when backup is on, on
+each watchdog tick and by `omg doctor`, unless that flock is held. With backup off, doctor and the
+watchdog do not create `state/backup/operation.lock`. The staged database must
+exist and pass `integrity_check` before restic is started. A missing database or a failed integrity
+check records `backup_failed`. A missing password records `backup_failed` when that state changes and
+at most once an hour after that, so a one-minute tick does not append an event every time. Doctor
+still fails while that failure is the latest backup outcome.
 
 Schedule, when the flag is on: back up if the event generation changed and at least 10 minutes have passed,
 or if 6 hours have passed. Prune once a day. Check once a day. Once a week the check reads a 5 percent
@@ -294,7 +297,9 @@ the tick skips. `omg backup run` exits 16 in that case. Exit 11 is reserved for 
 times `watchdog_stale_intervals`, if that heartbeat says the password is unset, if the password is
 shorter than 12 characters, if the latest backup failed, if the last successful backup is older than
 `backup_max_age_seconds` (default 6 hours), if a lock is 30 minutes old or older, or if any repository
-file is 15 MiB or larger. A pack size other than 4 is a warning. Doctor also reports lock count, age,
+file is 15 MiB or larger. Turning backup on before any backup has succeeded fails the `backup_age`
+row; that failure is expected until the first successful backup. A pack size other than 4 is a warning.
+Doctor also reports lock count, age,
 and machine and the store size summed from file sizes (not `df`). It does not report the password.
 
 ```bash
@@ -315,7 +320,8 @@ restore does not inherit that variable.
 
 ```bash
 export OMG_RESTIC_PASSWORD
-scripts/recover.sh --check    # report only; does not remove a lock and does not write the home
+scripts/recover.sh --check    # report only; does not remove a lock and does not write the home,
+                              # including state/backup/operation.lock
 scripts/recover.sh
 ```
 
@@ -334,7 +340,12 @@ Lock handling, in order:
 stream, it is restored and an older schema is migrated forward. If the local stream is already ahead,
 local files are kept. Diverged streams exit 11 and nothing is written. A snapshot schema newer than this
 code is refused. A corrupt local database is moved aside, with its `-wal` and `-shm` files, and then the
-snapshot is restored. `--check` exits 14 when a restore would be required. After a real restore the script
+snapshot is restored. The restored database is mode 0600. `--check` exits 14 when a restore would be
+required and does not create files in the home. Exit 16 is also the immediate "backup operation in
+progress" flock, before any `--retry-lock` wait. Exit 17 means the restic command would have included
+the password. A password that only occurs inside the repository path, the cache directory, the restore
+target, or the omg home is not that failure. Exit 12 remains a failed check or a newer schema. After a
+real restore the script
 runs `omg watchdog ensure` and `omg doctor` without `OMG_DISABLE_TRANSPORT`.
 
 `scripts/drill-restic.sh` runs an init, backup, restore, byte compare, and stale-lock drill under `/tmp`

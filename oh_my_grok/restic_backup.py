@@ -14,6 +14,7 @@ and are not returned, logged, or stored in an event.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import fcntl
 import hashlib
 import json
@@ -65,6 +66,8 @@ EXIT_POST = 15
 # the same code as a diverged restore.
 EXIT_LOCK = 16
 EXIT_LOCKED = EXIT_LOCK
+# Distinct from exit 12, which is a failed check or a newer snapshot schema.
+EXIT_ARGV = 17
 
 Runner = Callable[[list[str], dict[str, str], float], "CommandResult"]
 
@@ -83,6 +86,7 @@ class BackupFailed(OmgError):
             "locked": EXIT_LOCKED,
             "repo_unset": EXIT_USAGE,
             "restic_missing": EXIT_USAGE,
+            "password_in_argv": EXIT_ARGV,
         }.get(reason, 1)
         super().__init__(f"backup failed: {reason}", reason=reason, **details)
 
@@ -123,14 +127,31 @@ def require_password() -> str:
     return password
 
 
-def _password_for(conn: sqlite3.Connection, paths: Paths) -> str:
-    """Like ``require_password``, and record a failure the doctor can see."""
+def _password_for(conn: sqlite3.Connection, paths: Paths, *, now: float | None = None) -> str:
+    """Like ``require_password``, and record a failure the doctor can see.
+
+    ``password_unset`` is recorded when the password state changes, then at most once an hour.
+    A watchdog tick every minute must not append a new event each time.
+    """
     try:
         return require_password()
     except BackupFailed as exc:
-        if exc.reason in {"password_unset", "password_short"}:
+        if exc.reason == "password_unset":
+            _emit_password_unset(conn, paths, time.time() if now is None else now)
+        elif exc.reason == "password_short":
             _fail(conn, exc.reason)
         raise
+
+
+def _emit_password_unset(conn: sqlite3.Connection, paths: Paths, now: float) -> None:
+    status = load_status(paths)
+    last = status.get("last_password_unset_unix")
+    same = status.get("password_failure") == "password_unset"
+    if (same and isinstance(last, (int, float)) and not isinstance(last, bool)
+            and now - float(last) < 3600):
+        return
+    update_status(paths, last_password_unset_unix=now, password_failure="password_unset")
+    _emit(conn, "backup_failed", reason="password_unset")
 
 
 def repo_path(policy: dict) -> Path | None:
@@ -257,18 +278,27 @@ def reap_stale_staging(paths: Paths) -> bool:
 
 
 @contextlib.contextmanager
-def operation_lock(conn: sqlite3.Connection | None, paths: Paths, *, record: bool = True):
+def operation_lock(conn: sqlite3.Connection | None, paths: Paths, *, record: bool = True,
+                   create: bool = True):
     """Exclusive lock for backup, prune, check, and restore. A busy lock skips.
 
     The lock file lives under the omg home, never on the agent store. ``conn`` may be
     None when the database cannot be opened; the busy lock is still reported to the caller.
     Restore passes ``record=False`` so a contended check does not append an event and
-    change the stream that a later restore compares.
+    change the stream that a later restore compares. ``--check`` passes ``create=False``
+    so a missing lock file is not created and the home is not written.
     """
     directory = paths.state_dir / "backup"
-    directory.mkdir(parents=True, exist_ok=True)
-    os.chmod(directory, 0o700)
-    fd = os.open(directory / "operation.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    lock_path = directory / "operation.lock"
+    if not create and not lock_path.exists():
+        yield True
+        return
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    else:
+        fd = os.open(lock_path, os.O_RDWR)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -519,7 +549,24 @@ def update_status(paths: Paths, **fields: Any) -> None:
     save_status(paths, data)
 
 
+_cache_override: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
+    "omg_restic_cache_override", default=None)
+
+
+@contextlib.contextmanager
+def external_cache(path: Path):
+    """Use a cache outside the omg home. ``--check`` must not create files there."""
+    token = _cache_override.set(path)
+    try:
+        yield
+    finally:
+        _cache_override.reset(token)
+
+
 def _cache_dir(paths: Paths, repo: Path) -> Path:
+    override = _cache_override.get()
+    if override is not None:
+        return override
     path = paths.state_dir / "restic-cache"
     path.mkdir(parents=True, exist_ok=True)
     os.chmod(path, 0o700)
@@ -653,17 +700,20 @@ _FIXED_ARGV = frozenset({
 _GENERATED_TAG = re.compile(r"(?:gen|schema):\d+\Z")
 
 
-def _argv_discloses_password(password: str, argv: list[str]) -> bool:
-    """True when a dynamic argument contains the password.
+def _argv_discloses_password(password: str, argv: list[str], *, allowed: set[str] | None = None) -> bool:
+    """True when the password would be passed as an argv token or embedded in a value we built.
 
-    Fixed flags and the generated ``gen:`` / ``schema:`` tags are not disclosure. A password
-    shorter than 4 characters is only a disclosure when it is an entire argument, because it
-    would otherwise match ordinary paths and flags.
+    The repository path, cache directory, restore target, omg home, and restic binary are
+    arguments this process chooses. A password that only occurs inside one of those paths is
+    not disclosure. Fixed flags and generated ``gen:`` / ``schema:`` tags are not disclosure
+    either. A password shorter than 4 characters is only a disclosure when it is an entire
+    argument, because it would otherwise match ordinary flags.
     """
     if not password:
         return False
+    own_paths = allowed or set()
     for arg in argv:
-        if arg in _FIXED_ARGV or _GENERATED_TAG.fullmatch(arg):
+        if arg in _FIXED_ARGV or arg in own_paths or _GENERATED_TAG.fullmatch(arg):
             continue
         if arg == password:
             return True
@@ -672,9 +722,24 @@ def _argv_discloses_password(password: str, argv: list[str]) -> bool:
     return False
 
 
+def _own_argv_paths(paths: Paths, repo: Path, cache: Path, command: list[str], binary: Path) -> set[str]:
+    """Paths this code passes through, not values built from the password."""
+    owned = {str(repo), str(cache), str(binary), str(paths.root)}
+    for path in (repo, cache, binary, paths.root):
+        try:
+            owned.add(str(path.resolve()))
+        except OSError:
+            continue
+    if "--target" in command:
+        index = command.index("--target")
+        if index + 1 < len(command):
+            owned.add(command[index + 1])
+    return owned
+
+
 def _execute(argv: list[str], env: dict[str, str], timeout: float, runner: Runner | None,
-             password: str) -> CommandResult:
-    if _argv_discloses_password(password, argv):
+             password: str, *, allowed: set[str] | None = None) -> CommandResult:
+    if _argv_discloses_password(password, argv, allowed=allowed):
         raise BackupFailed("password_in_argv")
     if "--password-command" in argv or "--password-file" in argv or "-p" in argv:
         raise BackupFailed("password_in_argv")
@@ -694,9 +759,10 @@ def call_restic(paths: Paths, repo: Path, command: list[str], *, password: str, 
     binary = Path("restic") if runner is not None else restic_binary()
     argv = _build_argv(binary, repo, cache, command, extra_global)
     env = _command_env(password, cache)
+    allowed = _own_argv_paths(paths, repo, cache, command, binary)
     last: CommandResult | None = None
     for attempt in (1, 2):
-        last = _execute(argv, env, timeout, runner, password)
+        last = _execute(argv, env, timeout, runner, password, allowed=allowed)
         if last.efbig or last.einval or _is_einval(last.stderr) or last.locked or last.timed_out or last.returncode == 0:
             return last
         if last.returncode == 12:
@@ -781,7 +847,7 @@ def run_backup(conn: sqlite3.Connection, paths: Paths, *, force: bool = False, n
     if not force and _efbig_backoff(status, moment, policy):
         return {"ok": True, "skipped": True, "reason": "efbig"}
     repo = _require_repo(policy)
-    password = _password_for(conn, paths)
+    password = _password_for(conn, paths, now=moment)
     timeout = _timeout(policy)
     with operation_lock(conn, paths) as held:
         if not held:
@@ -830,7 +896,8 @@ def _run_backup_locked(conn, paths, repo, password, timeout, moment, runner) -> 
         # Record the id after backup_ok so that event is not itself a reason to back up again.
         update_status(paths, last_backup_unix=moment, last_attempt_unix=moment,
                       last_generation=current_generation(conn), pack_size=PACK_MIB,
-                      last_schema=meta["schema"], last_failure_reason=None)
+                      last_schema=meta["schema"], last_failure_reason=None,
+                      password_failure=None, last_password_unset_unix=None)
         return {"ok": True, "skipped": False, "generation": meta["generation"], "schema": meta["schema"],
                 "tags": ["omg", f"gen:{meta['generation']}", f"schema:{meta['schema']}"], "host": HOST}
     finally:
@@ -841,8 +908,8 @@ def prune_repo(conn: sqlite3.Connection, paths: Paths, *, runner: Runner | None 
                now: float | None = None) -> dict[str, Any]:
     policy = _policy(paths)
     repo = _require_repo(policy)
-    password = _password_for(conn, paths)
     moment = time.time() if now is None else now
+    password = _password_for(conn, paths, now=moment)
     with operation_lock(conn, paths) as held:
         if not held:
             return {"ok": True, "skipped": True, "reason": "locked"}
@@ -877,8 +944,8 @@ def check_repo(conn: sqlite3.Connection, paths: Paths, *, read_data: bool = Fals
                now: float | None = None) -> dict[str, Any]:
     policy = _policy(paths)
     repo = _require_repo(policy)
-    password = _password_for(conn, paths)
     moment = time.time() if now is None else now
+    password = _password_for(conn, paths, now=moment)
     with operation_lock(conn, paths) as held:
         if not held:
             return {"ok": True, "skipped": True, "reason": "locked"}
@@ -1137,7 +1204,6 @@ def doctor_report(paths: Paths | None = None, *, now: float | None = None,
                   runner: Runner | None = None) -> list[dict[str, Any]]:
     """Checks for ``omg doctor``. WARN and SKIP keep ``ok`` true so they do not fail the command."""
     paths = paths or get_paths()
-    reap_stale_staging(paths)
     moment = time.time() if now is None else now
     try:
         policy = _policy(paths)
@@ -1156,6 +1222,7 @@ def doctor_report(paths: Paths | None = None, *, now: float | None = None,
             _check("backup_password", True, password, "PASS"),
             _check("backup_age", True, "backup off", "SKIP"),
         ]
+    reap_stale_staging(paths)
     checks = []
     try:
         binary = restic_binary()

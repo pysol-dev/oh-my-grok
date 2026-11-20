@@ -477,3 +477,4 @@ def restore(backup_path: Path | str, db_path: Path | str) -> None:
             dst.close()
     finally:
         src.close()
+    os.chmod(Path(db_path), 0o600)
