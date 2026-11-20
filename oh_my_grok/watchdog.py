@@ -407,6 +407,11 @@ def tick(engine: Engine, *, now: float | None = None, interval: float | None = N
             "stalls": _step(lambda: _stalls(engine, policy, moment, wake=mode == features.ON)),
         }
     # backup is its own flag. The loop is only the clock; off skips the step.
+    # Staging cleanup stays inside a step so a failure cannot abort the tick, and it runs
+    # only while backup is on so an idle home does not gain state/backup/operation.lock.
+    if policy["features"].get("backup") == features.ON:
+        from . import restic_backup
+        outcomes["staging"] = _step(lambda: {"reaped": bool(restic_backup.reap_stale_staging(engine.paths))})
     outcomes["backup"] = _step(lambda: _backup_step(engine, moment))
     for name, step in outcomes.items():
         if not step.get("ok"):

@@ -454,7 +454,13 @@ duties between cooperating agents, not protection against a malicious same-accou
   only through `RESTIC_PASSWORD_COMMAND=printenv OMG_RESTIC_PASSWORD` in that process. Every other child,
   including the sandbox, language-server git, `restic version`, and pytest, has the variable removed.
   It is not an argument, not a file, and not written under `/workspace` or into events, doctor
-  output, or logs. The heartbeat records only `set` or `unset`. `state/secrets/hooks.json` is backed up as raw
+  output, or logs. The heartbeat records only `set` or `unset`, and doctor ignores a stale heartbeat.
+  Init and doctor reject a password shorter than 12 characters. Restore accepts any password that opens
+  the repository. The password is not treated as an argument leak when it only occurs inside the
+  repository path, the cache directory, the restore target, or the omg home. Putting the password
+  itself on argv is exit 17, which is not the check/schema exit 12. A killed backup's private staging
+  directory is removed on the next backup, and on doctor and the watchdog tick while backup is on.
+  `state/secrets/hooks.json` is backed up as raw
   bytes inside the encrypted restic snapshot and is not printed. `scripts/recover.sh` sets
   `OMG_DISABLE_TRANSPORT=1` only on the restore command.
 - **2026-11-04 disclosure (honest record):** the terminal path (`hook set`: GUI paste delivered length=0) and the
