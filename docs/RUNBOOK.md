@@ -271,7 +271,9 @@ The watchdog process keeps `OMG_RESTIC_PASSWORD`. Every child it starts, other t
 that needs the password, has that variable removed. The password still reaches restic only through
 `RESTIC_PASSWORD_COMMAND=printenv OMG_RESTIC_PASSWORD`. The heartbeat records `restic_password` as
 `set` or `unset` and never the value. Backup, prune, check, and restore share a flock under the omg
-home. A second caller exits 16 and records `backup_locked` without touching the staging directory.
+home. A second backup, prune, or check exits 16 and records `backup_locked` without touching the
+staging directory. Restore exits 16 without writing an event, so a contended check cannot change the
+stream a later restore compares. A local database that sqlite cannot open does not block that restore.
 Staging is mode 0700. A symlink, or a directory owned by another user, is refused. A mode-0700 staging
 directory left by a killed backup is removed at the start of a backup, on each watchdog tick, and by
 `omg doctor`, unless that flock is held. The staged database must

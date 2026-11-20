@@ -18,6 +18,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -256,11 +257,13 @@ def reap_stale_staging(paths: Paths) -> bool:
 
 
 @contextlib.contextmanager
-def operation_lock(conn: sqlite3.Connection | None, paths: Paths):
+def operation_lock(conn: sqlite3.Connection | None, paths: Paths, *, record: bool = True):
     """Exclusive lock for backup, prune, check, and restore. A busy lock skips.
 
     The lock file lives under the omg home, never on the agent store. ``conn`` may be
     None when the database cannot be opened; the busy lock is still reported to the caller.
+    Restore passes ``record=False`` so a contended check does not append an event and
+    change the stream that a later restore compares.
     """
     directory = paths.state_dir / "backup"
     directory.mkdir(parents=True, exist_ok=True)
@@ -270,7 +273,7 @@ def operation_lock(conn: sqlite3.Connection | None, paths: Paths):
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         os.close(fd)
-        if conn is not None:
+        if record and conn is not None:
             _emit(conn, "backup_locked", reason="locked")
         yield False
         return
@@ -637,9 +640,41 @@ def _stream(argv: list[str], env: dict[str, str], timeout: float) -> CommandResu
                          einval=_is_einval(stderr), locked=proc.returncode == 11, timed_out=timed_out)
 
 
+# Literals this code always puts on the restic command. A short password can be a substring of
+# one of them (`a` is inside `--pack-size`) without the password having been placed on argv.
+_FIXED_ARGV = frozenset({
+    "--repo", "--pack-size", str(PACK_MIB), "--cache-dir", "--no-lock", "--retry-lock", "2m",
+    "--host", HOST, "--tag", "omg", "--group-by", "host",
+    "--keep-hourly", "--keep-daily", "--keep-weekly", "--prune",
+    "--read-data-subset", "5%", "--target",
+    "backup", "forget", "check", "init", "unlock", "snapshots", "restore", "latest",
+    "version", "list", "locks", "cat", "lock",
+})
+_GENERATED_TAG = re.compile(r"(?:gen|schema):\d+\Z")
+
+
+def _argv_discloses_password(password: str, argv: list[str]) -> bool:
+    """True when a dynamic argument contains the password.
+
+    Fixed flags and the generated ``gen:`` / ``schema:`` tags are not disclosure. A password
+    shorter than 4 characters is only a disclosure when it is an entire argument, because it
+    would otherwise match ordinary paths and flags.
+    """
+    if not password:
+        return False
+    for arg in argv:
+        if arg in _FIXED_ARGV or _GENERATED_TAG.fullmatch(arg):
+            continue
+        if arg == password:
+            return True
+        if len(password) >= REDACT_PASSWORD_CHARS and password in arg:
+            return True
+    return False
+
+
 def _execute(argv: list[str], env: dict[str, str], timeout: float, runner: Runner | None,
              password: str) -> CommandResult:
-    if any(password in arg for arg in argv):
+    if _argv_discloses_password(password, argv):
         raise BackupFailed("password_in_argv")
     if "--password-command" in argv or "--password-file" in argv or "-p" in argv:
         raise BackupFailed("password_in_argv")

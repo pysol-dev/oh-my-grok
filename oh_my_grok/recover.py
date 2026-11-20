@@ -337,7 +337,10 @@ def _lock_connection(paths: Paths) -> sqlite3.Connection | None:
         return None
     if header != b"SQLite format 3\x00":
         return None
-    return db.connect(database)
+    try:
+        return db.connect(database)
+    except sqlite3.Error:
+        return None
 
 
 def run_recover(*, check: bool = False, runner: Runner | None = None, now: float | None = None,
@@ -376,7 +379,7 @@ def _run_recover(paths: Paths, conn: sqlite3.Connection | None, *, check: bool, 
         print("backup_repo is empty", file=sys.stderr)
         return EXIT_USAGE
     timeout = _timeout(policy)
-    with operation_lock(conn, paths) as held:
+    with operation_lock(conn, paths, record=False) as held:
         if not held:
             print("backup operation in progress", file=sys.stderr)
             return EXIT_LOCK

@@ -1306,8 +1306,10 @@ def test_recover_exits_16_when_the_operation_lock_is_held(omg_home, tmp_path, mo
         return CommandResult(0, stdout="[]\n")
 
     try:
+        before = engine.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
         code = restic_backup_recover().run_recover(runner=runner, hostname="thisbox",
                                                    pid_alive_fn=lambda pid: False)
+        after = engine.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
         kinds = [row["kind"] for row in engine.conn.execute("SELECT kind FROM events")]
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
@@ -1315,7 +1317,117 @@ def test_recover_exits_16_when_the_operation_lock_is_held(omg_home, tmp_path, mo
         engine.close()
     assert code == 16
     assert calls == []
-    assert "backup_locked" in kinds
+    assert after == before
+    assert "backup_locked" not in kinds
+
+
+def test_recover_opens_a_database_sqlite_cannot_read(omg_home, tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", PASSWORD)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "config").write_text("{}\n")
+    _policy(repo, features={"backup": "on"})
+    engine = Engine()
+    path = engine.paths.db_path
+    engine.close()
+    path.write_bytes(b"SQLite format 3\x00" + b"\x00" * 128)
+    calls = []
+
+    def runner(argv, env, timeout):
+        calls.append(argv)
+        if "snapshots" in argv:
+            return CommandResult(0, stdout="[]\n")
+        return CommandResult(0, stdout="")
+
+    code = restic_backup_recover().run_recover(runner=runner, hostname="thisbox", pid_alive_fn=lambda pid: False)
+    err = capsys.readouterr().err
+    assert code == 10
+    assert "internal error" not in err
+    assert any("snapshots" in argv for argv in calls)
+
+
+def test_contended_check_does_not_make_a_later_restore_diverge(omg_home, tmp_path, monkeypatch):
+    import fcntl
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", PASSWORD)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "config").write_text("{}\n")
+    _policy(repo, features={"backup": "on"})
+    engine = Engine()
+    _add_event(engine.conn, data="local")
+    older = tmp_path / "older.sqlite3"
+    db.backup(engine.conn, older)
+    _add_event(engine.conn, data="remote")
+    newer = tmp_path / "newer.sqlite3"
+    db.backup(engine.conn, newer)
+    paths = engine.paths
+    engine.close()
+    _checkpoint(older)
+    paths.db_path.write_bytes(older.read_bytes())
+    for extra in ("-wal", "-shm"):
+        sidecar = Path(str(paths.db_path) + extra)
+        if sidecar.exists():
+            sidecar.unlink()
+    directory = paths.state_dir / "backup"
+    directory.mkdir(parents=True, exist_ok=True)
+    fd = os.open(directory / "operation.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        held = restic_backup_recover().run_recover(check=True, runner=_quiet_runner(), hostname="thisbox",
+                                                   pid_alive_fn=lambda pid: False)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    assert held == 16
+    opened = db.connect(paths.db_path)
+    try:
+        kinds = [row["kind"] for row in opened.execute("SELECT kind FROM events")]
+    finally:
+        opened.close()
+    assert "backup_locked" not in kinds
+
+    def runner(argv, env, timeout):
+        if "restore" in argv:
+            target = Path(argv[argv.index("--target") + 1])
+            tree = _snapshot_tree(tmp_path / "snap", newer)
+            for item in tree.rglob("*"):
+                dest = target / item.relative_to(tree)
+                if item.is_dir():
+                    dest.mkdir(parents=True, exist_ok=True)
+                else:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(item.read_bytes())
+            return CommandResult(0)
+        if "snapshots" in argv:
+            return CommandResult(0, stdout='[{"id":"abc","short_id":"abc"}]\n')
+        return CommandResult(0, stdout="")
+
+    code = restic_backup_recover().run_recover(check=True, runner=runner, hostname="thisbox",
+                                              pid_alive_fn=lambda pid: False)
+    assert code == 14
+
+
+def test_one_character_password_is_not_treated_as_an_argument(omg_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("OMG_RESTIC_PASSWORD", "a")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "config").write_text("{}\n")
+    _policy(repo, features={"backup": "on"})
+    calls = []
+
+    def runner(argv, env, timeout):
+        calls.append(list(argv))
+        if "snapshots" in argv:
+            return CommandResult(0, stdout="[]\n")
+        return CommandResult(0, stdout="")
+
+    code = restic_backup_recover().run_recover(runner=runner, hostname="thisbox", pid_alive_fn=lambda pid: False)
+    assert code == 10
+    assert calls
+    with pytest.raises(BackupFailed) as exc:
+        restic_backup._execute(["restic", "--repo", str(repo), "--pack-size", "4", "leak-this-password"],
+                               {}, 1, None, "leak-this-password")
+    assert exc.value.reason == "password_in_argv"
 
 
 def _secret_staging(paths: Path) -> Path:
