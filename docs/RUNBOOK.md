@@ -238,6 +238,100 @@ backup on the next open). A missing base revision fails closed.
 - `./omg restore FILE` needs a TTY. Stop all omo activity first. It verifies the backup's integrity before
   swapping it in, and keeps the old DB.
 
+### Restic repository
+
+`scripts/bootstrap.sh` installs restic 0.19.1 from `tooling/restic.lock` into `tools/restic`. The archive
+sha256 is checked before decompress. If the download is unavailable, a cached copy whose sha256 matches the
+lock is copied into `tools/` and only that copy is chmod'd. Do not chmod, utime, or link files on the store.
+
+The repository is a directory named by `backup_repo` in the host policy (not a committed file). Point it at
+the agent store, outside this checkout. `features.backup` defaults to `off`. Turning it `on` makes the
+watchdog run the schedule below. `omg backup run` writes a snapshot immediately.
+
+The password is `OMG_RESTIC_PASSWORD` in the environment. Restic receives it only as
+`RESTIC_PASSWORD_COMMAND=printenv OMG_RESTIC_PASSWORD`. Do not pass it on argv, do not put it in a file, and
+do not put it under `/workspace`. The value is never printed. `hooks.json` is copied into the snapshot as
+raw bytes and encrypted by restic; it is not printed either.
+
+Every restic command this code builds uses `RESTIC_PACK_SIZE=4` and `--pack-size 4`. The store rejects a
+file of 16 MiB or more (`EFBIG`). Packs of 4 MiB stay under that cap. Staging is one stable directory
+under `/tmp` per home (`omg-backup-staging-<home hash>`), reused so every snapshot records the same path.
+Restore also uses `/tmp`. Snapshots are tagged `omg`, `gen:<max event id>`, and `schema:<version>`
+(schema 7 on this code) with host `omg-box`. The snapshot is a SQLite backup of the database, not the
+live WAL, plus `config/`, all of `jobs/`, and `state/secrets/hooks.json` when that file exists.
+
+`forget` groups by host and only considers snapshots with host `omg-box` and tag `omg`. The `gen:`
+and `schema:` tags change every snapshot, so grouping by tags would keep every generation. Foreign or
+untagged snapshots are left in place. With that filter, the retention policy is one set: 48 hourly,
+14 daily, and 8 weekly.
+
+The watchdog process keeps `OMG_RESTIC_PASSWORD`. Every child it starts, other than a restic command
+that needs the password, has that variable removed. The password still reaches restic only through
+`RESTIC_PASSWORD_COMMAND=printenv OMG_RESTIC_PASSWORD`. The heartbeat records `restic_password` as
+`set` or `unset` and never the value. Backup, prune, and check share a flock under the omg home.
+A second caller exits 16 and records `backup_locked` without touching the staging directory. Staging
+is mode 0700. A symlink, or a directory owned by another user, is refused. The staged database must
+exist and pass `integrity_check` before restic is started.
+
+Schedule, when the flag is on: back up if the event generation changed and at least 10 minutes have passed,
+or if 6 hours have passed. Prune once a day. Check once a day. Once a week the check reads a 5 percent
+data subset. `EFBIG` on backup or prune kills that restic process, records `backup_failed` with
+`reason=efbig`, and is not tried again until the 10 minute minimum has passed, even when the daily
+prune was already due. `EAGAIN`, or `ENOENT` while listing locks, is retried once. `EINVAL` /
+`invalid argument` kills restic as soon as it appears on stderr and is not retried.
+
+A lock whose hostname is this machine and whose pid is not alive is removed with plain `restic unlock`
+(never `--remove-all`) and the operation is tried once more. Any other lock records `backup_locked` and
+the tick skips. `omg backup run` exits 16 in that case. Exit 11 is reserved for a diverged restore.
+`omg doctor`, when backup is on, fails if the watchdog heartbeat says the password is unset, if the
+watchdog has not reported it, if the password is shorter than 12 characters, if the latest backup failed,
+if a lock is 30 minutes old or older, or if any repository file is 15 MiB or larger. A pack size other
+than 4 is a warning. Doctor also reports lock count, age, and machine and the store size summed from
+file sizes (not `df`). It does not report the password.
+
+```bash
+# policy on the host, not in git: backup_repo is an absolute directory; features.backup is "on" or "off"
+export OMG_RESTIC_PASSWORD    # the value stays in the environment of this process
+./omg backup init
+./omg backup run
+./omg backup prune
+./omg backup check            # add --read-data for the weekly subset
+./omg doctor
+```
+
+### Restore
+
+Stop writers first. `scripts/recover.sh` bootstraps, then runs the restore with `OMG_DISABLE_TRANSPORT=1`
+on that process only, so a restored hooks file cannot POST. The watchdog started after a successful
+restore does not inherit that variable.
+
+```bash
+export OMG_RESTIC_PASSWORD
+scripts/recover.sh --check    # report only; does not remove a lock and does not write the home
+scripts/recover.sh
+```
+
+Lock handling, in order:
+
+1. Read the locks with `--no-lock`, including an exclusive lock. That read is not a failed check.
+2. An exclusive lock from another machine younger than 30 minutes, or an exclusive lock whose pid is
+   still alive on this machine, waits with `--retry-lock 2m` and then exits 16 if it is still there.
+   The two-minute wait applies only to exclusive locks. A young non-exclusive lock from another machine
+   exits 16 immediately and is not restored past. Neither kind is removed.
+3. A stale lock on this machine (the pid is not alive), including an exclusive lock left by a killed
+   restic, is removed with plain `restic unlock`. Never pass `--remove-all`.
+4. After that unlock, `restic check` must succeed before a snapshot is applied.
+
+`latest` is limited to host `omg-box` and tag `omg`. If the snapshot's event stream extends the local
+stream, it is restored and an older schema is migrated forward. If the local stream is already ahead,
+local files are kept. Diverged streams exit 11 and nothing is written. A snapshot schema newer than this
+code is refused. A corrupt local database is moved aside, with its `-wal` and `-shm` files, and then the
+snapshot is restored. `--check` exits 14 when a restore would be required. After a real restore the script
+runs `omg watchdog ensure` and `omg doctor` without `OMG_DISABLE_TRANSPORT`.
+
+`scripts/drill-restic.sh` runs an init, backup, restore, byte compare, and stale-lock drill under `/tmp`
+and deletes that directory on the way out. It does not touch the store.
+
 ## 11. Failed / dead-letter dispatches
 - `status` shows the dispatch `status`, `http_status` and `last_error` (redacted).
 - `failed` rows are permanent: 401/403/404/410, or retries exhausted.

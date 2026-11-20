@@ -20,8 +20,8 @@ SECRET_KEYS = re.compile(r"(?i)^(authorization|key|bearer|token|secret|password|
 _known: set[str] = set()
 
 
-def register_secret(value: str | None) -> None:
-    if value and len(value) >= 6:
+def register_secret(value: str | None, *, min_length: int = 6) -> None:
+    if value and len(value) >= min_length:
         _known.add(value)
 
 

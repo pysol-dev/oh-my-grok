@@ -12,7 +12,7 @@ from oh_my_grok.errors import ValidationError
 def test_all_features_default_off():
     d = features.defaults()
     assert set(d) == {"adaptive_roster", "boulder", "lsp", "git_discipline", "docs_evidence", "repo_lease",
-                      "healing", "watchdog"}
+                      "healing", "watchdog", "backup"}
     assert set(d.values()) == {"off"}
 
 
@@ -34,6 +34,15 @@ def test_watchdog_flag_accepts_shadow_and_on_only():
     assert features.normalize({})["watchdog"] == "off"
     with pytest.raises(ValidationError):
         features.normalize({"watchdog": "enforce"})
+
+
+def test_backup_flag_accepts_off_and_on_only():
+    assert features.normalize({"backup": "on"})["backup"] == "on"
+    assert features.normalize({})["backup"] == "off"
+    with pytest.raises(ValidationError):
+        features.normalize({"backup": "shadow"})
+    with pytest.raises(ValidationError):
+        features.normalize({"backup": "enforce"})
 
 
 def test_healing_flag_accepts_shadow_and_enforce_only():

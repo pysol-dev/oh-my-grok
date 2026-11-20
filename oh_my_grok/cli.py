@@ -19,7 +19,7 @@ from . import __version__, db, sandbox
 from .config import TEMPLATE_MARKERS, load_policy, load_verifier_profiles
 from .errors import OmgError, ValidationError
 from .hooks import _check_perms, hook_status, load_hooks, set_hook, validate_url
-from .paths import CODE_ROOT, get_paths
+from .paths import CODE_ROOT, get_paths, scrubbed_environ
 from .redact import redact, redact_obj
 from .roster import CLASSES, INTENTS, validate_scope
 from .states import ROLES
@@ -64,8 +64,10 @@ def cmd_doctor(args) -> int:
     paths = get_paths()
     checks = []
 
-    def add(name, ok, detail=""):
-        checks.append({"check": name, "ok": bool(ok), "detail": detail})
+    def add(name, ok, detail="", status=None):
+        if status is None:
+            status = "PASS" if ok else "FAIL"
+        checks.append({"check": name, "ok": bool(ok), "status": status, "detail": detail})
 
     add("python>=3.11", sys.version_info >= (3, 11), sys.version.split()[0])
     try:
@@ -151,6 +153,12 @@ def cmd_doctor(args) -> int:
     except Exception as ex:  # noqa: BLE001 - doctor reports the failure instead of crashing
         wd = None
         add("watchdog", False, redact(str(ex))[:300])
+    try:
+        from . import restic_backup
+        for item in restic_backup.doctor_report(paths):
+            add(item["check"], item["ok"], item.get("detail", ""), status=item.get("status"))
+    except Exception as ex:  # noqa: BLE001 - doctor reports the failure instead of crashing
+        add("backup_repo", False, redact(str(ex))[:300])
     # informational (do not fail doctor): live wiring is the operator's job
     info = {"hooks_configured": hook_status(paths), "lsp_tools": lsp_info,
             "features_default": load_policy(paths.config_dir)["features"]}
@@ -172,7 +180,7 @@ def cmd_doctor(args) -> int:
         op = {"state": "NOT OPERATIONAL: evidence could not be read (" + redact(str(ex))[:100] + ")", "criteria": {}}
     info["operational_criteria"] = op["criteria"]
     data = {"ok": ok, "version": __version__, "checks": checks, "info": info, "live_status": op["state"]}
-    lines = [f"{'PASS' if c['ok'] else 'FAIL'}  {c['check']}  {c['detail']}" for c in checks]
+    lines = [f"{c.get('status') or ('PASS' if c['ok'] else 'FAIL')}  {c['check']}  {c['detail']}" for c in checks]
     lines.append("hooks configured: " + ", ".join(f"{r}={v}" for r, v in info["hooks_configured"].items()))
     lines.append(data["live_status"])
     lines.append("doctor: " + ("OK" if ok else "PROBLEMS FOUND"))
@@ -200,9 +208,77 @@ def cmd_migrate(args) -> int:
 
 
 def cmd_backup(args) -> int:
+    if getattr(args, "backup_cmd", None):
+        raise ValidationError("usage: omg backup --out PATH | omg backup init|run|prune|check")
+    if not getattr(args, "out", None):
+        raise ValidationError("usage: omg backup --out PATH | omg backup init|run|prune|check")
     e = _engine()
-    p = db.backup(e.conn, Path(args.out))
+    try:
+        p = db.backup(e.conn, Path(args.out))
+    finally:
+        e.close()
     _out(args, {"backup": str(p)}, f"backup written (integrity ok): {p}")
+    return EXIT_OK
+
+
+def _backup_call(fn):
+    e = _engine()
+    try:
+        return fn(e)
+    finally:
+        e.close()
+
+
+def cmd_backup_init(args) -> int:
+    from . import restic_backup
+
+    def go(engine):
+        return restic_backup.init_repo(engine.paths)
+
+    info = _backup_call(go)
+    _out(args, info, f"restic repository ready at {info['repo']}")
+    return EXIT_OK
+
+
+def cmd_backup_run(args) -> int:
+    from . import restic_backup
+
+    def go(engine):
+        return restic_backup.run_backup(engine.conn, engine.paths, force=True)
+
+    info = _backup_call(go)
+    if info.get("reason") == "locked":
+        _out(args, info, "restic repository is locked; skipping this run")
+        return restic_backup.EXIT_LOCKED
+    _out(args, info, f"backup generation {info.get('generation')} schema {info.get('schema')}")
+    return EXIT_OK
+
+
+def cmd_backup_prune(args) -> int:
+    from . import restic_backup
+
+    def go(engine):
+        return restic_backup.prune_repo(engine.conn, engine.paths)
+
+    info = _backup_call(go)
+    if info.get("reason") == "locked":
+        _out(args, info, "restic repository is locked; prune skipped")
+        return restic_backup.EXIT_LOCKED
+    _out(args, info, "prune complete")
+    return EXIT_OK
+
+
+def cmd_backup_check(args) -> int:
+    from . import restic_backup
+
+    def go(engine):
+        return restic_backup.check_repo(engine.conn, engine.paths, read_data=bool(args.read_data))
+
+    info = _backup_call(go)
+    if info.get("reason") == "locked":
+        _out(args, info, "restic repository is locked; check skipped")
+        return restic_backup.EXIT_LOCKED
+    _out(args, info, "check complete" + (" (read-data subset 5%)" if info.get("read_data_subset") else ""))
     return EXIT_OK
 
 
@@ -529,7 +605,7 @@ def _pytest(suite: str, extra: list[str]) -> int:
     tdir = CODE_ROOT / "tests" / suite
     cmd = [sys.executable, "-m", "pytest", str(tdir), "-q", "-p", "no:cacheprovider", *extra]
     print("running: " + " ".join(cmd), file=sys.stderr)
-    return subprocess.call(cmd, cwd=str(CODE_ROOT))
+    return subprocess.call(cmd, cwd=str(CODE_ROOT), env=scrubbed_environ())
 
 
 def cmd_test(args) -> int:
@@ -824,8 +900,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("export", cmd_export, "write a sanitized evidence pack")
     sp.add_argument("job")
     sp.add_argument("--out", required=True)
-    sp = add("backup", cmd_backup, "consistent SQLite backup (backup API + integrity check)")
-    sp.add_argument("--out", required=True)
+    sp = add("backup", cmd_backup, "restic backup of bus state; --out writes a raw SQLite snapshot instead")
+    sp.add_argument("--out", help="write a raw integrity-checked SQLite snapshot to this path")
+    backup_cmds = sp.add_subparsers(dest="backup_cmd", required=False)
+    add("init", cmd_backup_init, "create the restic repository at backup_repo", parent=backup_cmds)
+    add("run", cmd_backup_run, "back up the SQLite snapshot, config, jobs, and hooks now", parent=backup_cmds)
+    add("prune", cmd_backup_prune, "forget snapshots beyond 48 hourly / 14 daily / 8 weekly, then prune",
+        parent=backup_cmds)
+    sp = add("check", cmd_backup_check, "check the repository; --read-data reads a 5 percent subset",
+        parent=backup_cmds)
+    sp.add_argument("--read-data", action="store_true", help="read a random 5 percent of pack data")
     sp = add("restore", cmd_restore, "restore a backup (interactive TTY; stop omg processes first)")
     sp.add_argument("src")
     hook = sub.add_parser("hook", help="webhook secrets").add_subparsers(dest="hook_cmd", required=True)

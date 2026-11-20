@@ -9,6 +9,7 @@
 #   requirements.lock                  -> .venv          (oh-my-grok runtime: mcp SDK, pytest, pyflakes)
 #   tooling/requirements-tools.lock    -> tools/venv     (ruff, basedpyright, nodejs-wheel-binaries)
 #   tooling/node/package-lock.json     -> tools/node     (typescript, typescript-language-server)
+#   tooling/restic.lock                -> tools/restic   (restic 0.19.1, sha256-pinned)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -83,6 +84,11 @@ if [ "$WANT_TOOLS" = 1 ]; then
   [ -n "$(find "$TOOLS/venv" -path '*nodejs_wheel/bin/node' 2>/dev/null | head -n1)" ] || bad "node (nodejs-wheel-binaries) in $TOOLS/venv"
   [ -f "$TOOLS/node/node_modules/typescript-language-server/lib/cli.mjs" ] || bad "typescript-language-server in $TOOLS/node"
   [ -f "$TOOLS/node/node_modules/typescript/lib/tsserver.js" ] || bad "typescript in $TOOLS/node"
+  if [ "$CHECK" = 1 ]; then
+    "$ROOT/scripts/install-restic.sh" --check || bad "restic 0.19.1 in $TOOLS"
+  else
+    "$ROOT/scripts/install-restic.sh"
+  fi
 fi
 
 if [ "$problems" -ne 0 ]; then

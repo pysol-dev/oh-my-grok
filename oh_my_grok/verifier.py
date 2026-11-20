@@ -320,7 +320,8 @@ def run(repo: Path, revision: str, name: str | None, prof: dict | None, work_roo
         env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8", "HOME": sandbox.SANDBOX_WORK,
                "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1", "PYTHONSAFEPATH": "1"}
         for k in prof.get("env_allow", []):
-            if k in os.environ:
+            if k in os.environ and k not in ("OMG_RESTIC_PASSWORD", "RESTIC_PASSWORD", "RESTIC_PASSWORD_FILE",
+                                            "RESTIC_PASSWORD_COMMAND"):
                 env[k] = os.environ[k]
         env.update({k: str(v) for k, v in prof.get("env_set", {}).items()})
         python = prof.get("runner") in ACCEPTED_RUNNERS
@@ -655,7 +656,9 @@ def oracle_variants(prof, ctx: _Ctx, rng) -> list[dict]:
     names = ("python3", "/usr/bin/python3", ctx.exe)
     plain0 = next((a for a in names if _alias_ok(a, ctx.exe)), ctx.exe)
     other0 = next((a for a in reversed(names) if _alias_ok(a, ctx.exe) and a != plain0), ctx.exe)
-    extra = {k: os.environ[k] for k in prof.get("env_allow", []) if k in os.environ}
+    extra = {k: os.environ[k] for k in prof.get("env_allow", [])
+             if k in os.environ and k not in ("OMG_RESTIC_PASSWORD", "RESTIC_PASSWORD", "RESTIC_PASSWORD_FILE",
+                                              "RESTIC_PASSWORD_COMMAND")}
     extra.update({k: str(v) for k, v in prof.get("env_set", {}).items()})
     lays: list = []
     while len(lays) < ORACLE_RUNS:

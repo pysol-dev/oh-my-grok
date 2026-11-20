@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from .paths import scrubbed_environ
+
 BWRAP_CANDIDATES = ("/usr/bin/bwrap", "/bin/bwrap")
 BWRAP_VERSION_RE = re.compile(r"bubblewrap (\d{1,3}\.\d{1,3}(?:\.\d{1,3})?)")
 RUNTIME_ROOT = "/usr"
@@ -60,12 +62,14 @@ def probe() -> Probe:
     if not bw:
         return Probe(False, "none", "no sandbox available: bwrap (bubblewrap) not installed")
     try:
-        vp = subprocess.run([bw, "--version"], capture_output=True, text=True, timeout=10)
+        vp = subprocess.run([bw, "--version"], capture_output=True, text=True, timeout=10,
+                            env=scrubbed_environ(), check=False)
         m = BWRAP_VERSION_RE.fullmatch(vp.stdout.strip()) if vp.returncode == 0 else None
         if not m:
             return Probe(False, "none", "no sandbox available: unexpected `bwrap --version` output "
                          f"(exit {vp.returncode}): {vp.stdout.strip()[:60]!r}")
-        cp = subprocess.run([bw, *base_args(), "--", "/usr/bin/true"], capture_output=True, text=True, timeout=20)
+        cp = subprocess.run([bw, *base_args(), "--", "/usr/bin/true"], capture_output=True, text=True, timeout=20,
+                            env=scrubbed_environ(), check=False)
     except (OSError, subprocess.SubprocessError) as e:
         return Probe(False, "none", f"no sandbox available: bwrap failed to start ({type(e).__name__})")
     if cp.returncode != 0:
@@ -112,7 +116,8 @@ def namespace_self_check(bw: str) -> str | None:
     pkg = str(Path(__file__).resolve().parent)
     try:
         cp = subprocess.run([bw, *base_args(), "--", "/usr/bin/python3", "-I", "-S", "-c", _SELF_CHECK, nonce,
-                             sentinel, pkg], capture_output=True, text=True, timeout=30)
+                             sentinel, pkg], capture_output=True, text=True, timeout=30,
+                            env=scrubbed_environ(), check=False)
     except (OSError, subprocess.SubprocessError) as e:
         return f"probe did not run ({type(e).__name__})"
     finally:
